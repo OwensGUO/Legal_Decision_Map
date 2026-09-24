@@ -1,0 +1,15 @@
+experiments:
+  B0: {backbone: majority_mean}
+  B1: {backbone: hfl/chinese-roberta-wwm-ext}
+  B2: {backbone: thunlp/Lawformer}
+  B3: {factors: false, counterfactuals: false}
+  B4: {factors: true, counterfactuals: false}
+  B5: {factors: true, counterfactuals: ordinary}
+  M: {factors: true, counterfactuals: typed}
+  A1: {from: M, invariant: false}
+  A2: {from: M, boundary: false}
+  A3: {from: M, sentence_rank: false}
+  A4: {from: M, factors: false}
+  A5: {from: M, hard_charge_sentence: true}
+  A6: {from: M, filter_counterfactuals: false}
+

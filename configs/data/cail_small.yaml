@@ -1,0 +1,11 @@
+data:
+  dataset: cail
+  root: /data/chenguo/datasets/CAIL2018
+  variant: exercise_contest
+  output_dir: outputs/cail_small
+  sanitize_mode: conservative
+model:
+  max_length: 4096
+training:
+  seeds: [42, 2026, 3407]
+

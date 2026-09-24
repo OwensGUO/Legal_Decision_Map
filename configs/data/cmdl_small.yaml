@@ -1,0 +1,11 @@
+data:
+  dataset: cmdl
+  root: /data/chenguo/datasets/CMDL
+  variant: small
+  output_dir: outputs/cmdl_small
+  sanitize_mode: conservative
+model:
+  max_length: 8192
+training:
+  seeds: [42, 2026, 3407]
+

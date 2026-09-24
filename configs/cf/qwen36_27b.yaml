@@ -1,0 +1,29 @@
+generator:
+  backend: vllm
+  model_path: /data/chenguo/Qwen3.6-27B
+  model_revision: local
+  endpoint: http://127.0.0.1:30000/v1/chat/completions
+  allow_remote: false
+  tensor_parallel_size: 4
+  max_context_length: 8192
+  temperature: 0.2
+  top_p: 0.9
+  # Outputs repeat the whole rewritten fact; 3000 source chars stay within 8192 tokens.
+  max_tokens: 4096
+  max_source_chars: 3000
+  seed: 42
+  # Retries of outputs that fail validation.
+  retries: 2
+  # Concurrent HTTP requests; vLLM batches them on the GPUs.
+  concurrency: 32
+  request_timeout: 600
+  # Retries of timeouts, HTTP 429 and 5xx responses, with exponential backoff.
+  request_retries: 3
+  # Minimum difflib similarity to the parent text before an output counts as a rewrite.
+  min_similarity: 0.5
+  thinking: false
+charge_boundaries:
+  - [盗窃, 诈骗]
+  - [赌博, 开设赌场]
+  - [故意伤害, 寻衅滋事]
+  - [盗窃, 抢夺, 抢劫]

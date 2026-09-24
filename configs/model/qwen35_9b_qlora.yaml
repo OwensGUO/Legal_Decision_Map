@@ -1,0 +1,28 @@
+model:
+  path: /data/chenguo/Qwen3.5-9B
+  revision: local
+  language_only: true
+  max_length: 4096
+  attn_implementation: sdpa
+  quantization: nf4
+  compute_dtype: bfloat16
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+training:
+  gradient_checkpointing: true
+  gradient_accumulation_steps: 8
+  per_device_batch_size: 1
+  learning_rate: 0.0002
+  epochs: 1
+  max_steps: 1000
+  rank_margin: 1.0
+  mixed_precision: bf16
+  seed: 42
+loss:
+  sentence: 1.0
+  invariant: 1.0
+  boundary: 1.0
+  response: 1.0
+  factor: 1.0

@@ -1,0 +1,5 @@
+# Optional Qwen3.5 Gated DeltaNet Triton acceleration.
+# On NVIDIA driver 535 this package is accepted only after its real GPU probe
+# succeeds; it is not required for installation, data processing, or vLLM.
+-r requirements.txt
+flash-linear-attention==0.5.0
