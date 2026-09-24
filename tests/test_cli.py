@@ -107,6 +107,70 @@ def test_build_dataset_writes_traceable_processed_records(tmp_path) -> None:
     assert (output / "manifest.json").is_file()
 
 
+def test_build_dataset_keeps_cross_split_group_only_in_held_out_split(tmp_path) -> None:
+    source = tmp_path / "source" / "exercise_contest"
+    source.mkdir(parents=True)
+    duplicate = {
+        "fact": "被告人段某实施盗窃并退赃。",
+        "meta": {
+            "criminals": ["段某"],
+            "accusation": ["盗窃"],
+            "term_of_imprisonment": {
+                "death_penalty": False,
+                "life_imprisonment": False,
+                "imprisonment": 12,
+            },
+        },
+    }
+    unique_test = {
+        **duplicate,
+        "fact": "被告人李某实施盗窃并退赃。",
+        "meta": {**duplicate["meta"], "criminals": ["李某"]},
+    }
+    (source / "data_train.json").write_text(
+        json.dumps(duplicate, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (source / "data_valid.json").write_text(
+        json.dumps(duplicate, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (source / "data_test.json").write_text(
+        json.dumps(unique_test, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "data": {
+                    "dataset": "cail",
+                    "root": str(tmp_path / "source"),
+                    "variant": "exercise_contest",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "processed"
+    summary = build_dataset(config_path, output)
+
+    assert (output / "train.jsonl").read_text(encoding="utf-8") == ""
+    [valid_record] = [
+        json.loads(line)
+        for line in (output / "valid.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    [test_record] = [
+        json.loads(line)
+        for line in (output / "test.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert valid_record["group_id"] != test_record["group_id"]
+    assert summary["split_units"] == {"train": 0, "valid": 1, "test": 1}
+    assert summary["split_integrity"] == {
+        "assignment_policy": "prefer_test_then_valid_then_train",
+        "cross_split_groups": 1,
+        "dropped_units": {"train": 1, "valid": 0, "test": 0},
+    }
+
+
 def test_environment_and_requirement_dry_runs_are_read_only() -> None:
     for name in ("audit_environment.py", "check_requirements.py", "probe_gpu_stack.py"):
         result = subprocess.run(

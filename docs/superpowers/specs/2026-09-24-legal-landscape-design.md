@@ -40,8 +40,12 @@ dry-runs. Every command exposes help and bounded `--limit` behavior.
 Frozen dataclasses define `CaseUnit`, `LegalFactors`, and `InterventionSpec`.
 CAIL and CMDL adapters normalize source rows into `CaseUnit` objects. CMDL
 creates one unit per target defendant but reuses the same `group_id` for every
-defendant from a case. Stable IDs derive from dataset, split, source path, and
-line number. A manifest records path, size, SHA-256, and line count.
+defendant from a case. Stable IDs derive from canonical case content without
+the split name, so duplicated source cases can be detected across official
+files. When a source group crosses splits, the processed dataset keeps the
+whole group only in the most held-out split (`test > valid > train`) and records
+the dropped-unit counts in metadata. A manifest records path, size, SHA-256,
+and line count.
 
 The sanitizer produces raw, conservative, and strict variants plus structured
 redaction spans. Conservative mode removes outcome-bearing court/prosecution

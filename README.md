@@ -177,6 +177,10 @@ python scripts/build_dataset.py --config configs/data/cmdl_small.yaml \
 的上限，例如 CAIL-small 训练集可使用 `--limit 200000`。输出含 raw、conservative、
 strict 三种文本、屏蔽审计、因素、标签、原始路径、case/group ID、manifest 和词表。
 
+源数据中存在少量相同案件跨官方 split 重复的情况。构建器会按 `test > valid > train`
+将整个 `group_id` 只保留在最严格的留出集，防止训练集泄漏；`metadata.json` 的
+`split_integrity` 会记录跨 split 组数和各 split 删除的单元数。该处理不修改源数据。
+
 ## 7. 启动本地 Qwen3.6-27B vLLM 服务
 
 `run.sh` 会自动启动和停止服务；手动调试时在四卡服务器仅监听回环地址：

@@ -14,6 +14,8 @@ from legal_landscape.data.manifest import build_manifest
 from legal_landscape.data.sanitize import sanitize_text
 from legal_landscape.factors.extract import extract_factors
 
+_SPLIT_PRIORITY = {"train": 0, "valid": 1, "test": 2}
+
 
 def _source_paths(data: dict[str, Any]) -> dict[str, Path]:
     root = Path(data["root"])
@@ -34,6 +36,31 @@ def _source_paths(data: dict[str, Any]) -> dict[str, Path]:
     raise ValueError(f"unsupported dataset: {data['dataset']}")
 
 
+def _iter_cases(
+    data: dict[str, Any], source: Path, *, split: str, limit: int | None
+):
+    if data["dataset"] == "cail":
+        return iter_cail(source, split=split, limit=limit)
+    return iter_cmdl(source, split=split, limit=limit)
+
+
+def _assign_groups_to_splits(
+    data: dict[str, Any], paths: dict[str, Path], *, limit: int | None
+) -> tuple[dict[str, str], set[str]]:
+    """Assign duplicate source groups to the most held-out official split."""
+    assignments: dict[str, str] = {}
+    cross_split_groups: set[str] = set()
+    for split, source in paths.items():
+        for case in _iter_cases(data, source, split=split, limit=limit):
+            previous = assignments.setdefault(case.group_id, split)
+            if previous == split:
+                continue
+            cross_split_groups.add(case.group_id)
+            if _SPLIT_PRIORITY[split] > _SPLIT_PRIORITY[previous]:
+                assignments[case.group_id] = split
+    return assignments, cross_split_groups
+
+
 def build_dataset(
     config_path: str | Path,
     output_dir: str | Path,
@@ -49,20 +76,19 @@ def build_dataset(
     destination.mkdir(parents=True, exist_ok=True)
     split_units: dict[str, int] = {}
     charges: set[str] = set()
-    group_splits: dict[str, str] = {}
+    group_splits, cross_split_groups = _assign_groups_to_splits(
+        data, paths, limit=limit
+    )
+    dropped_units = dict.fromkeys(paths, 0)
     for split, source in paths.items():
-        iterator = (
-            iter_cail(source, split=split, limit=limit)
-            if data["dataset"] == "cail"
-            else iter_cmdl(source, split=split, limit=limit)
-        )
+        iterator = _iter_cases(data, source, split=split, limit=limit)
         count = 0
         output_path = destination / f"{split}.jsonl"
         with output_path.open("w", encoding="utf-8") as handle:
             for case in iterator:
-                previous = group_splits.setdefault(case.group_id, split)
-                if previous != split:
-                    raise ValueError(f"group {case.group_id} crosses splits {previous}/{split}")
+                if group_splits[case.group_id] != split:
+                    dropped_units[split] += 1
+                    continue
                 sanitized = sanitize_text(case.fact_raw, charges=case.charges)
                 factors = extract_factors(case.fact_raw, target_defendant=case.target_defendant)
                 record = {
@@ -83,6 +109,11 @@ def build_dataset(
     metadata = {
         "dataset": data["dataset"],
         "split_units": split_units,
+        "split_integrity": {
+            "assignment_policy": "prefer_test_then_valid_then_train",
+            "cross_split_groups": len(cross_split_groups),
+            "dropped_units": dropped_units,
+        },
         "charge_vocabulary": sorted(charges),
         "penalty_vocabulary": [
             "fixed_term",
