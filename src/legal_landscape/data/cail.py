@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from legal_landscape.data.articles import normalize_criminal_articles
 from legal_landscape.data.schema import CaseUnit, PenaltyType
 
 
@@ -55,6 +56,9 @@ def iter_cail(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                     penalty_type=penalty_type,
                     imprisonment_months=months,
                     source_path=f"{source}:{line_number}",
+                    conviction_articles=normalize_criminal_articles(
+                        meta.get("relevant_articles") or ()
+                    ),
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid CAIL record at {source}:{line_number}: {exc}") from exc

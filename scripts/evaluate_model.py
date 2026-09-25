@@ -18,10 +18,22 @@ from legal_landscape.evaluation.bootstrap import (
 )
 from legal_landscape.evaluation.cmdl_case_metrics import cmdl_metrics
 from legal_landscape.evaluation.counterfactual_metrics import counterfactual_metrics
-from legal_landscape.evaluation.static_metrics import charge_metrics, sentence_metrics
+from legal_landscape.evaluation.static_metrics import (
+    charge_metrics,
+    multiclass_metrics,
+    multilabel_metrics,
+    sentence_class,
+    sentence_metrics,
+)
 
 DEFAULT_PRIMARY_ENDPOINTS = {
-    "static": ("macro_f1", "micro_f1", "exact_match", "mae", "tolerance_accuracy"),
+    "static": (
+        "charge_macro_f1",
+        "article_macro_f1",
+        "sentence_macro_f1",
+        "sentence_mae",
+        "sentence_tolerance_accuracy",
+    ),
     "counterfactual": (
         "flip_accuracy",
         "invariant_violation_rate",
@@ -70,7 +82,40 @@ def calculate_metrics(kind: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             [row["penalty_type"] for row in rows],
             charge_counts=np.asarray([sum(row["true_charges"]) for row in rows]),
         )
-        return {**charge, **sentence}
+        true_sentence_classes = [
+            sentence_class(row["penalty_type"], row.get("true_months")) for row in rows
+        ]
+        predicted_sentence_classes = [
+            sentence_class(
+                row.get("predicted_penalty_type", row["penalty_type"]),
+                row.get("predicted_months"),
+            )
+            for row in rows
+        ]
+        sentence_classification = multiclass_metrics(
+            true_sentence_classes,
+            predicted_sentence_classes,
+        )
+        metrics: dict[str, Any] = {
+            **{f"charge_{name}": value for name, value in charge.items()},
+            **{
+                f"sentence_{name}": value
+                for name, value in sentence_classification.items()
+            },
+            **{f"sentence_{name}": value for name, value in sentence.items()},
+            # Legacy aliases retained for existing result consumers.
+            "macro_f1": charge["macro_f1"],
+            "micro_f1": charge["micro_f1"],
+            "exact_match": charge["exact_match"],
+            **sentence,
+        }
+        if all("true_articles" in row and "predicted_articles" in row for row in rows):
+            article = multilabel_metrics(
+                np.asarray([row["true_articles"] for row in rows]),
+                np.asarray([row["predicted_articles"] for row in rows]),
+            )
+            metrics.update({f"article_{name}": value for name, value in article.items()})
+        return metrics
     if kind == "counterfactual":
         return counterfactual_metrics(rows)
     if kind == "cmdl":
@@ -81,12 +126,21 @@ def calculate_metrics(kind: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
 def bootstrap_names(kind: str) -> tuple[str, ...]:
     if kind == "static":
         return (
-            "macro_f1",
-            "micro_f1",
-            "exact_match",
-            "mae",
-            "log_mae",
-            "tolerance_accuracy",
+            "charge_accuracy",
+            "charge_macro_precision",
+            "charge_macro_recall",
+            "charge_macro_f1",
+            "article_accuracy",
+            "article_macro_precision",
+            "article_macro_recall",
+            "article_macro_f1",
+            "sentence_accuracy",
+            "sentence_macro_precision",
+            "sentence_macro_recall",
+            "sentence_macro_f1",
+            "sentence_mae",
+            "sentence_log_mae",
+            "sentence_tolerance_accuracy",
         )
     return DEFAULT_PRIMARY_ENDPOINTS[kind]
 
@@ -109,10 +163,13 @@ def main() -> int:
         return 0
     rows = read_rows(args.input, args.limit)
     metrics = calculate_metrics(args.kind, rows)
+    available_bootstrap_names = tuple(
+        name for name in bootstrap_names(args.kind) if name in metrics
+    )
     confidence_intervals = bootstrap_metric_set(
         rows,
         lambda sample: calculate_metrics(args.kind, sample),
-        bootstrap_names(args.kind),
+        available_bootstrap_names,
         iterations=args.bootstrap_iterations,
         seed=args.bootstrap_seed,
     )
@@ -130,7 +187,9 @@ def main() -> int:
         endpoint_names = (
             tuple(item.strip() for item in args.primary_endpoints.split(",") if item.strip())
             if args.primary_endpoints
-            else DEFAULT_PRIMARY_ENDPOINTS[args.kind]
+            else tuple(
+                name for name in DEFAULT_PRIMARY_ENDPOINTS[args.kind] if name in metrics
+            )
         )
         if not endpoint_names or len(endpoint_names) > 5:
             raise ValueError("primary endpoints must contain between one and five metrics")

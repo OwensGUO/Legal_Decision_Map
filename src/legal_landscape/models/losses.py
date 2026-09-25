@@ -13,6 +13,7 @@ from torch.nn import functional as F
 @dataclass(frozen=True)
 class LossBreakdown:
     charge: Tensor
+    article: Tensor
     sentence: Tensor
     invariant: Tensor
     boundary: Tensor
@@ -38,6 +39,9 @@ def compute_typed_losses(
     charge_logits: Tensor | None = None,
     charge_targets: Tensor | None = None,
     charge_mask: Tensor | None = None,
+    article_logits: Tensor | None = None,
+    article_targets: Tensor | None = None,
+    article_mask: Tensor | None = None,
     penalty_logits: Tensor | None = None,
     penalty_targets: Tensor | None = None,
     penalty_mask: Tensor | None = None,
@@ -57,10 +61,11 @@ def compute_typed_losses(
     rank_margin: float = 0.0,
     weights: dict[str, float] | None = None,
 ) -> LossBreakdown:
-    """Compute the requested six-part objective with empty-mask safeguards."""
+    """Compute the supervised and counterfactual objective with empty-mask safeguards."""
     zero = _anchor(
         (
             charge_logits,
+            article_logits,
             penalty_logits,
             sentence_predictions,
             factor_logits,
@@ -70,7 +75,16 @@ def compute_typed_losses(
         )
     )
     counts = {
-        name: 0 for name in ("charge", "sentence", "invariant", "boundary", "response", "factor")
+        name: 0
+        for name in (
+            "charge",
+            "article",
+            "sentence",
+            "invariant",
+            "boundary",
+            "response",
+            "factor",
+        )
     }
     charge = zero
     if charge_logits is not None and charge_targets is not None:
@@ -84,6 +98,19 @@ def compute_typed_losses(
         ).mean(-1)
         charge = _masked_mean(per_item, mask, zero)
         counts["charge"] = int(mask.sum().item())
+
+    article = zero
+    if article_logits is not None and article_targets is not None:
+        mask = (
+            torch.ones(article_logits.shape[0], dtype=torch.bool, device=article_logits.device)
+            if article_mask is None
+            else article_mask.bool()
+        )
+        per_item = F.binary_cross_entropy_with_logits(
+            article_logits, article_targets, reduction="none"
+        ).mean(-1)
+        article = _masked_mean(per_item, mask, zero)
+        counts["article"] = int(mask.sum().item())
 
     sentence = zero
     sentence_count = 0
@@ -168,6 +195,7 @@ def compute_typed_losses(
         counts["response"] = int(rank_mask.sum().item())
 
     scale = {
+        "article": 1.0,
         "sentence": 1.0,
         "invariant": 1.0,
         "boundary": 1.0,
@@ -177,10 +205,21 @@ def compute_typed_losses(
     }
     total = (
         charge
+        + scale["article"] * article
         + scale["sentence"] * sentence
         + scale["invariant"] * invariant
         + scale["boundary"] * boundary
         + scale["response"] * response
         + scale["factor"] * factor
     )
-    return LossBreakdown(charge, sentence, invariant, boundary, response, factor, total, counts)
+    return LossBreakdown(
+        charge,
+        article,
+        sentence,
+        invariant,
+        boundary,
+        response,
+        factor,
+        total,
+        counts,
+    )

@@ -223,10 +223,16 @@ def training_plan(config: dict[str, Any], *, experiment: str) -> dict[str, Any]:
 
 def format_model_input(record: dict[str, Any], *, use_factors: bool) -> str:
     """Render explicit input sections shared by all real-model experiments."""
+    fact = (
+        record.get("fact_strict")
+        or record.get("fact_conservative")
+        or record.get("fact_raw")
+        or ""
+    )
     sections = [
         f"[DATASET]\n{record['dataset']}",
         f"[TARGET_DEFENDANT]\n{record['target_defendant']}",
-        f"[FACT]\n{record.get('fact_conservative') or record.get('fact_raw') or ''}",
+        f"[FACT]\n{fact}",
     ]
     if use_factors:
         sections.append(
@@ -292,7 +298,8 @@ def load_counterfactual_pairs(
                 pairs.append(
                     {
                         "parent_record": parent,
-                        "parent_text": parent.get("fact_conservative")
+                        "parent_text": parent.get("fact_strict")
+                        or parent.get("fact_conservative")
                         or parent.get("fact_raw")
                         or "",
                         "counterfactual_text": counterfactual_text,
@@ -314,34 +321,50 @@ def make_static_prediction_rows(
     records: list[dict[str, Any]],
     *,
     charge_probabilities: list[list[float]],
+    article_probabilities: list[list[float]],
     penalty_indices: list[int],
     sentence_months: list[float],
     charge_vocabulary: list[str],
+    article_vocabulary: list[str],
     penalty_vocabulary: list[str],
     threshold: float = 0.5,
 ) -> list[dict[str, Any]]:
     """Build evaluation JSON rows while retaining original case/group IDs."""
     if not (
-        len(records) == len(charge_probabilities) == len(penalty_indices) == len(sentence_months)
+        len(records)
+        == len(charge_probabilities)
+        == len(article_probabilities)
+        == len(penalty_indices)
+        == len(sentence_months)
     ):
         raise ValueError("prediction arrays must match the number of records")
     charge_to_index = {label: index for index, label in enumerate(charge_vocabulary)}
+    article_to_index = {label: index for index, label in enumerate(article_vocabulary)}
     rows: list[dict[str, Any]] = []
-    for record, probabilities, penalty_index, predicted_months in zip(
+    for record, probabilities, article_probs, penalty_index, predicted_months in zip(
         records,
         charge_probabilities,
+        article_probabilities,
         penalty_indices,
         sentence_months,
         strict=True,
     ):
         if len(probabilities) != len(charge_vocabulary):
             raise ValueError("charge probability width does not match vocabulary")
+        if len(article_probs) != len(article_vocabulary):
+            raise ValueError("article probability width does not match vocabulary")
         true_charges = [0] * len(charge_vocabulary)
         for charge in record["charges"]:
             true_charges[charge_to_index[charge]] = 1
         predicted_charges = [int(value >= threshold) for value in probabilities]
         if not any(predicted_charges):
             predicted_charges[max(range(len(probabilities)), key=probabilities.__getitem__)] = 1
+        true_articles = [0] * len(article_vocabulary)
+        for article in record.get("conviction_articles") or ():
+            true_articles[article_to_index[article]] = 1
+        predicted_articles = [int(value >= threshold) for value in article_probs]
+        if article_probs and not any(predicted_articles):
+            predicted_articles[max(range(len(article_probs)), key=article_probs.__getitem__)] = 1
         rows.append(
             {
                 "case_id": record["case_id"],
@@ -355,11 +378,23 @@ def make_static_prediction_rows(
                     for label, selected in zip(charge_vocabulary, predicted_charges, strict=True)
                     if selected
                 ],
+                "true_articles": true_articles,
+                "predicted_articles": predicted_articles,
+                "article_probabilities": article_probs,
+                "true_article_labels": list(record.get("conviction_articles") or ()),
+                "predicted_article_labels": [
+                    label
+                    for label, selected in zip(
+                        article_vocabulary, predicted_articles, strict=True
+                    )
+                    if selected
+                ],
                 "penalty_type": record["penalty_type"],
                 "predicted_penalty_type": penalty_vocabulary[penalty_index],
                 "true_months": record.get("imprisonment_months"),
                 "predicted_months": float(predicted_months),
                 "correct": predicted_charges == true_charges,
+                "article_correct": predicted_articles == true_articles,
             }
         )
     return rows
@@ -507,6 +542,7 @@ def run_dummy_train_step(*, seed: int = 42) -> float:
         DummyBackbone(vocab_size=32, hidden_size=16),
         hidden_size=16,
         num_charges=3,
+        num_articles=4,
         num_penalty_types=6,
         num_factors=5,
     )
@@ -515,6 +551,10 @@ def run_dummy_train_step(*, seed: int = 42) -> float:
     losses = compute_typed_losses(
         charge_logits=output["charge_logits"],
         charge_targets=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        article_logits=output["article_logits"],
+        article_targets=torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+        ),
         penalty_logits=output["penalty_type_logits"],
         penalty_targets=torch.tensor([0, 0]),
         sentence_predictions=output["sentence_months"],
@@ -531,7 +571,16 @@ def validate_loss_breakdown(losses: Any, diagnostic_path: str | Path, *, step: i
     """Fail fast on NaN/Inf or a nonzero loss with no eligible samples."""
     errors: list[str] = []
     values: dict[str, float] = {}
-    for name in ("charge", "sentence", "invariant", "boundary", "response", "factor", "total"):
+    for name in (
+        "charge",
+        "article",
+        "sentence",
+        "invariant",
+        "boundary",
+        "response",
+        "factor",
+        "total",
+    ):
         value = float(getattr(losses, name).detach().item())
         values[name] = value
         if not math.isfinite(value):
@@ -553,17 +602,21 @@ def validate_loss_breakdown(losses: Any, diagnostic_path: str | Path, *, step: i
 
 def _fit_majority_mean(records: list[dict[str, Any]], output_dir: Path) -> dict[str, Any]:
     charge_counts: dict[str, int] = {}
+    article_counts: dict[str, int] = {}
     finite_terms: list[float] = []
     penalty_counts: dict[str, int] = {}
     for record in records:
         for charge in record["charges"]:
             charge_counts[charge] = charge_counts.get(charge, 0) + 1
+        for article in record.get("conviction_articles") or ():
+            article_counts[article] = article_counts.get(article, 0) + 1
         penalty = str(record["penalty_type"])
         penalty_counts[penalty] = penalty_counts.get(penalty, 0) + 1
         if penalty == "fixed_term" and record.get("imprisonment_months") is not None:
             finite_terms.append(float(record["imprisonment_months"]))
     payload = {
         "majority_charge": max(charge_counts, key=charge_counts.get),
+        "majority_article": max(article_counts, key=article_counts.get),
         "majority_penalty_type": max(penalty_counts, key=penalty_counts.get),
         "mean_imprisonment_months": (
             sum(finite_terms) / len(finite_terms) if finite_terms else 0.0
@@ -622,8 +675,22 @@ def run_real_training(
     metadata_path = Path(train_data).parent / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     charges = list(metadata["charge_vocabulary"])
+    articles = list(metadata.get("article_vocabulary") or ())
+    if not articles:
+        articles = sorted(
+            {
+                str(article)
+                for record in records
+                for article in (record.get("conviction_articles") or ())
+            }
+        )
+    if not articles:
+        raise ValueError(
+            "training data has no conviction-article labels; rebuild the processed dataset"
+        )
     penalties = list(metadata["penalty_vocabulary"])
     charge_to_index = {label: index for index, label in enumerate(charges)}
+    article_to_index = {label: index for index, label in enumerate(articles)}
     penalty_to_index = {label: index for index, label in enumerate(penalties)}
     parents = {str(record["case_id"]): record for record in records}
     evaluation_pairs: list[dict[str, Any]] = []
@@ -659,8 +726,12 @@ def run_real_training(
     if experiment.backbone == "majority_mean":
         result = _fit_majority_mean(records, destination)
         majority_charge = str(result["majority_charge"])
+        majority_article = str(result["majority_article"])
         majority_penalty = str(result["majority_penalty_type"])
         majority_probability = [float(charge == majority_charge) for charge in charges]
+        majority_article_probability = [
+            float(article == majority_article) for article in articles
+        ]
         prediction_root = Path(prediction_dir or destination / "predictions")
         if evaluation_data is not None:
             evaluation_records = load_processed_records(evaluation_data, limit=limit)
@@ -670,10 +741,13 @@ def run_real_training(
                 make_static_prediction_rows(
                     evaluation_records,
                     charge_probabilities=[majority_probability] * len(evaluation_records),
+                    article_probabilities=[majority_article_probability]
+                    * len(evaluation_records),
                     penalty_indices=[penalties.index(majority_penalty)] * len(evaluation_records),
                     sentence_months=[float(result["mean_imprisonment_months"])]
                     * len(evaluation_records),
                     charge_vocabulary=charges,
+                    article_vocabulary=articles,
                     penalty_vocabulary=penalties,
                 ),
             )
@@ -699,8 +773,10 @@ def run_real_training(
         for pair in pairs:
             parent = dict(pair["parent_record"])
             parent["fact_conservative"] = pair["counterfactual_text"]
+            parent["fact_strict"] = pair["counterfactual_text"]
             if pair["intervention_type"] == "charge_flip" and pair["target_charge"]:
                 parent["charges"] = [pair["target_charge"]]
+                parent["conviction_articles"] = []
             parent["penalty_type"] = "unknown"
             parent["imprisonment_months"] = None
             records.append(parent)
@@ -754,6 +830,7 @@ def run_real_training(
         TextBackbone(text_model),
         hidden_size=hidden_size,
         num_charges=len(charges),
+        num_articles=len(articles),
         num_penalty_types=len(penalties),
         num_factors=5,
         hard_charge=experiment.hard_charge_sentence,
@@ -774,6 +851,8 @@ def run_real_training(
             [format_model_input(item, use_factors=experiment.use_factors) for item in batch]
         )
         charge_targets = torch.zeros((len(batch), len(charges)), dtype=torch.float32)
+        article_targets = torch.zeros((len(batch), len(articles)), dtype=torch.float32)
+        article_mask = torch.zeros(len(batch), dtype=torch.bool)
         penalty_targets = torch.zeros(len(batch), dtype=torch.long)
         sentence_targets = torch.zeros(len(batch), dtype=torch.float32)
         sentence_mask = torch.zeros(len(batch), dtype=torch.bool)
@@ -781,6 +860,10 @@ def run_real_training(
         for index, item in enumerate(batch):
             for charge in item["charges"]:
                 charge_targets[index, charge_to_index[charge]] = 1.0
+            item_articles = item.get("conviction_articles") or ()
+            for article in item_articles:
+                article_targets[index, article_to_index[article]] = 1.0
+            article_mask[index] = bool(item_articles)
             penalty_targets[index] = penalty_to_index[item["penalty_type"]]
             eligible = (
                 item["penalty_type"] == "fixed_term"
@@ -803,6 +886,8 @@ def run_real_training(
         result = {
             **encoded,
             "charge_targets": charge_targets,
+            "article_targets": article_targets,
+            "article_mask": article_mask,
             "penalty_targets": penalty_targets,
             "sentence_targets": sentence_targets,
             "sentence_mask": sentence_mask,
@@ -820,6 +905,7 @@ def run_real_training(
             {
                 **item["parent_record"],
                 "fact_conservative": item["counterfactual_text"],
+                "fact_strict": item["counterfactual_text"],
             }
             for item in batch
         ]
@@ -987,6 +1073,9 @@ def run_real_training(
                 losses = compute_typed_losses(
                     charge_logits=output["charge_logits"],
                     charge_targets=batch["charge_targets"],
+                    article_logits=output["article_logits"],
+                    article_targets=batch["article_targets"],
+                    article_mask=batch["article_mask"],
                     penalty_logits=output["penalty_type_logits"],
                     penalty_targets=batch["penalty_targets"],
                     sentence_predictions=output["sentence_months"],
@@ -1013,6 +1102,7 @@ def run_real_training(
                         name: float(getattr(losses, name).detach())
                         for name in (
                             "charge",
+                            "article",
                             "sentence",
                             "invariant",
                             "boundary",
@@ -1051,6 +1141,7 @@ def run_real_training(
                     "steps": step,
                     "completed_microbatches": completed_microbatches,
                     "charge_vocabulary": charges,
+                    "article_vocabulary": articles,
                     "penalty_vocabulary": penalties,
                     "counterfactual_pairs": len(pairs),
                     "evaluation_counterfactual_pairs": len(evaluation_pairs),
@@ -1083,7 +1174,7 @@ def run_real_training(
                 collate_fn=collate_cases,
             )
         )
-        gathered_static: dict[int, tuple[list[float], int, float]] = {}
+        gathered_static: dict[int, tuple[list[float], list[float], int, float]] = {}
         with torch.no_grad():
             for batch in evaluation_loader:
                 output = predictor(batch["input_ids"], batch.get("attention_mask"))
@@ -1091,20 +1182,33 @@ def run_real_training(
                     (
                         batch["record_indices"],
                         torch.sigmoid(output["charge_logits"]),
+                        torch.sigmoid(output["article_logits"]),
                         output["penalty_type_logits"].argmax(dim=-1),
                         output["sentence_months"],
                     )
                 )
-                indices, probabilities, penalty_indices, sentence_months = gathered
+                (
+                    indices,
+                    probabilities,
+                    article_probabilities,
+                    penalty_indices,
+                    sentence_months,
+                ) = gathered
                 if accelerator.is_main_process:
-                    for index, probability, penalty, months in zip(
+                    for index, probability, article_probability, penalty, months in zip(
                         indices.cpu().tolist(),
                         probabilities.float().cpu().tolist(),
+                        article_probabilities.float().cpu().tolist(),
                         penalty_indices.cpu().tolist(),
                         sentence_months.float().cpu().tolist(),
                         strict=True,
                     ):
-                        gathered_static[int(index)] = (probability, int(penalty), float(months))
+                        gathered_static[int(index)] = (
+                            probability,
+                            article_probability,
+                            int(penalty),
+                            float(months),
+                        )
         if accelerator.is_main_process:
             ordered_static = [gathered_static[index] for index in range(len(evaluation_records))]
             static_path = prediction_root / "static.jsonl"
@@ -1113,9 +1217,11 @@ def run_real_training(
                 make_static_prediction_rows(
                     evaluation_records,
                     charge_probabilities=[item[0] for item in ordered_static],
-                    penalty_indices=[item[1] for item in ordered_static],
-                    sentence_months=[item[2] for item in ordered_static],
+                    article_probabilities=[item[1] for item in ordered_static],
+                    penalty_indices=[item[2] for item in ordered_static],
+                    sentence_months=[item[3] for item in ordered_static],
                     charge_vocabulary=charges,
+                    article_vocabulary=articles,
                     penalty_vocabulary=penalties,
                 ),
             )

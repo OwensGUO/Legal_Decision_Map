@@ -2,7 +2,8 @@
 
 本项目把 CAIL-small 单被告主实验和 CMDL-small 多被告扩展实验统一为可追溯的
 `CaseUnit`，先抽取结构化法律因素，再生成三类反事实，最后用多任务 QLoRA 模型学习
-罪名、刑罚类型、有限期刑月份和因素辅助任务。默认命令不会启动全量生成或训练。
+罪名、被告级定罪法条、刑罚类型、有限期刑月份和因素辅助任务。法条头以软罪名概率为
+条件，刑期头进一步使用软法条概率；默认命令不会启动全量生成或训练。
 
 ## 1. 目录与安全边界
 
@@ -177,6 +178,11 @@ python scripts/build_dataset.py --config configs/data/cmdl_small.yaml \
 的上限，例如 CAIL-small 训练集可使用 `--limit 200000`。输出含 raw、conservative、
 strict 三种文本、屏蔽审计、因素、标签、原始路径、case/group ID、manifest 和词表。
 
+CAIL 的定罪法条来自 `meta.relevant_articles`，CMDL 来自目标被告各项
+`outcomes[].judgment[].article`，统一规范为 `criminal_law:<条>[:<款>]`。CMDL 顶层
+`relevant_articles` 是案件级信息，不会复制为每个被告的监督标签。训练优先使用
+`fact_strict`，避免原文中的罪名和法条引用泄漏到预测任务。
+
 源数据中存在少量相同案件跨官方 split 重复的情况。构建器会按 `test > valid > train`
 将整个 `group_id` 只保留在最严格的留出集，防止训练集泄漏；`metadata.json` 的
 `split_integrity` 会记录跨 split 组数和各 split 删除的单元数。该处理不修改源数据。
@@ -299,6 +305,8 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --multi_gpu --num_processes 4 \
 `--set training.seed=42`、`2026`、`3407` 分别运行。CAIL 使用
 `--set model.max_length=4096`，CMDL 使用 `8192`。训练日志在 `train.jsonl` 和
 `tensorboard/`，损失 NaN/Inf 或空样本非零会立即写 `loss_diagnostic.json` 并退出。
+静态预测文件同时保存罪名和法条的真实/预测多热向量、概率与可读标签，以及刑罚类型和
+连续月份预测。
 
 ## 11. 评测并生成 JSON
 
@@ -324,6 +332,13 @@ python scripts/evaluate_model.py --kind cmdl \
 每个评测结果都会按 `group_id` 整组重采样并输出点估计与 95% 置信区间。指定
 `--reference-input` 后，额外输出配对差异、原始 p 值，以及至多五个主要终点的 Holm
 校正 p 值；未指定参考模型时不会伪造比较检验。无期、死刑不会进入月份指标。
+
+静态评测对罪名、定罪法条和最终刑期类别都强制输出 `accuracy`、
+`macro_precision`、`macro_recall`、`macro_f1`，字段分别使用 `charge_`、`article_`、
+`sentence_` 前缀。罪名和法条的 accuracy 是整组标签完全一致；刑期类别包括死刑、无期、
+拘役、管制、免刑、未知，以及有期徒刑 `0-6`、`7-12`、`13-24`、`25-36`、`37-60`、
+`61-120`、`121+` 月。评测还输出多标签 micro 指标、Hamming accuracy，以及单罪名有期
+徒刑样本的 MAE、log-MAE 和三个月容差准确率。
 
 ## 12. 本地验收
 

@@ -80,6 +80,23 @@ class ModelLossTests(unittest.TestCase):
         self.assertEqual(losses.sentence.item(), 0.0)
         self.assertEqual(losses.total.item(), 0.0)
 
+    def test_article_supervision_uses_multilabel_bce_and_empty_mask(self) -> None:
+        from legal_landscape.models.losses import compute_typed_losses
+
+        active = compute_typed_losses(
+            article_logits=torch.tensor([[2.0, -2.0], [-1.0, 1.0]]),
+            article_targets=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        )
+        empty = compute_typed_losses(
+            article_logits=torch.zeros((2, 2)),
+            article_targets=torch.zeros((2, 2)),
+            article_mask=torch.tensor([False, False]),
+        )
+        self.assertGreater(active.article.item(), 0.0)
+        self.assertEqual(active.active_counts["article"], 2)
+        self.assertEqual(empty.article.item(), 0.0)
+        self.assertEqual(empty.active_counts["article"], 0)
+
     def test_predictor_runs_with_dummy_backbone(self) -> None:
         from legal_landscape.models.predictor import DummyBackbone, LegalLandscapePredictor
 
@@ -87,6 +104,7 @@ class ModelLossTests(unittest.TestCase):
             DummyBackbone(vocab_size=20, hidden_size=8),
             hidden_size=8,
             num_charges=3,
+            num_articles=4,
             num_penalty_types=6,
             num_factors=5,
         )
@@ -95,6 +113,9 @@ class ModelLossTests(unittest.TestCase):
             model.heads.charge.bias.zero_()
         output = model(torch.tensor([[1, 2, 3], [4, 5, 0]]))
         self.assertEqual(tuple(output["charge_logits"].shape), (2, 3))
+        self.assertEqual(tuple(output["article_logits"].shape), (2, 4))
+        self.assertEqual(model.heads.article.in_features, 8 + 3)
+        self.assertEqual(model.heads.sentence_by_charge.in_features, 8 + 4)
         self.assertEqual(tuple(output["sentence_months"].shape), (2,))
         self.assertTrue(
             torch.allclose(output["charge_probabilities"].sum(-1), torch.full((2,), 1.5))

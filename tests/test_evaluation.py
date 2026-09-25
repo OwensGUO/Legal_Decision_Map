@@ -11,16 +11,52 @@ from legal_landscape.evaluation.bootstrap import (
 )
 from legal_landscape.evaluation.cmdl_case_metrics import cmdl_metrics
 from legal_landscape.evaluation.counterfactual_metrics import counterfactual_metrics
-from legal_landscape.evaluation.static_metrics import charge_metrics, sentence_metrics
+from legal_landscape.evaluation.static_metrics import (
+    charge_metrics,
+    multiclass_metrics,
+    multilabel_metrics,
+    sentence_class,
+    sentence_metrics,
+)
 
 
 def test_charge_metrics_have_hand_checked_values() -> None:
     truth = np.array([[1, 0], [1, 1], [0, 1]])
     prediction = np.array([[1, 0], [1, 0], [0, 1]])
     result = charge_metrics(truth, prediction)
+    assert result["accuracy"] == 2 / 3
+    assert result["macro_precision"] == 1.0
+    assert result["macro_recall"] == 0.75
     assert result["micro_f1"] == 6 / 7
     assert result["macro_f1"] == (1.0 + 2 / 3) / 2
     assert result["exact_match"] == 2 / 3
+
+
+def test_multilabel_metrics_report_required_and_supplementary_values() -> None:
+    truth = np.array([[1, 0], [1, 1], [0, 1]])
+    prediction = np.array([[1, 0], [1, 0], [0, 1]])
+    result = multilabel_metrics(truth, prediction)
+    assert result["accuracy"] == 2 / 3
+    assert result["macro_precision"] == 1.0
+    assert result["macro_recall"] == 0.75
+    assert result["macro_f1"] == (1.0 + 2 / 3) / 2
+    assert result["hamming_accuracy"] == 5 / 6
+
+
+def test_multiclass_metrics_and_sentence_bins_have_hand_checked_values() -> None:
+    result = multiclass_metrics(
+        ("a", "b", "c", "c"),
+        ("a", "b", "b", "c"),
+        labels=("a", "b", "c"),
+    )
+    assert result["accuracy"] == 0.75
+    assert result["macro_precision"] == (1.0 + 0.5 + 1.0) / 3
+    assert result["macro_recall"] == (1.0 + 1.0 + 0.5) / 3
+    assert result["macro_f1"] == (1.0 + 2 / 3 + 2 / 3) / 3
+    assert sentence_class("fixed_term", 6) == "fixed_term_0_6"
+    assert sentence_class("fixed_term", 7) == "fixed_term_7_12"
+    assert sentence_class("fixed_term", 121) == "fixed_term_121_plus"
+    assert sentence_class("life", None) == "life"
 
 
 def test_sentence_metrics_exclude_life_and_death() -> None:

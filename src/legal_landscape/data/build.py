@@ -76,6 +76,7 @@ def build_dataset(
     destination.mkdir(parents=True, exist_ok=True)
     split_units: dict[str, int] = {}
     charges: set[str] = set()
+    articles: set[str] = set()
     group_splits, cross_split_groups = _assign_groups_to_splits(
         data, paths, limit=limit
     )
@@ -100,6 +101,7 @@ def build_dataset(
                 }
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 charges.update(case.charges)
+                articles.update(case.conviction_articles)
                 count += 1
         split_units[split] = count
     manifest = [entry.to_dict() for entry in build_manifest(list(paths.values()))]
@@ -115,6 +117,7 @@ def build_dataset(
             "dropped_units": dropped_units,
         },
         "charge_vocabulary": sorted(charges),
+        "article_vocabulary": sorted(articles),
         "penalty_vocabulary": [
             "fixed_term",
             "life",

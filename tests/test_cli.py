@@ -70,6 +70,7 @@ def test_build_dataset_writes_traceable_processed_records(tmp_path) -> None:
         "meta": {
             "criminals": ["段某"],
             "accusation": ["盗窃"],
+            "relevant_articles": [264],
             "term_of_imprisonment": {
                 "death_penalty": False,
                 "life_imprisonment": False,
@@ -102,6 +103,9 @@ def test_build_dataset_writes_traceable_processed_records(tmp_path) -> None:
     assert processed["case_id"] == processed["group_id"]
     assert processed["source_path"].endswith("data_train.json:1")
     assert processed["fact_raw"] == f"{row['fact']}data_train.json"
+    assert processed["conviction_articles"] == ["criminal_law:264"]
+    assert processed["sentencing_articles"] == []
+    assert summary["article_vocabulary"] == ["criminal_law:264"]
     assert "公诉机关指控" not in processed["fact_conservative"]
     assert processed["factors"]["amount"] == 1000.0
     assert (output / "manifest.json").is_file()
@@ -222,22 +226,38 @@ def test_evaluation_cli_writes_bootstrap_and_five_holm_results(tmp_path) -> None
             "group_id": "g1",
             "true_charges": [1, 0],
             "predicted_charges": [1, 0],
+            "true_articles": [1, 0],
+            "predicted_articles": [1, 0],
             "predicted_months": 12.0,
             "true_months": 12.0,
             "penalty_type": "fixed_term",
+            "predicted_penalty_type": "fixed_term",
         },
         {
             "group_id": "g2",
             "true_charges": [0, 1],
             "predicted_charges": [0, 1],
+            "true_articles": [0, 1],
+            "predicted_articles": [0, 1],
             "predicted_months": 18.0,
             "true_months": 18.0,
             "penalty_type": "fixed_term",
+            "predicted_penalty_type": "fixed_term",
         },
     ]
     reference = [
-        {**candidate[0], "predicted_charges": [0, 1], "predicted_months": 20.0},
-        {**candidate[1], "predicted_charges": [1, 0], "predicted_months": 26.0},
+        {
+            **candidate[0],
+            "predicted_charges": [0, 1],
+            "predicted_articles": [0, 1],
+            "predicted_months": 20.0,
+        },
+        {
+            **candidate[1],
+            "predicted_charges": [1, 0],
+            "predicted_articles": [1, 0],
+            "predicted_months": 26.0,
+        },
     ]
     candidate_path = tmp_path / "candidate.jsonl"
     reference_path = tmp_path / "reference.jsonl"
@@ -271,5 +291,11 @@ def test_evaluation_cli_writes_bootstrap_and_five_holm_results(tmp_path) -> None
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["confidence_intervals"]["macro_f1"]["iterations"] == 20
+    required = {
+        f"{task}_{metric}"
+        for task in ("charge", "article", "sentence")
+        for metric in ("accuracy", "macro_precision", "macro_recall", "macro_f1")
+    }
+    assert required <= payload.keys()
+    assert payload["confidence_intervals"]["charge_macro_f1"]["iterations"] == 20
     assert len(payload["comparison"]["holm_adjusted_p_values"]) == 5

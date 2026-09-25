@@ -29,13 +29,20 @@ class LegalLandscapePredictor(nn.Module):
         *,
         hidden_size: int,
         num_charges: int,
+        num_articles: int,
         num_penalty_types: int,
         num_factors: int,
         hard_charge: bool = False,
     ) -> None:
         super().__init__()
         self.backbone = backbone
-        self.heads = MultiTaskHeads(hidden_size, num_charges, num_penalty_types, num_factors)
+        self.heads = MultiTaskHeads(
+            hidden_size,
+            num_charges,
+            num_articles,
+            num_penalty_types,
+            num_factors,
+        )
         self.hard_charge = hard_charge
 
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> dict[str, Tensor]:

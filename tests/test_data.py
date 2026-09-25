@@ -28,6 +28,7 @@ def test_cail_maps_one_row_to_one_case_and_preserves_multilabel(tmp_path) -> Non
                 "meta": {
                     "criminals": ["段某"],
                     "accusation": ["故意伤害", "寻衅滋事"],
+                    "relevant_articles": [234, "293-1"],
                     "term_of_imprisonment": {
                         "death_penalty": False,
                         "life_imprisonment": False,
@@ -41,6 +42,8 @@ def test_cail_maps_one_row_to_one_case_and_preserves_multilabel(tmp_path) -> Non
     assert case.case_id == case.group_id
     assert case.target_defendant == "段某"
     assert case.charges == ("故意伤害", "寻衅滋事")
+    assert case.conviction_articles == ("criminal_law:234", "criminal_law:293:1")
+    assert case.sentencing_articles == ()
     assert case.imprisonment_months == 12
 
 
@@ -59,9 +62,20 @@ def test_cmdl_expands_defendants_and_keeps_group(tmp_path) -> None:
             {
                 "fact": "甲乙共同实施行为。",
                 "defendants": ["甲", "乙"],
+                "relevant_articles": ["25-1", "27"],
                 "outcomes": [
-                    {"name": "甲", "judgment": [{"accusation": "盗窃罪", "penalty": penalty}]},
-                    {"name": "乙", "judgment": [{"accusation": "诈骗罪", "penalty": penalty}]},
+                    {
+                        "name": "甲",
+                        "judgment": [
+                            {"accusation": "盗窃罪", "article": ["264"], "penalty": penalty}
+                        ],
+                    },
+                    {
+                        "name": "乙",
+                        "judgment": [
+                            {"accusation": "诈骗罪", "article": ["266-1"], "penalty": penalty}
+                        ],
+                    },
                 ],
             }
         ],
@@ -71,6 +85,9 @@ def test_cmdl_expands_defendants_and_keeps_group(tmp_path) -> None:
     assert len({item.group_id for item in cases}) == 1
     assert len({item.case_id for item in cases}) == 2
     assert cases[0].charges == ("盗窃",)
+    assert cases[0].conviction_articles == ("criminal_law:264",)
+    assert cases[1].conviction_articles == ("criminal_law:266:1",)
+    assert all(item.sentencing_articles == () for item in cases)
 
 
 def test_life_sentence_never_gets_months(tmp_path) -> None:

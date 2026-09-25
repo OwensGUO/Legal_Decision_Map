@@ -21,6 +21,7 @@ training:
   mixed_precision: bf16
   seed: 42
 loss:
+  article: 1.0
   sentence: 1.0
   invariant: 1.0
   boundary: 1.0

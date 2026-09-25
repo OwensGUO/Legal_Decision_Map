@@ -126,13 +126,15 @@ class TrainingPlanTests(unittest.TestCase):
                 "dataset": "cmdl",
                 "target_defendant": "某甲",
                 "fact_conservative": "案件事实。",
+                "fact_strict": "严格屏蔽后的案件事实。",
                 "factors": {"amount": 1000.0, "confession": True},
             },
             use_factors=True,
         )
         self.assertIn("[DATASET]\ncmdl", text)
         self.assertIn("[TARGET_DEFENDANT]\n某甲", text)
-        self.assertIn("[FACT]\n案件事实。", text)
+        self.assertIn("[FACT]\n严格屏蔽后的案件事实。", text)
+        self.assertNotIn("[FACT]\n案件事实。", text)
         self.assertIn("[FACTORS]", text)
         self.assertIn('"amount": 1000.0', text)
 
@@ -176,6 +178,7 @@ class TrainingPlanTests(unittest.TestCase):
                 "case_id": "c1",
                 "group_id": "g1",
                 "charges": ["盗窃"],
+                "conviction_articles": ["criminal_law:264"],
                 "penalty_type": "fixed_term",
                 "imprisonment_months": 12,
             },
@@ -183,6 +186,7 @@ class TrainingPlanTests(unittest.TestCase):
                 "case_id": "c2",
                 "group_id": "g2",
                 "charges": ["诈骗"],
+                "conviction_articles": ["criminal_law:266"],
                 "penalty_type": "life",
                 "imprisonment_months": None,
             },
@@ -190,14 +194,19 @@ class TrainingPlanTests(unittest.TestCase):
         rows = make_static_prediction_rows(
             records,
             charge_probabilities=[[0.8, 0.2], [0.3, 0.7]],
+            article_probabilities=[[0.9, 0.1], [0.2, 0.8]],
             penalty_indices=[0, 1],
             sentence_months=[11.5, 99.0],
             charge_vocabulary=["盗窃", "诈骗"],
+            article_vocabulary=["criminal_law:264", "criminal_law:266"],
             penalty_vocabulary=["fixed_term", "life"],
         )
         self.assertEqual(rows[0]["group_id"], "g1")
         self.assertEqual(rows[0]["true_charges"], [1, 0])
         self.assertEqual(rows[0]["predicted_charges"], [1, 0])
+        self.assertEqual(rows[0]["true_articles"], [1, 0])
+        self.assertEqual(rows[0]["predicted_articles"], [1, 0])
+        self.assertEqual(rows[0]["predicted_article_labels"], ["criminal_law:264"])
         self.assertTrue(rows[0]["correct"])
         self.assertIsNone(rows[1]["true_months"])
 
@@ -206,15 +215,18 @@ class TrainingPlanTests(unittest.TestCase):
             "case_id": "c1",
             "group_id": "g1",
             "charges": ["盗窃", "诈骗"],
+            "conviction_articles": ["criminal_law:264", "criminal_law:266"],
             "penalty_type": "fixed_term",
             "imprisonment_months": 12,
         }
         row = make_static_prediction_rows(
             [record],
             charge_probabilities=[[0.8, 0.7]],
+            article_probabilities=[[0.8, 0.7]],
             penalty_indices=[0],
             sentence_months=[12.0],
             charge_vocabulary=["盗窃", "诈骗"],
+            article_vocabulary=["criminal_law:264", "criminal_law:266"],
             penalty_vocabulary=["fixed_term"],
         )[0]
         self.assertEqual(row["predicted_charges"], [1, 1])
@@ -268,14 +280,23 @@ class TorchTrainingTests(unittest.TestCase):
 
         zero = torch.tensor(0.0)
         bad = LossBreakdown(
-            torch.tensor(float("nan")),
-            zero,
-            zero,
-            zero,
-            zero,
-            torch.tensor(1.0),
-            zero,
-            {"charge": 1, "sentence": 0, "invariant": 0, "boundary": 0, "response": 0, "factor": 0},
+            charge=torch.tensor(float("nan")),
+            article=zero,
+            sentence=zero,
+            invariant=zero,
+            boundary=zero,
+            response=zero,
+            factor=torch.tensor(1.0),
+            total=zero,
+            active_counts={
+                "charge": 1,
+                "article": 0,
+                "sentence": 0,
+                "invariant": 0,
+                "boundary": 0,
+                "response": 0,
+                "factor": 0,
+            },
         )
         with TemporaryDirectory() as directory:
             path = Path(directory) / "diagnostic.json"

@@ -29,6 +29,8 @@ class CaseUnit:
     penalty_type: str
     imprisonment_months: int | None
     source_path: str
+    conviction_articles: tuple[str, ...] = ()
+    sentencing_articles: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.dataset, self.split, self.case_id, self.group_id, self.source_path)):
@@ -41,6 +43,8 @@ class CaseUnit:
             raise ValueError("months are only valid for fixed-term imprisonment")
         if self.imprisonment_months is not None and self.imprisonment_months < 0:
             raise ValueError("months must be non-negative")
+        if any(not item.strip() for item in self.conviction_articles + self.sentencing_articles):
+            raise ValueError("article labels must be non-empty")
 
     @property
     def is_sentence_regression_eligible(self) -> bool:
@@ -53,11 +57,20 @@ class CaseUnit:
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["charges"] = list(self.charges)
+        value["conviction_articles"] = list(self.conviction_articles)
+        value["sentencing_articles"] = list(self.sentencing_articles)
         return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> CaseUnit:
-        return cls(**{**value, "charges": tuple(value["charges"])})
+        return cls(
+            **{
+                **value,
+                "charges": tuple(value["charges"]),
+                "conviction_articles": tuple(value.get("conviction_articles") or ()),
+                "sentencing_articles": tuple(value.get("sentencing_articles") or ()),
+            }
+        )
 
 
 def assert_group_split_integrity(cases: list[CaseUnit] | tuple[CaseUnit, ...]) -> None:
