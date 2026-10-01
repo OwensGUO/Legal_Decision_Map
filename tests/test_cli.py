@@ -189,6 +189,27 @@ def test_environment_and_requirement_dry_runs_are_read_only() -> None:
         assert json.loads(result.stdout)["dry_run"] is True
 
 
+def test_check_requirements_dry_run_works_without_pythonpath() -> None:
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "check_requirements.py"),
+            "--dry-run",
+            "--limit",
+            "4",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["dry_run"] is True
+
+
 def test_requirement_failures_include_every_requested_dependency_group() -> None:
     module = runpy.run_path(str(ROOT / "scripts" / "check_requirements.py"))
     has_requirement_failures = module["has_requirement_failures"]

@@ -1,4 +1,5 @@
 # Opt-in Qwen3.8 Gated DeltaNet Triton acceleration for CUDA 13.0.
+# Run a real GPU kernel probe successfully before using this package.
 # This package is not required for the base environment.
 -r requirements.txt
 flash-linear-attention[cuda]==0.5.2
