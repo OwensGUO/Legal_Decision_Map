@@ -27,46 +27,40 @@ tests/                   CPU/纯逻辑测试
 docs/superpowers/        设计与实施计划
 ```
 
-## 2. 服务器首次安装（Conda、Python 3.12、驱动 535）
+## 2. 服务器首次安装（Conda、Python 3.12、CUDA 13）
 
 数据处理、vLLM 反事实生成、训练和评测共用一个 Conda 环境。在项目根目录执行：
 
 ```bash
-conda create -n legal-landscape python=3.12 -y
-conda activate legal-landscape
+conda create -n legal-landscape-cu130 python=3.12 -y
+conda activate legal-landscape-cu130
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
 python -m pip install -e . --no-deps
 python -m pip check
+MODE=smoke bash run.sh
 ```
 
-基础环境不强制安装 Triton/FLA。只有基础 `MODE=smoke` 已通过且需要加速
-Qwen3.5 训练时，才尝试：
+目标服务器为 Ubuntu 24.04 x86-64、NVIDIA 驱动 580.173.02、CUDA 13.0，默认分配
+四张 RTX 4090（物理编号 `4,5,6,7`）。请新建环境，不要原地升级旧环境。
+
+基础环境不安装可选的 `flash-linear-attention[cuda]==0.5.2`。只有基础
+`MODE=smoke` 已通过且需要 Gated DeltaNet 加速时，才安装并执行真实内核探针：
 
 ```bash
 python -m pip install -r requirements-optional.txt
 CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/probe_gpu_stack.py --limit 4 --probe-fla
 ```
 
-版本选择依据（`requirements.txt` 顶部注释同步说明）：
+`requirements.txt` 是依赖的权威列表：`torch==2.13.0`、`vllm==0.30.0`、
+`transformers==5.15.0`、`accelerate==1.15.0`、`peft==0.21.1`、
+`bitsandbytes==0.50.0`，使用 CUDA 13 的预构建 wheel，不隐式源码编译 vLLM。
+FLA 安装成功不代表可用，必须通过上述实际 GPU 内核探针；缺少 FLA 时使用
+Transformers 回退实现。
 
-- Qwen3.5-9B 与 Qwen3.6-27B 的 `config.json` 都是 `model_type: qwen3_5`
-  （线性注意力 Gated DeltaNet 与全注意力混合，附带视觉塔）。vLLM 从 0.17 起、
-  Transformers 从 5.2 起才支持该架构。
-- Ubuntu 20.04 的 glibc 为 2.31；vLLM 0.20 起的 wheel 需要 glibc 2.35，因此固定
-  `vllm==0.19.1`，并按它的测试组合固定 `torch==2.10.0`、`transformers==5.5.3`、
-  `peft==0.18.1`、`bitsandbytes==0.49.2`、`accelerate==1.13.0`。
-- PyPI 上的 torch 2.10.0 使用 CUDA 12.8 运行时。驱动 535.171.04 原生对应 CUDA 12.2，
-  依靠 [CUDA 12.x 次版本兼容](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
-  （要求驱动 ≥ 525.60.13）运行；不要安装 cu13x wheel，它们需要 580 以上驱动。
-  服务器上的 CUDA Toolkit 12.2 不参与 wheel 选择。
-- `flash-linear-attention` 提供 Qwen3.5 训练时 Gated DeltaNet 的 Triton 快速路径，但
-  驱动 535 对较新 PTX/JIT 内核存在兼容风险，因此只放在 `requirements-optional.txt`。
-  缺少它时使用 Transformers 回退路径，速度可能较慢，但基础安装不会因此失败。
-
-CUDA 12.x 次版本兼容不保证较新 PTX/JIT 一定可用。因此“pip 安装成功”不视为验收成功；
-必须以 `probe_gpu_stack.py` 和 vLLM 的真实 JSON 生成探针结果为准。RTX 4090 不支持
-vLLM 的 CUDA forward-compatibility 库，请勿设置 `VLLM_ENABLE_CUDA_COMPATIBILITY=1`。
+“pip 安装成功”不视为验收成功；必须通过精确版本检查、`pip check`、CUDA 内核、
+BF16、NF4 及 vLLM 的真实非思考 JSON 生成探针。请勿设置
+`VLLM_ENABLE_CUDA_COMPATIBILITY=1`。
 
 安装后可用第 4 节命令确认 CUDA 真实可用、四卡可见、模型架构可被解析。
 
@@ -76,7 +70,7 @@ vLLM 的 CUDA forward-compatibility 库，请勿设置 `VLLM_ENABLE_CUDA_COMPATI
 执行的全部命令，再跑小规模闭环：
 
 ```bash
-conda activate legal-landscape
+conda activate legal-landscape-cu130
 bash run.sh --dry-run
 MODE=smoke bash run.sh
 ```
@@ -88,12 +82,16 @@ bash run.sh
 ```
 
 默认 `MODE=main` 会依次构建 CAIL-small 和 CMDL-small、以四卡张量并行启动
-Qwen3.6-27B vLLM 服务、断点续生成三类反事实、停止 vLLM 释放显存、用四卡训练两套
+Qwen3.8-27B BF16 vLLM 服务、断点续生成三类反事实、停止 vLLM 释放显存、用四卡训练两套
 `B3/seed-42` 和 `M/seed-42` 模型、导出预测，并执行聚类 bootstrap 及 M 对 B3 的
-配对评测。输出统一写入
-`outputs/`。反事实生成始终带 `--resume`。训练默认每 100 个优化器更新保存一次
+配对评测。输出统一写入 `OUTPUT_ROOT`（默认 `outputs/`）：处理数据共享
+`processed/{cail_small,cmdl_small}/`；反事实隔离为
+`counterfactuals/{qwen38,qwen36}/{cail,cmdl}.jsonl`，训练、检查点、预测和评测隔离为
+`runs/{qwen38,qwen36}/{cail,cmdl}/{experiment}/seed-{seed}/`，避免跨生成器恢复或混用。
+反事实生成始终带 `--resume`。训练默认每 100 个优化器更新保存一次
 `checkpoint-step-*`；若发生中断，再次执行会从时间最新的周期或最终检查点恢复。可用
-`CHECKPOINT_EVERY` 调整间隔。最终状态写入 `outputs/run-summary.json`。
+`CHECKPOINT_EVERY` 调整间隔。最终状态写入 `${OUTPUT_ROOT}/run-summary.json`，记录所选
+生成器；该根目录文件及诊断日志代表最近一次运行，按生成器隔离的结果保存在上述目录。
 
 完整基线、消融和三随机种子矩阵会产生 78 次训练，耗时和存储开销很大，仅在主流程验证
 通过后执行：
@@ -109,23 +107,42 @@ CAIL_ROOT=/data/datasets/CAIL2018 \
 CMDL_ROOT=/data/datasets/CMDL \
 QWEN35_PATH=/models/Qwen3.5-9B \
 QWEN36_PATH=/models/Qwen3.6-27B \
+QWEN38_PATH=/models/Qwen3.8-27B \
 OUTPUT_ROOT=/data/experiments/legal-landscape \
 bash run.sh
 ```
 
 默认不会修改依赖；只有显式设置 `INSTALL_DEPS=1` 才会安装 `requirements.txt`。
-`INSTALL_DEPS=1 INSTALL_FLA=1` 才会额外安装并探测 FLA。`MOCK_GENERATOR=1 MODE=smoke bash run.sh` 可跳过 Qwen3.6 服务，
+`INSTALL_DEPS=1 INSTALL_FLA=1` 才会额外安装并探测 FLA。`INSTALL_FLA=1` 会对已安装
+的 FLA 执行真实内核探针。`MOCK_GENERATOR=1 MODE=smoke bash run.sh` 可跳过生成服务，
 用于检查数据到训练的控制流；`INFER_MANAGED=0` 表示复用已运行的本地 vLLM 服务，
 `INFER_HOST`、`INFER_PORT`、`INFER_GPU_MEMORY` 调整地址与显存占用比例（不使用
 `VLLM_*` 前缀，因为 `VLLM_PORT` 等是 vLLM 自身的内部变量）。常用覆盖
 参数可运行 `bash run.sh --help` 查看。
+
+默认 `GENERATOR_MODEL=qwen38`；显式比较使用
+`GENERATOR_MODEL=qwen36 MODE=smoke bash run.sh`。默认路径如下，均可用对应变量覆盖：
+
+| 变量 | 默认路径 |
+|---|---|
+| `QWEN38_PATH` | `/data/cguo/Qwen3.8-27B` |
+| `QWEN36_PATH` | `/data/cguo/Qwen3.6-27B` |
+| `QWEN35_PATH` | `/data/cguo/Qwen3.5-9B` |
+| `CAIL_ROOT` | `/data/cguo/datasets/CAIL2018` |
+| `CMDL_ROOT` | `/data/cguo/datasets/CMDL` |
+
+Qwen3.8 BF16 是主生成器，Qwen3.6 BF16 用于明确标注的比较，Qwen3.5-9B 保持 NF4
+QLoRA 训练骨干。正式全量生成前，固定约 100 个父案件，用相同种子分别生成 Qwen3.6
+和 Qwen3.8 结果，报告 JSON 有效率、全部验证通过率、重试、目标因素实现、非目标漂移
+及近重复拒绝率。该质量门槛需要人工/实验核验，不是 `MODE=smoke` 自动完成的步骤，
+也不按下游测试表现重新选择主模型。
 
 ## 4. 环境、依赖和四卡检查
 
 ```bash
 python scripts/audit_environment.py
 python scripts/check_requirements.py \
-  --model-path /data/chenguo/Qwen3.5-9B
+  --model-path /data/cguo/Qwen3.5-9B
 CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/probe_gpu_stack.py --limit 4
 ```
 
@@ -166,12 +183,12 @@ python scripts/audit_data.py --config configs/data/cmdl_small.yaml --limit 2 \
 
 ```bash
 python scripts/build_dataset.py --config configs/data/cail_small.yaml \
-  --output-dir outputs/cail_small --limit 100 --dry-run
+  --output-dir outputs/processed/cail_small --limit 100 --dry-run
 python scripts/build_dataset.py --config configs/data/cail_small.yaml \
-  --output-dir outputs/cail_small --limit 100 --execute
+  --output-dir outputs/processed/cail_small --limit 100 --execute
 
 python scripts/build_dataset.py --config configs/data/cmdl_small.yaml \
-  --output-dir outputs/cmdl_small --limit 100 --execute
+  --output-dir outputs/processed/cmdl_small --limit 100 --execute
 ```
 
 去掉 `--limit` 并不安全，因为 CLI 默认仍为 100。正式全量构建时显式给一个覆盖数据规模
@@ -187,33 +204,40 @@ CAIL 的定罪法条来自 `meta.relevant_articles`，CMDL 来自目标被告各
 将整个 `group_id` 只保留在最严格的留出集，防止训练集泄漏；`metadata.json` 的
 `split_integrity` 会记录跨 split 组数和各 split 删除的单元数。该处理不修改源数据。
 
-## 7. 启动本地 Qwen3.6-27B vLLM 服务
+## 7. 启动本地 Qwen3.8-27B BF16 vLLM 服务
 
 `run.sh` 会自动启动和停止服务；手动调试时在四卡服务器仅监听回环地址：
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 VLLM_USE_FLASHINFER_SAMPLER=0 NCCL_P2P_DISABLE=1 \
-vllm serve /data/chenguo/Qwen3.6-27B \
-  --served-model-name Qwen3.6-27B \
+vllm serve /data/cguo/Qwen3.8-27B \
+  --served-model-name Qwen3.8-27B \
   --tensor-parallel-size 4 \
   --host 127.0.0.1 \
   --port 30000 \
   --max-model-len 8192 \
   --language-model-only \
+  --enable-prefix-caching \
   --disable-custom-all-reduce \
-  --enforce-eager \
   --gpu-memory-utilization 0.90
 curl --fail http://127.0.0.1:30000/health
 ```
 
-- `--language-model-only` 不加载 Qwen3.6 的视觉塔，本项目只输入文本。
-- `VLLM_USE_FLASHINFER_SAMPLER=0` 使用 PyTorch 采样器，避免 FlashInfer 用服务器上的
-  CUDA 12.2 工具链即时编译内核。
-- 服务名固定为 `Qwen3.6-27B`，请求中的 `model` 字段与之相同。
+- 手动示例使用安全 P2P 回退；推荐用 `run.sh` 自动应用探针决策。
+- `--language-model-only` 只加载语言部分，本项目只输入文本。
+- `VLLM_USE_FLASHINFER_SAMPLER=0` 使用 PyTorch 采样器，避免额外采样器 JIT 编译。
+- 服务名默认 `Qwen3.8-27B`，选择 Qwen3.6 时为 `Qwen3.6-27B`，可由
+  `INFER_MODEL_NAME` 覆盖；请求中的 `model` 字段必须与服务名相同。
   请求传入 `chat_template_kwargs.enable_thinking=false` 和 JSON response format。
 - 27B BF16 权重约 54 GB，四卡张量并行后每卡约 13.5 GB，其余显存用于 KV 缓存与线性
-  注意力状态。默认禁用 P2P、自定义 all-reduce 和 CUDA graph，以优先保证驱动 535
-  环境可诊断运行；验证稳定后可设置 `VLLM_ENFORCE_EAGER=0` 对比吞吐。
+  注意力状态，实际显存和吞吐需要服务器验证。
+- `P2P_POLICY=auto`（默认）只信任 `gpu-probe.json` 中
+  `peer_access.all_pairs_accessible` 的 JSON 布尔值 `true`；缺失、格式错误、数字、
+  字符串或 `false` 都使用 `NCCL_P2P_DISABLE=1` 和 `--disable-custom-all-reduce`
+  回退。`disable` 强制回退，`enable` 显式绕过自动决策启用 P2P/custom all-reduce。
+  dry-run 的 auto 先显示安全回退，真实决策取决于实际 GPU 探针。
+- CUDA Graph 默认开启（`VLLM_ENFORCE_EAGER=0`），前缀缓存默认开启；诊断时设置
+  `VLLM_ENFORCE_EAGER=1` 添加 `--enforce-eager`。服务启动失败会退出，不自动切换配置。
 
 训练加载器读取顶层及嵌套 `text_config`：纯文本 checkpoint 使用 causal-LM loader；
 多模态 `ForConditionalGeneration` checkpoint 使用正确的 image-text loader，再提取语言
@@ -226,21 +250,21 @@ curl --fail http://127.0.0.1:30000/health
 
 ```bash
 python scripts/generate_counterfactuals.py \
-  --config configs/cf/qwen36_27b.yaml \
-  --input outputs/cail_small/train.jsonl \
-  --output outputs/cf/cail.jsonl \
+  --config configs/cf/qwen38_27b.yaml \
+  --input outputs/processed/cail_small/train.jsonl \
+  --output outputs/counterfactuals/qwen38/cail.jsonl \
   --limit 12 --dry-run
 
 python scripts/generate_counterfactuals.py \
-  --config configs/cf/qwen36_27b.yaml \
-  --input outputs/cail_small/train.jsonl \
-  --output outputs/cf/cail_mock.jsonl \
+  --config configs/cf/qwen38_27b.yaml \
+  --input outputs/processed/cail_small/train.jsonl \
+  --output outputs/counterfactuals/qwen38/cail_mock.jsonl \
   --limit 12 --mock --execute
 
 python scripts/generate_counterfactuals.py \
-  --config configs/cf/qwen36_27b.yaml \
-  --input outputs/cail_small/train.jsonl \
-  --output outputs/cf/cail.jsonl \
+  --config configs/cf/qwen38_27b.yaml \
+  --input outputs/processed/cail_small/train.jsonl \
+  --output outputs/counterfactuals/qwen38/cail.jsonl \
   --limit 12 --resume --execute
 ```
 
@@ -251,7 +275,7 @@ python scripts/generate_counterfactuals.py \
 
 ```bash
 python scripts/train_model.py --config configs/model/qwen35_9b_qlora.yaml \
-  --experiment M --train-data outputs/cail_small/train.jsonl --limit 8 --dry-run
+  --experiment M --train-data outputs/processed/cail_small/train.jsonl --limit 8 --dry-run
 
 python scripts/train_model.py --config configs/model/qwen35_9b_qlora.yaml \
   --experiment M --dummy --limit 2 --execute
@@ -267,9 +291,9 @@ dummy 命令使用微型 CPU backbone 做一次真实反向传播，不读取 Qw
 CUDA_VISIBLE_DEVICES=4 python scripts/train_model.py \
   --config configs/model/qwen35_9b_qlora.yaml \
   --experiment M \
-  --train-data outputs/cail_small/train.jsonl \
-  --counterfactual-data outputs/cf/cail.jsonl \
-  --output-dir outputs/train/M-seed42 \
+  --train-data outputs/processed/cail_small/train.jsonl \
+  --counterfactual-data outputs/counterfactuals/qwen38/cail.jsonl \
+  --output-dir outputs/runs/qwen38/cail/M/seed-42/training \
   --limit 200000 --execute
 ```
 
@@ -280,9 +304,9 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --multi_gpu --num_processes 4 \
   --mixed_precision bf16 scripts/train_model.py \
   --config configs/model/qwen35_9b_qlora.yaml \
   --experiment M \
-  --train-data outputs/cail_small/train.jsonl \
-  --counterfactual-data outputs/cf/cail.jsonl \
-  --output-dir outputs/train/M-seed42 \
+  --train-data outputs/processed/cail_small/train.jsonl \
+  --counterfactual-data outputs/counterfactuals/qwen38/cail.jsonl \
+  --output-dir outputs/runs/qwen38/cail/M/seed-42/training \
   --limit 200000 --execute
 ```
 
@@ -293,10 +317,10 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --multi_gpu --num_processes 4 \
   --mixed_precision bf16 scripts/train_model.py \
   --config configs/model/qwen35_9b_qlora.yaml \
   --experiment M \
-  --train-data outputs/cail_small/train.jsonl \
-  --counterfactual-data outputs/cf/cail.jsonl \
-  --output-dir outputs/train/M-seed42 \
-  --resume-from-checkpoint outputs/train/M-seed42/checkpoint-final \
+  --train-data outputs/processed/cail_small/train.jsonl \
+  --counterfactual-data outputs/counterfactuals/qwen38/cail.jsonl \
+  --output-dir outputs/runs/qwen38/cail/M/seed-42/training \
+  --resume-from-checkpoint outputs/runs/qwen38/cail/M/seed-42/training/checkpoint-final \
   --limit 200000 --execute
 ```
 
@@ -314,19 +338,19 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --multi_gpu --num_processes 4 \
 
 ```bash
 python scripts/evaluate_model.py --kind static \
-  --input outputs/predictions/static.jsonl \
-  --output outputs/results/static.json --limit 100000 \
+  --input outputs/runs/qwen38/cail/M/seed-42/predictions/static.jsonl \
+  --output outputs/runs/qwen38/cail/M/seed-42/results/static.json --limit 100000 \
   --bootstrap-iterations 2000 --bootstrap-seed 42
 
 python scripts/evaluate_model.py --kind counterfactual \
-  --input outputs/predictions/counterfactual.jsonl \
-  --reference-input outputs/B3/predictions/counterfactual.jsonl \
-  --output outputs/results/counterfactual.json --limit 100000 \
+  --input outputs/runs/qwen38/cail/M/seed-42/predictions/counterfactual.jsonl \
+  --reference-input outputs/runs/qwen38/cail/B3/seed-42/predictions/counterfactual.jsonl \
+  --output outputs/runs/qwen38/cail/M/seed-42/results/counterfactual.json --limit 100000 \
   --bootstrap-iterations 2000 --bootstrap-seed 42
 
 python scripts/evaluate_model.py --kind cmdl \
-  --input outputs/predictions/cmdl.jsonl \
-  --output outputs/results/cmdl.json --limit 100000
+  --input outputs/runs/qwen38/cmdl/M/seed-42/predictions/static.jsonl \
+  --output outputs/runs/qwen38/cmdl/M/seed-42/results/cmdl.json --limit 100000
 ```
 
 每个评测结果都会按 `group_id` 整组重采样并输出点估计与 95% 置信区间。指定
@@ -343,19 +367,28 @@ python scripts/evaluate_model.py --kind cmdl \
 ## 12. 本地验收
 
 ```bash
-python -m compileall src scripts
+python -m compileall -q src scripts
 pytest -q
-PYTHONPATH=src python -m unittest tests.test_models_losses tests.test_training -v
+PYTHONPATH=src /opt/anaconda3/envs/myenv/bin/python -m unittest tests.test_models_losses tests.test_training -v
 ruff check .
+bash -n run.sh
+MODE=smoke bash run.sh --dry-run
+MODE=main bash run.sh --dry-run
+MODE=matrix bash run.sh --dry-run
 ```
 
 若默认 Python 没装 PyTorch，pytest 会明确跳过 Torch 测试；应在安装了 PyTorch 的
-Python 3.12 环境运行上面的 unittest 命令。每个脚本均支持 `--help`，生成、构建和训练
+Python 3.12 环境运行上面的 unittest 命令；`/opt/anaconda3/envs/myenv/bin/python` 是本地
+验收解释器，服务器可用已激活环境的 `python`。若该本地解释器缺失，必须如实记录，并用
+可用项目解释器补充同一 unittest 检查。matrix dry-run 应打印 78 条训练命令。
+每个脚本均支持 `--help`，生成、构建和训练
 均需要显式 `--execute` 才发生重操作。
 
 ## 13. 尚需在服务器验证的部分
 
-本地没有 Qwen3.5-9B/Qwen3.6-27B 和 NVIDIA GPU，因此以下内容不能由本地 CPU 验收
-替代：真实 `config.json` 权重映射、bitsandbytes NF4、BF16、驱动 535 下的 Triton/PTX、
-四卡显存占用、vLLM 张量并行、4096/8192 实际吞吐和多进程断点恢复。先按第 3 节检查，再各跑 `--limit 2` 的
-mock/dummy/真实小批量，确认后才扩大规模。
+本地 macOS CPU 测试及 dry-run 不能证明目标 CUDA 13 硬件行为。本地没有
+Qwen3.5-9B/Qwen3.6-27B/Qwen3.8-27B 和 NVIDIA GPU，以下部分必须在目标服务器
+核验：wheel 安装与版本兼容、真实 `config.json` 权重映射、bitsandbytes NF4、BF16、
+Triton/FLA 实际内核、四卡 P2P 与显存、CUDA Graph、vLLM TP4 JSON 生成、4096/8192
+实际吞吐和多进程断点恢复。先按第 4 节检查，再运行有界 mock 和真实生成批次、
+`MODE=smoke` 闭环及约 100 个父案件的生成器质量门槛，全部通过后才扩大规模。

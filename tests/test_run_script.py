@@ -190,6 +190,37 @@ def test_matrix_dry_run_expands_to_78_training_runs() -> None:
         line for line in result.stdout.splitlines() if "scripts/train_model.py" in line
     ]
     assert len(training_commands) == 78
+    assert "/data/cguo/models/RoBERTa" in result.stdout
+    assert "/data/cguo/models/Lawformer" in result.stdout
+
+
+def test_baseline_model_paths_can_be_overridden() -> None:
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "MODE": "matrix",
+            "EXPERIMENTS": "B1 B2",
+            "SEEDS": "42",
+            "ROBERTA_PATH": "/custom/RoBERTa",
+            "LAWFORMER_PATH": "/custom/Lawformer",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    training_commands = [
+        shlex.split(line[2:])
+        for line in result.stdout.splitlines()
+        if line.startswith("$ ") and "scripts/train_model.py" in line
+    ]
+    assert len(training_commands) == 4
+    for args in training_commands:
+        experiment = args[args.index("--experiment") + 1]
+        expected = "/custom/RoBERTa" if experiment == "B1" else "/custom/Lawformer"
+        assert f"model.path={expected}" in args
 
 
 def test_main_dry_run_trains_b3_and_pairs_m_evaluation_against_it() -> None:

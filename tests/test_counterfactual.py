@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from legal_landscape.config import load_config
 from legal_landscape.counterfactual.generate import (
     GenerationRequest,
     MockGenerator,
@@ -11,7 +12,6 @@ from legal_landscape.counterfactual.generate import (
     generate_records,
 )
 from legal_landscape.counterfactual.validators import validate_generation
-from legal_landscape.config import load_config
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 
 

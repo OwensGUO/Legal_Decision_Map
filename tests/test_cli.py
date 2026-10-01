@@ -49,6 +49,16 @@ def test_counterfactual_cli_defaults_to_qwen38_config() -> None:
     assert module["parser"]().parse_args([]).config == "configs/cf/qwen38_27b.yaml"
 
 
+def test_standalone_configs_use_current_server_paths() -> None:
+    for name, section, key, expected in (
+        ("data/cail_small.yaml", "data", "root", "/data/cguo/datasets/CAIL2018"),
+        ("data/cmdl_small.yaml", "data", "root", "/data/cguo/datasets/CMDL"),
+        ("model/qwen35_9b_qlora.yaml", "model", "path", "/data/cguo/Qwen3.5-9B"),
+    ):
+        config = yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))
+        assert config[section][key] == expected
+
+
 def test_heavy_clis_default_to_dry_run() -> None:
     for name, extra in (
         ("generate_counterfactuals.py", []),

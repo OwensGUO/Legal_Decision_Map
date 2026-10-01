@@ -4,14 +4,19 @@
 
 Build a Python 3.12 research codebase for typed counterfactual legal decision
 landscape learning. The repository must be testable without GPUs or model
-weights, while the same interfaces must support Qwen3.6-27B generation and
+weights, while the same interfaces must support Qwen3.8-27B BF16 generation,
+explicit Qwen3.6-27B BF16 comparison generation, and
 Qwen3.5-9B QLoRA training on GPUs 4, 5, 6, and 7 of the target eight-RTX-4090
 server.
 
-The fixed server constraints are Ubuntu 20.04, NVIDIA driver 535.171.04, and a
-locally installed CUDA 12.2 toolkit. The driver cannot be upgraded. Every newer
-CUDA runtime or JIT kernel must therefore pass an executable server probe rather
-than being accepted from version numbers alone.
+The supported server is Ubuntu 24.04 x86-64, NVIDIA driver 580.173.02, and
+CUDA 13.0, using a fresh Python 3.12 Conda environment named
+`legal-landscape-cu130`. Executable server probes remain mandatory; package
+installation and local CPU tests do not prove CUDA hardware behavior.
+
+Default local resources are `/data/cguo/Qwen3.8-27B` for the primary generator,
+`/data/cguo/Qwen3.6-27B` for its comparison, `/data/cguo/Qwen3.5-9B` for training,
+and `/data/cguo/datasets/{CAIL2018,CMDL}` for datasets. All remain overridable.
 
 ## Scope and data policy
 
@@ -62,18 +67,34 @@ direction.
 
 A common generator protocol has two implementations: a deterministic CPU mock
 and an HTTP client for a local vLLM OpenAI-compatible endpoint. The prompt
-instructs Qwen3.6 only to realize the supplied intervention as text, disables
-thinking, and requests JSON. Validators check schema, target edits, non-target
+instructs the selected Qwen generator only to realize the supplied intervention
+as text, disables thinking, and requests JSON. Validators check schema, target edits, non-target
 preservation, identity, label/sentence leakage, and near duplication. JSONL
 output records provenance, prompt/model revisions, sampling, seed, raw
 response, retries, and validation details; resume mode skips completed IDs.
 
-vLLM serves the multimodal Qwen3.6 checkpoint in language-only mode on the four
-allocated GPUs and listens on loopback by default. Conservative defaults
-disable custom all-reduce, peer-to-peer NCCL, FlashInfer sampling, and CUDA
-graphs. Startup succeeds only after both the health endpoint and a real JSON
+vLLM serves Qwen3.8 BF16 by default in language-only mode on the four allocated
+GPUs and listens on loopback. `GENERATOR_MODEL=qwen36` explicitly selects the
+comparison. Prefix caching and CUDA graphs are enabled by default;
+`VLLM_ENFORCE_EAGER=1` adds the diagnostic eager fallback. FlashInfer sampling
+is disabled. `P2P_POLICY=auto|enable|disable` controls NCCL P2P and custom
+all-reduce: auto enables them only when the GPU probe reports the JSON Boolean
+`true` at `peer_access.all_pairs_accessible`. Missing, malformed, false, numeric,
+or string values use `NCCL_P2P_DISABLE=1` and `--disable-custom-all-reduce`.
+The disable policy forces that fallback, while enable is an explicit override.
+Startup succeeds only after both the health endpoint and a real JSON
 chat-completion probe succeed. The script never enables vLLM's CUDA
 forward-compatibility library on GeForce RTX GPUs.
+
+Processed datasets remain shared under `${OUTPUT_ROOT}/processed/`.
+Counterfactuals use `${OUTPUT_ROOT}/counterfactuals/${GENERATOR_MODEL}/`, and
+training, checkpoints, predictions, and evaluation use
+`${OUTPUT_ROOT}/runs/${GENERATOR_MODEL}/`, preventing cross-generator resume
+or contamination. Before full generation, approximately 100 fixed parent
+cases are generated with both generators using identical seeds; the quality
+guard reports JSON validity, validator pass rate, retries, target realization,
+non-target drift, and near-duplicate rejection. It does not select the primary
+model using downstream test performance.
 
 ### Prediction, losses, and training
 
@@ -125,25 +146,23 @@ p-values.
 
 ## Dependency and compatibility policy
 
-The supported installation is one already activated Conda environment using
-Python 3.12. The reproducible primary stack is vLLM 0.19.1, PyTorch 2.10.0,
-Transformers 5.5.3, Accelerate 1.13.0, PEFT 0.18.1, and bitsandbytes 0.49.2.
-vLLM's manylinux 2.31 wheel is used unchanged and supplies its matching PyTorch
-stack. The project does not attempt an implicit source build.
+The supported installation is one freshly created, already activated Conda
+environment using Python 3.12. The reproducible CUDA 13 stack is vLLM 0.30.0,
+PyTorch 2.13.0, Transformers 5.15.0, Accelerate 1.15.0, PEFT 0.21.1, and
+bitsandbytes 0.50.0. The CUDA 13 PyPI wheels are used unchanged; the project
+does not attempt an implicit vLLM source build. `requirements.txt` is authoritative.
 
-Driver 535 supports the CUDA 12 major-family compatibility floor, but newer PTX
-or JIT-generated kernels may still fail. Installation success is therefore not
-acceptance. Before model work the server checks a CUDA tensor operation, BF16,
-the four visible devices, bitsandbytes NF4 capability, and dependency versions.
+Installation success is not acceptance. Before model work the server checks
+`pip check`, exact package versions, a CUDA tensor operation, BF16, the four
+visible devices, pairwise peer access, and bitsandbytes NF4 capability.
 The vLLM phase additionally performs a real text-generation request. Failures
 stop with diagnostics that include the driver, PyTorch CUDA runtime, visible
 GPU mapping, and relevant service log tail.
 
-`flash-linear-attention` is an optional acceleration extra, not a core
+`flash-linear-attention[cuda]==0.5.2` is an optional acceleration extra, not a core
 requirement. Its Triton kernels must pass a dedicated probe before use. Without
-it, Transformers uses its supported fallback path. This preserves installability
-on driver 535 and complies with the requirement that fast attention kernels not
-be mandatory.
+it, Transformers uses its supported fallback path. Only opt in after the base
+smoke pipeline and a real FLA kernel probe succeed on the target server.
 
 ## Testing and acceptance
 
@@ -175,8 +194,9 @@ Accelerate through `CUDA_VISIBLE_DEVICES` while child processes use local ranks
 0 through 3.
 
 The pipeline audits the environment and data, builds both small datasets,
-starts Qwen3.6 vLLM on the four allocated GPUs, performs a real generation
-probe, generates resumable typed counterfactuals, stops vLLM to release GPU
+starts the selected generator (Qwen3.8 by default) on the four allocated GPUs,
+performs a real generation probe, generates resumable typed counterfactuals,
+stops vLLM to release GPU
 memory, trains, exports static and counterfactual predictions, runs clustered
 bootstrap evaluation, and writes a machine-readable run summary. `smoke`
 bounds every stage and is mandatory on a new server environment; `main` runs

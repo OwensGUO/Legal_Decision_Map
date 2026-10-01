@@ -42,7 +42,7 @@ Common overrides:
   INSTALL_FLA=1                  Install and probe optional FLA/Triton kernels
 
 Examples:
-  conda activate legal-landscape
+  conda activate legal-landscape-cu130
   MODE=smoke bash run.sh
   bash run.sh
   MODE=matrix bash run.sh
@@ -73,8 +73,8 @@ QWEN35_PATH="${QWEN35_PATH:-/data/cguo/Qwen3.5-9B}"
 QWEN36_PATH="${QWEN36_PATH:-/data/cguo/Qwen3.6-27B}"
 QWEN38_PATH="${QWEN38_PATH:-/data/cguo/Qwen3.8-27B}"
 GENERATOR_MODEL="${GENERATOR_MODEL:-qwen38}"
-ROBERTA_PATH="${ROBERTA_PATH:-/data/chenguo/models/RoBERTa}"
-LAWFORMER_PATH="${LAWFORMER_PATH:-/data/chenguo/models/Lawformer}"
+ROBERTA_PATH="${ROBERTA_PATH:-/data/cguo/models/RoBERTa}"
+LAWFORMER_PATH="${LAWFORMER_PATH:-/data/cguo/models/Lawformer}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/outputs}"
 INFER_HOST="${INFER_HOST:-127.0.0.1}"
 INFER_PORT="${INFER_PORT:-30000}"
