@@ -22,7 +22,7 @@ from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--config", default="configs/cf/qwen36_27b.yaml")
+    result.add_argument("--config", default="configs/cf/qwen38_27b.yaml")
     result.add_argument("--input", type=Path)
     result.add_argument("--output", type=Path, default=Path("outputs/counterfactuals.jsonl"))
     result.add_argument("--limit", type=int, default=10)

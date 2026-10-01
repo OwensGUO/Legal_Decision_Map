@@ -44,6 +44,11 @@ def test_all_cli_help_paths() -> None:
         assert "usage:" in result.stdout.lower()
 
 
+def test_counterfactual_cli_defaults_to_qwen38_config() -> None:
+    module = runpy.run_path(str(ROOT / "scripts" / "generate_counterfactuals.py"))
+    assert module["parser"]().parse_args([]).config == "configs/cf/qwen38_27b.yaml"
+
+
 def test_heavy_clis_default_to_dry_run() -> None:
     for name, extra in (
         ("generate_counterfactuals.py", []),

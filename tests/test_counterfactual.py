@@ -11,7 +11,18 @@ from legal_landscape.counterfactual.generate import (
     generate_records,
 )
 from legal_landscape.counterfactual.validators import validate_generation
+from legal_landscape.config import load_config
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
+
+
+def test_qwen38_config_uses_local_bf16_primary_model() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    loaded = load_config(root / "configs/cf/qwen38_27b.yaml")
+    assert loaded["generator"]["model_path"] == "/data/cguo/Qwen3.8-27B"
+    assert loaded["generator"]["thinking"] is False
+    assert loaded["generator"]["tensor_parallel_size"] == 4
 
 
 def _spec(kind: str = "sentence_rank") -> InterventionSpec:
