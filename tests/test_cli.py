@@ -210,6 +210,28 @@ def test_check_requirements_dry_run_works_without_pythonpath() -> None:
     assert json.loads(result.stdout)["dry_run"] is True
 
 
+def test_gpu_probe_reports_pairwise_peer_access() -> None:
+    module = runpy.run_path(str(ROOT / "scripts" / "probe_gpu_stack.py"))
+
+    class FakeCuda:
+        @staticmethod
+        def can_device_access_peer(source: int, target: int) -> bool:
+            return {0, 1} == {source, target}
+
+    fake_torch = type("FakeTorch", (), {"cuda": FakeCuda()})()
+    assert module["probe_peer_access"](fake_torch, 3) == {
+        "pairs": {
+            "0->1": True,
+            "0->2": False,
+            "1->0": True,
+            "1->2": False,
+            "2->0": False,
+            "2->1": False,
+        },
+        "all_pairs_accessible": False,
+    }
+
+
 def test_requirement_failures_include_every_requested_dependency_group() -> None:
     module = runpy.run_path(str(ROOT / "scripts" / "check_requirements.py"))
     has_requirement_failures = module["has_requirement_failures"]

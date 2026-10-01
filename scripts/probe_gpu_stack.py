@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -17,8 +18,26 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--probe-fla", action="store_true", help="Also import FLA and launch Triton"
     )
+    result.add_argument("--output", type=Path, help="Write probe JSON to this path")
     result.add_argument("--dry-run", action="store_true")
     return result
+
+
+def probe_peer_access(torch: Any, device_count: int) -> dict[str, Any]:
+    pairs = {
+        f"{source}->{target}": bool(torch.cuda.can_device_access_peer(source, target))
+        for source in range(device_count)
+        for target in range(device_count)
+        if source != target
+    }
+    return {"pairs": pairs, "all_pairs_accessible": bool(pairs) and all(pairs.values())}
+
+
+def _emit_json(payload: dict[str, Any], output: Path | None) -> None:
+    rendered = json.dumps(payload, ensure_ascii=False, indent=2)
+    print(rendered)
+    if output is not None:
+        output.write_text(rendered + "\n", encoding="utf-8")
 
 
 def _probe_triton(torch: Any) -> str:
@@ -59,17 +78,19 @@ def probe(required_devices: int, *, probe_fla: bool) -> tuple[dict[str, Any], bo
         payload["torch"] = torch.__version__
         payload["torch_cuda_runtime"] = torch.version.cuda
         payload["cuda_available"] = torch.cuda.is_available()
-        payload["visible_device_count"] = torch.cuda.device_count()
+        device_count = torch.cuda.device_count()
+        payload["visible_device_count"] = device_count
         payload["devices"] = [
-            torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())
+            torch.cuda.get_device_name(index) for index in range(device_count)
         ]
         if not torch.cuda.is_available():
             errors.append("CUDA is unavailable")
-        elif torch.cuda.device_count() != required_devices:
+        elif device_count != required_devices:
             errors.append(
-                f"expected {required_devices} visible CUDA devices, got {torch.cuda.device_count()}"
+                f"expected {required_devices} visible CUDA devices, got {device_count}"
             )
         else:
+            payload["peer_access"] = probe_peer_access(torch, device_count)
             matrix = torch.ones((64, 64), device="cuda", dtype=torch.bfloat16)
             result = matrix @ matrix
             torch.cuda.synchronize()
@@ -111,19 +132,18 @@ def main() -> int:
     if args.limit <= 0:
         raise SystemExit("--limit must be positive")
     if args.dry_run:
-        print(
-            json.dumps(
-                {
-                    "dry_run": True,
-                    "required_devices": args.limit,
-                    "probe_fla": args.probe_fla,
-                    "checks": ["CUDA", "BF16", "bitsandbytes NF4", "optional FLA/Triton"],
-                }
-            )
+        _emit_json(
+            {
+                "dry_run": True,
+                "required_devices": args.limit,
+                "probe_fla": args.probe_fla,
+                "checks": ["CUDA", "BF16", "bitsandbytes NF4", "optional FLA/Triton"],
+            },
+            args.output,
         )
         return 0
     payload, passed = probe(args.limit, probe_fla=args.probe_fla)
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    _emit_json(payload, args.output)
     return 0 if passed else 1
 
 
