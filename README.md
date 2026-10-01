@@ -95,6 +95,20 @@ Qwen3.8-27B BF16 vLLM 服务、断点续生成三类反事实、停止 vLLM 释�
 `CHECKPOINT_EVERY` 调整间隔。最终状态写入 `${OUTPUT_ROOT}/run-summary.json`，记录所选
 生成器；该根目录文件及诊断日志代表最近一次运行，按生成器隔离的结果保存在上述目录。
 
+持久生成器身份保存在 `counterfactuals/{qwen38,qwen36}/generator-provenance.json`，
+包含 schema 版本、生成器选择、实际 HTTP 模型名、解析后的本地 checkpoint 路径、配置版本、
+后端和轻量指纹。启动 vLLM 前和训练前会核验该身份；仅完全一致时允许恢复。
+如果同一选择器下换了 checkpoint 路径、配置版本、服务别名或指纹，或已有反事实/下游结果
+却没有 manifest，脚本会中止。请使用新的 `OUTPUT_ROOT`，或在确认来源后有意识地迁移/清理
+该生成器的反事实与全部下游结果；不要仅删除 manifest 或给旧数据补写当前身份。
+空命名空间的 manifest 原子创建，已有 manifest 不会覆盖。
+
+指纹对 checkpoint 顶层的 JSON 配置/索引、tokenizer 与 chat-template 文件内容做 SHA-256，
+并纳入 `.safetensors` / `pytorch_model*.bin` 权重文件名和大小；元数据合计上限为 64 MiB。
+缺少配置、权重、索引引用的分片或超出上限都会明确报错。它不读取大体积权重内容，
+因此不是整套模型的密码学完整性证明，也无法发现大小不变的权重替换。请将 checkpoint
+作为不可变输入，改变权重时使用新路径/明确版本和新的输出根目录。
+
 完整基线、消融和三随机种子矩阵会产生 78 次训练，耗时和存储开销很大，仅在主流程验证
 通过后执行：
 
@@ -118,11 +132,14 @@ bash run.sh
 `INSTALL_DEPS=1 INSTALL_FLA=1` 会额外安装 FLA；`INSTALL_FLA=1` 会执行上述 FLA
 导入/通用 Triton 初步检查。该开关不会验证 FLA 注意力内核；在目标 GPU 的模型相关
 FLA 操作成功之前，不要为项目设置此开关或安装 FLA。
-`MOCK_GENERATOR=1 MODE=smoke bash run.sh` 可跳过生成服务，
+`MOCK_GENERATOR=1 MODE=smoke OUTPUT_ROOT=outputs/mock bash run.sh` 可跳过生成服务，
 用于检查数据到训练的控制流；`INFER_MANAGED=0` 表示复用已运行的本地 vLLM 服务，
 `INFER_HOST`、`INFER_PORT`、`INFER_GPU_MEMORY` 调整地址与显存占用比例（不使用
 `VLLM_*` 前缀，因为 `VLLM_PORT` 等是 vLLM 自身的内部变量）。常用覆盖
 参数可运行 `bash run.sh --help` 查看。
+mock 身份明确记录 `mock-v1` 与实现指纹，和真实模型不兼容，必须使用独立输出根目录。
+复用已有服务时，操作者须确认它加载的 checkpoint 与所选路径一致；本地指纹无法证明
+外部服务实际加载了哪些权重。
 
 默认 `GENERATOR_MODEL=qwen38`；显式比较使用
 `GENERATOR_MODEL=qwen36 MODE=smoke bash run.sh`。默认路径如下，均可用对应变量覆盖：
@@ -262,21 +279,45 @@ python scripts/generate_counterfactuals.py \
 python scripts/generate_counterfactuals.py \
   --config configs/cf/qwen38_27b.yaml \
   --input outputs/processed/cail_small/train.jsonl \
-  --output outputs/counterfactuals/qwen38/cail_mock.jsonl \
+  --output outputs/mock/counterfactuals/qwen38/cail.jsonl \
+  --artifact-root outputs/mock/runs/qwen38 \
   --limit 12 --mock --execute
 
 python scripts/generate_counterfactuals.py \
   --config configs/cf/qwen38_27b.yaml \
   --input outputs/processed/cail_small/train.jsonl \
   --output outputs/counterfactuals/qwen38/cail.jsonl \
+  --artifact-root outputs/runs/qwen38 \
+  --set generator.checkpoint_path=/data/cguo/Qwen3.8-27B \
   --set generator.model_path=Qwen3.8-27B \
   --limit 12 --resume --execute
 ```
 
 输出保存原案件 ID、类型、前后因素、changed_fields、rule_id、模型/提示版本、采样参数、
-种子、原始响应、重试次数和逐项验证结果。`--resume` 按稳定 generation ID 跳过完成项。
+种子、原始响应、重试次数和逐项验证结果。每行的 `generator_identity` 保存完整生成器身份，
+`model_revision` 保存非占位的 checkpoint 指纹；配置中的 `local` 只作为
+`configured_revision` 保留。`--resume` 在身份核验后按稳定 generation ID 跳过完成项。
 真实生成命令的 `generator.model_path` 会成为 HTTP 请求的 `model` 字段，因此必须与
-第 7 节 `--served-model-name` 的别名一致；更换服务别名时同步调整该覆盖值。
+第 7 节 `--served-model-name` 的别名一致；`generator.checkpoint_path` 独立记录本地目录，
+两者都必须与实际服务一致。切换到 Qwen3.6 时同时改用对应配置、checkpoint、服务别名和
+`qwen36` 输出目录。配置和身份均遵循 YAML → `LEGAL_LANDSCAPE_*` 环境变量 → `--set` 优先级。
+
+手工执行时默认 manifest 位于输出 JSONL 的同一目录；`--artifact-root` 可重复，指定需要
+共同保护的下游目录。`--provenance-manifest` 可以显式指定同一 manifest。只有新空目录
+可初始化；`--dry-run` 不读取 checkpoint 或创建 manifest，也不证明已有输出可以安全恢复。
+启动手工 vLLM 服务前，可先执行同一轻量校验：
+
+```bash
+python scripts/check_generator_provenance.py \
+  --config configs/cf/qwen38_27b.yaml \
+  --manifest outputs/counterfactuals/qwen38/generator-provenance.json \
+  --artifact-root outputs/runs/qwen38 \
+  --set generator.checkpoint_path=/data/cguo/Qwen3.8-27B \
+  --set generator.model_path=Qwen3.8-27B
+```
+
+手工恢复训练/预测/评测前也应执行该校验。`run.sh` 自动完成这些门槛；直接调用训练脚本
+仍通过已有训练输入文件哈希核验检查点，但不会替你推断生成器当前选择。
 
 ## 9. 训练 dry-run 与 dummy 验证
 

@@ -11,6 +11,7 @@ from legal_landscape.counterfactual.generate import (
     VLLMHTTPGenerator,
     generate_records,
 )
+from legal_landscape.counterfactual.provenance import generator_identity
 from legal_landscape.counterfactual.validators import validate_generation
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 
@@ -99,7 +100,7 @@ def test_generate_records_persists_provenance_and_resumes(tmp_path) -> None:
         [request],
         MockGenerator(),
         output,
-        model_revision="mock-v1",
+        generator_identity=generator_identity({"selector": "mock"}, mock=True),
         prompt_version="v1",
         sampling={"temperature": 0.0},
         seed=42,
@@ -109,7 +110,8 @@ def test_generate_records_persists_provenance_and_resumes(tmp_path) -> None:
     record = records[0]
     assert record["parent_case_id"] == "c1"
     assert record["source_factors"]["amount"] == 1000.0
-    assert record["model_revision"] == "mock-v1"
+    assert record["generator_identity"]["configured_revision"] == "mock-v1"
+    assert len(record["model_revision"]) == 64
     assert record["retry_count"] == 0
     assert record["validation"]["valid"] is True
     assert len(output.read_text(encoding="utf-8").splitlines()) == 1
@@ -118,7 +120,7 @@ def test_generate_records_persists_provenance_and_resumes(tmp_path) -> None:
         [request],
         MockGenerator(),
         output,
-        model_revision="mock-v1",
+        generator_identity=generator_identity({"selector": "mock"}, mock=True),
         prompt_version="v1",
         sampling={},
         seed=42,
@@ -143,7 +145,7 @@ def test_generate_records_retries_invalid_output(tmp_path) -> None:
         [GenerationRequest("某甲事实。", _spec())],
         generator,
         tmp_path / "failed.jsonl",
-        model_revision="broken",
+        generator_identity=generator_identity({"selector": "broken"}, mock=True),
         prompt_version="v1",
         sampling={},
         seed=1,
@@ -152,6 +154,52 @@ def test_generate_records_retries_invalid_output(tmp_path) -> None:
     assert generator.calls == 3
     assert records[0]["validation"]["valid"] is False
     assert records[0]["retry_count"] == 2
+
+
+def test_persisted_rows_identify_selected_checkpoints_and_reject_incompatible_resume(tmp_path):
+    identities = []
+    request = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec())
+    for selector in ("qwen38", "qwen36"):
+        checkpoint = tmp_path / selector
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text(json.dumps({"model_type": selector}))
+        (checkpoint / "model.safetensors").write_bytes(b"fake weights")
+        identity = generator_identity({
+            "selector": selector, "model_path": f"served-{selector}",
+            "checkpoint_path": str(checkpoint), "model_revision": "local",
+        })
+        output = tmp_path / "outputs" / selector / "cail.jsonl"
+        generate_records(
+            [request], MockGenerator(), output, generator_identity=identity,
+            prompt_version="v1", sampling={}, seed=42, retries=0,
+        )
+        row = json.loads(output.read_text())
+        assert row["generator_identity"] == identity
+        assert row["generator_identity"]["generator_selector"] == selector
+        assert row["generator_identity"]["served_model_name"] == f"served-{selector}"
+        assert row["generator_identity"]["checkpoint_path"] == str(checkpoint.resolve())
+        assert row["model_revision"] == identity["checkpoint_fingerprint"]
+        identities.append(row["model_revision"])
+        before = output.read_bytes()
+        with pytest.raises(ValueError, match="provenance mismatch"):
+            generate_records(
+                [request], MockGenerator(), output,
+                generator_identity={**identity, "checkpoint_path": "another-checkpoint"},
+                prompt_version="v1", sampling={}, seed=42, retries=0, resume=True,
+            )
+        assert output.read_bytes() == before
+    assert identities[0] != identities[1]
+
+
+def test_generation_rejects_other_legacy_rows_in_same_namespace(tmp_path):
+    (tmp_path / "old-dataset.jsonl").write_text("old rows without provenance")
+    with pytest.raises(ValueError, match="Missing generator provenance"):
+        generate_records(
+            [], MockGenerator(), tmp_path / "new-dataset.jsonl",
+            generator_identity=generator_identity({"selector": "mock"}, mock=True),
+            prompt_version="v1", sampling={}, seed=42, retries=0,
+        )
+    assert not (tmp_path / "new-dataset.jsonl").exists()
 
 
 def test_http_generator_rejects_remote_endpoint_without_explicit_opt_in() -> None:
@@ -268,7 +316,7 @@ def test_concurrent_generation_writes_every_request_once(tmp_path) -> None:
         requests + requests[:3],
         MockGenerator(),
         output,
-        model_revision="mock-v1",
+        generator_identity=generator_identity({"selector": "mock"}, mock=True),
         prompt_version="v2",
         sampling={},
         seed=42,
@@ -304,7 +352,7 @@ def test_transport_failures_are_not_written_and_rejections_are(tmp_path) -> None
         [down, rejected],
         FlakyGenerator(),
         output,
-        model_revision="m",
+        generator_identity=generator_identity({"selector": "mock"}, mock=True),
         prompt_version="v2",
         sampling={},
         seed=1,

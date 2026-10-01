@@ -14,6 +14,86 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_SCRIPT = ROOT / "run.sh"
 
 
+@pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
+def test_provenance_preflight_guards_both_generator_namespaces_before_server(tmp_path, generator):
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"], cwd=ROOT,
+        env={**os.environ, "MODE": "smoke", "GENERATOR_MODEL": generator,
+             "OUTPUT_ROOT": str(tmp_path), f"{generator.upper()}_PATH": "/custom/checkpoint"},
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line[2:]) for line in result.stdout.splitlines()
+                if line.startswith("$ ")]
+    preflight = [args for args in commands if str(ROOT / "scripts/check_generator_provenance.py")
+                 in args]
+    assert preflight
+    args = preflight[0]
+    assert "generator.checkpoint_path=/custom/checkpoint" in args
+    assert f"generator.selector={generator}" in args
+    assert str(tmp_path / "runs" / generator) in args
+    assert str(tmp_path / "counterfactuals" / generator) in args
+    assert result.stdout.index("check_generator_provenance.py") < result.stdout.index("vllm serve")
+    generation = [args for args in commands if str(ROOT / "scripts/generate_counterfactuals.py")
+                  in args]
+    for args in generation:
+        assert "generator.checkpoint_path=/custom/checkpoint" in args
+        assert f"generator.selector={generator}" in args
+        assert str(tmp_path / "runs" / generator) in args
+
+
+@pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
+@pytest.mark.parametrize("artifact_root", ["counterfactuals", "runs"])
+@pytest.mark.parametrize("provenance_state", ["missing", "changed_checkpoint"])
+def test_real_pipeline_rejects_unprovenanced_artifacts_before_generation_or_training(
+    tmp_path, generator, artifact_root, provenance_state,
+):
+    binary_dir = tmp_path / "conda/bin"
+    binary_dir.mkdir(parents=True)
+    wrapper = binary_dir / "python"
+    wrapper.write_text(
+        f"#!{sys.executable}\nimport os, sys\n"
+        "if sys.argv[1].endswith('check_generator_provenance.py'):\n"
+        f"    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o755)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text('{}')
+    (checkpoint / "model.safetensors").write_bytes(b"fake weights")
+    if provenance_state == "changed_checkpoint":
+        from legal_landscape.counterfactual.provenance import ensure_manifest, generator_identity
+
+        identity = generator_identity({
+            "selector": generator, "model_path": {"qwen38": "Qwen3.8-27B",
+                                                   "qwen36": "Qwen3.6-27B"}[generator],
+            "checkpoint_path": str(checkpoint), "model_revision": "local",
+        })
+        manifest = tmp_path / "outputs/counterfactuals" / generator / "generator-provenance.json"
+        ensure_manifest(manifest, identity, artifact_roots=[manifest.parent])
+        (checkpoint / "config.json").write_text('{"new_checkpoint":true}')
+    artifact = tmp_path / "outputs" / artifact_root / generator / "stale-artifact"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("existing output")
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT)], cwd=ROOT,
+        env={**os.environ, "MODE": "smoke", "GENERATOR_MODEL": generator,
+             "OUTPUT_ROOT": str(tmp_path / "outputs"), "CONDA_PREFIX": str(binary_dir.parent),
+             "PATH": f"{binary_dir}:{os.environ['PATH']}", "INFER_MANAGED": "0",
+             "CAIL_ROOT": str(tmp_path), "CMDL_ROOT": str(tmp_path),
+             "QWEN35_PATH": str(checkpoint), f"{generator.upper()}_PATH": str(checkpoint)},
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    assert result.returncode != 0
+    expected = ("Missing generator provenance" if provenance_state == "missing"
+                else "Generator provenance mismatch")
+    assert expected in result.stderr
+    assert "new OUTPUT_ROOT" in result.stderr
+    assert "[phase] start vLLM" not in result.stdout
+    assert "[phase] generate counterfactuals" not in result.stdout
+    assert "[phase] train and export predictions" not in result.stdout
+
+
 def test_run_script_has_valid_shell_syntax_and_help() -> None:
     syntax = subprocess.run(
         ["bash", "-n", str(RUN_SCRIPT)], capture_output=True, text=True, check=False

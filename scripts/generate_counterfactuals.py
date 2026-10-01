@@ -17,6 +17,11 @@ from legal_landscape.counterfactual.generate import (
 )
 from legal_landscape.counterfactual.interventions import propose_interventions
 from legal_landscape.counterfactual.prompts import PROMPT_VERSION
+from legal_landscape.counterfactual.provenance import (
+    MANIFEST_NAME,
+    ensure_manifest,
+    generator_identity,
+)
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 
 
@@ -32,6 +37,14 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--mock", action="store_true")
     result.add_argument("--resume", action="store_true")
+    result.add_argument("--provenance-manifest", type=Path)
+    result.add_argument(
+        "--artifact-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional downstream artifact root protected by this manifest",
+    )
     result.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     return result
 
@@ -89,6 +102,14 @@ def main() -> int:
         return 0
     if args.input is None:
         raise SystemExit("--input is required with --execute")
+    manifest = args.provenance_manifest or args.output.parent / MANIFEST_NAME
+    try:
+        identity = generator_identity(config, mock=args.mock)
+        ensure_manifest(
+            manifest, identity, artifact_roots=[args.output.parent, *args.artifact_root]
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     sampling = {key: config[key] for key in ("temperature", "top_p", "max_tokens") if key in config}
     concurrency = int(config.get("concurrency", 1))
     generator = (
@@ -116,7 +137,8 @@ def main() -> int:
             requests,
             generator,
             args.output,
-            model_revision=config.get("model_revision", "local"),
+            generator_identity=identity,
+            provenance_manifest=manifest,
             prompt_version=PROMPT_VERSION,
             sampling=sampling,
             seed=int(config.get("seed", 42)),

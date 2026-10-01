@@ -1,5 +1,7 @@
 generator:
   backend: vllm
+  selector: qwen36
+  checkpoint_path: /data/cguo/Qwen3.6-27B
   model_path: /data/cguo/Qwen3.6-27B
   model_revision: local
   endpoint: http://127.0.0.1:30000/v1/chat/completions

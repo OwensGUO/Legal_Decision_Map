@@ -23,7 +23,46 @@ SCRIPTS = (
     "evaluate_model.py",
     "check_requirements.py",
     "probe_gpu_stack.py",
+    "check_generator_provenance.py",
 )
+
+
+def test_manual_generation_persists_effective_config_and_rejects_changed_checkpoint(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text('{}')
+    (checkpoint / "model.safetensors").write_bytes(b"fake weights")
+    namespace = tmp_path / "outputs/counterfactuals/qwen36"
+    runs = tmp_path / "outputs/runs/qwen36"
+    manifest = namespace / "generator-provenance.json"
+    overrides = ["--set", "generator.selector=qwen36", "--set",
+                 f"generator.checkpoint_path={checkpoint}", "--set",
+                 "generator.model_path=custom-alias", "--set", "generator.model_revision=commit123"]
+    env = {**_env(), "LEGAL_LANDSCAPE_GENERATOR__MODEL_REVISION": "overridden-env-revision"}
+    command = [sys.executable, str(ROOT / "scripts/check_generator_provenance.py"),
+               "--config", str(ROOT / "configs/cf/qwen36_27b.yaml"),
+               "--manifest", str(manifest), "--artifact-root", str(runs), *overrides]
+    for _ in range(2):
+        result = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+    identity = json.loads(manifest.read_text())
+    assert identity["configured_revision"] == "commit123"
+    assert identity["checkpoint_path"] == str(checkpoint.resolve())
+    assert identity["served_model_name"] == "custom-alias"
+    assert identity["generator_selector"] == "qwen36"
+    (checkpoint / "config.json").write_text('{"changed":true}')
+    output = namespace / "cail.jsonl"
+    output.write_text("existing rows")
+    generate = [sys.executable, str(ROOT / "scripts/generate_counterfactuals.py"),
+                "--config", str(ROOT / "configs/cf/qwen36_27b.yaml"),
+                "--input", str(tmp_path / "not-read.jsonl"), "--output", str(output),
+                "--artifact-root", str(runs), "--execute", "--resume", *overrides]
+    rejected = subprocess.run(generate, env=env, capture_output=True, text=True, check=False)
+    assert rejected.returncode != 0
+    assert "Generator provenance mismatch" in rejected.stderr
+    assert "new OUTPUT_ROOT" in rejected.stderr
+    assert output.read_text() == "existing rows"
+    assert json.loads(manifest.read_text()) == identity
 
 
 def _env() -> dict[str, str]:

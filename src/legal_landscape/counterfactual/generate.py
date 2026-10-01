@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from legal_landscape.counterfactual.prompts import build_messages
+from legal_landscape.counterfactual.provenance import MANIFEST_NAME, ensure_manifest
 from legal_landscape.counterfactual.validators import ValidationResult, validate_generation
 from legal_landscape.factors.schema import InterventionSpec
 
@@ -183,7 +184,7 @@ def _realize(
     request: GenerationRequest,
     generator: CounterfactualGenerator,
     *,
-    model_revision: str,
+    generator_identity: dict[str, Any],
     prompt_version: str,
     sampling: dict[str, Any],
     seed: int,
@@ -219,7 +220,8 @@ def _realize(
         "target_charge": spec.target_charge,
         "rank_direction": spec.rank_direction,
         "rule_id": spec.rule_id,
-        "model_revision": model_revision,
+        "model_revision": generator_identity["checkpoint_fingerprint"],
+        "generator_identity": dict(generator_identity),
         "prompt_version": prompt_version,
         "sampling": sampling,
         "seed": seed,
@@ -234,7 +236,7 @@ def generate_records(
     generator: CounterfactualGenerator,
     output_path: str | Path,
     *,
-    model_revision: str,
+    generator_identity: dict[str, Any],
     prompt_version: str,
     sampling: dict[str, Any],
     seed: int,
@@ -242,6 +244,7 @@ def generate_records(
     resume: bool = False,
     min_similarity: float = 0.5,
     concurrency: int = 1,
+    provenance_manifest: str | Path | None = None,
 ) -> GenerationResult:
     """Generate validated records concurrently and durably append each completed request.
 
@@ -252,6 +255,11 @@ def generate_records(
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
     destination = Path(output_path)
+    ensure_manifest(
+        provenance_manifest or destination.parent / MANIFEST_NAME,
+        generator_identity,
+        artifact_roots=[destination.parent],
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     completed = _completed(destination) if resume else set()
     outcome = GenerationResult()
@@ -270,7 +278,7 @@ def generate_records(
         return _realize(
             request,
             generator,
-            model_revision=model_revision,
+            generator_identity=generator_identity,
             prompt_version=prompt_version,
             sampling=sampling,
             seed=seed,

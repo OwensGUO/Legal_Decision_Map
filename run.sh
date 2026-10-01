@@ -348,6 +348,24 @@ CMDL_PROCESSED="$OUTPUT_ROOT/processed/cmdl_small"
 CAIL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cail.jsonl"
 CMDL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cmdl.jsonl"
 RUNS_ROOT="$OUTPUT_ROOT/runs/$GENERATOR_MODEL"
+PROVENANCE_MANIFEST="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/generator-provenance.json"
+generator_overrides=(
+  --set "generator.selector=$GENERATOR_MODEL"
+  --set "generator.checkpoint_path=$GENERATOR_PATH"
+  --set "generator.model_path=$INFER_MODEL_NAME"
+)
+provenance_command=(
+  python "$ROOT_DIR/scripts/check_generator_provenance.py"
+  --config "$GENERATOR_CONFIG" --manifest "$PROVENANCE_MANIFEST"
+  --artifact-root "$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL"
+  --artifact-root "$RUNS_ROOT"
+  "${generator_overrides[@]}"
+)
+if [[ "$MOCK_GENERATOR" == "1" ]]; then
+  provenance_command+=(--mock)
+fi
+phase "validate generator provenance"
+run_cmd "${provenance_command[@]}"
 
 phase "audit data"
 run_cmd python "$ROOT_DIR/scripts/audit_data.py" \
@@ -479,7 +497,8 @@ generate_counterfactuals() {
     --config "$GENERATOR_CONFIG"
     --input "$input_path" --output "$output_path"
     --limit "$CF_LIMIT" --resume --execute
-    --set "generator.model_path=$INFER_MODEL_NAME"
+    --provenance-manifest "$PROVENANCE_MANIFEST" --artifact-root "$RUNS_ROOT"
+    "${generator_overrides[@]}"
     --set "generator.endpoint=http://${INFER_HOST}:${INFER_PORT}/v1/chat/completions"
   )
   if [[ "$MOCK_GENERATOR" == "1" ]]; then
@@ -566,6 +585,7 @@ run_training() {
 }
 
 phase "train and export predictions"
+run_cmd "${provenance_command[@]}"
 for dataset in cail cmdl; do
   if [[ "$dataset" == "cail" ]]; then
     processed=$CAIL_PROCESSED

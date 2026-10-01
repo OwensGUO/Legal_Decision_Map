@@ -1,5 +1,7 @@
 generator:
   backend: vllm
+  selector: qwen38
+  checkpoint_path: /data/cguo/Qwen3.8-27B
   # BF16 precision is controlled by the local checkpoint and vLLM configuration.
   model_path: /data/cguo/Qwen3.8-27B
   model_revision: local

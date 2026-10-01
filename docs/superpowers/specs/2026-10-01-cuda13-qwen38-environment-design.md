@@ -137,6 +137,41 @@ mixing downstream results across models. Processed datasets stay shared under
 `${OUTPUT_ROOT}/processed/`. Root-level diagnostics and `run-summary.json`
 describe the latest invocation and include its selected generator.
 
+Durable identity is stored atomically in
+`${OUTPUT_ROOT}/counterfactuals/${GENERATOR_MODEL}/generator-provenance.json`.
+It contains schema version, selector, backend, served model name, resolved local
+checkpoint path, configured revision, fingerprint method, and checkpoint fingerprint.
+The HTTP alias (`generator.model_path`) and local checkpoint directory
+(`generator.checkpoint_path`) are separate effective configuration fields.
+YAML, environment, and CLI overrides retain their existing precedence.
+
+The reusable provenance module hashes top-level JSON/config/index, tokenizer, and
+chat-template file contents (at most 64 MiB in total), plus safetensors/PyTorch
+weight filenames and sizes. Missing config, absent/empty weights, missing indexed
+shards, and oversized identity metadata fail explicitly. This bounded fingerprint
+does not hash weight contents and cannot detect same-size weight replacement;
+checkpoints must remain immutable, with a new path/revision when weights change.
+It is not a full cryptographic checkpoint integrity guarantee. An unmanaged
+service must be verified by its operator to serve the declared checkpoint.
+
+Before starting vLLM and again before training, `run.sh` compares current identity
+with the immutable manifest guarding both counterfactual and downstream run roots.
+An exact identity can resume; changed identity or existing artifacts without
+provenance fail with instructions to use a new OUTPUT_ROOT or deliberately migrate
+or remove artifacts. A complete temporary file is fsynced and atomically linked
+without replacing any existing manifest. The model source remains read-only.
+Each JSONL row embeds `generator_identity`, and `model_revision` carries the
+fingerprint rather than the placeholder `local`. Stable intervention IDs remain
+valid within a compatible namespace. Existing training input hashes also capture
+the row identity through the counterfactual file's content hash.
+
+Standalone generation applies the same guard; `--artifact-root` includes additional
+downstream directories and `--provenance-manifest` selects an explicit manifest.
+Manual training/evaluation operators run `check_generator_provenance.py` first.
+Mock mode records its own backend, `mock-v1` identity, and implementation hash;
+mock and real runs require separate output roots. Dry-runs print the validation
+commands without accessing checkpoints or claiming that resume was validated.
+
 ## 6. Validation and acceptance
 
 Local CPU acceptance covers:
@@ -174,7 +209,9 @@ operator-run pilot, not automatically completed by the smoke script.
 
 Local acceptance on 2026-10-01 passed `python -m compileall -q src scripts`,
 `ruff check .`, `bash -n run.sh`, and smoke/main/matrix dry-runs. `pytest -q`
-reported 101 passed and 10 Torch-dependent skips with the default Python 3.13
+reported 127 passed and 10 Torch-dependent skips after the durable-provenance fix,
+including real-shell rejection of missing/mismatched provenance for both generators,
+with the default Python 3.13
 interpreter. The required Python 3.12 interpreter at
 `/opt/anaconda3/envs/myenv/bin/python` passed all 21 loss/training unittests
 with local torch 2.12.1 and no CUDA. The matrix expanded to exactly 78 training
