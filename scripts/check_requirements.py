@@ -23,12 +23,12 @@ TRAINING = (
 INFERENCE = ("vllm",)
 OPERATIONS = ("psutil", "pynvml", "tensorboard")
 EXPECTED_GPU_VERSIONS = {
-    "torch": "2.10.0",
-    "transformers": "5.5.3",
-    "accelerate": "1.13.0",
-    "peft": "0.18.1",
-    "bitsandbytes": "0.49.2",
-    "vllm": "0.19.1",
+    "torch": "2.13.0",
+    "vllm": "0.30.0",
+    "transformers": "5.15.0",
+    "accelerate": "1.15.0",
+    "peft": "0.21.1",
+    "bitsandbytes": "0.50.0",
 }
 
 

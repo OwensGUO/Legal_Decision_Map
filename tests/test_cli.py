@@ -201,16 +201,22 @@ def test_requirement_failures_include_every_requested_dependency_group() -> None
     assert not has_requirement_failures(packages, ("yaml", "torch"))
 
 
-def test_requirement_version_check_accepts_local_suffix_and_rejects_drift() -> None:
+def test_requirement_version_check_accepts_cuda13_stack_and_rejects_old_stack() -> None:
     module = runpy.run_path(str(ROOT / "scripts" / "check_requirements.py"))
     version_mismatches = module["version_mismatches"]
-    expected = {"torch": "2.10.0", "vllm": "0.19.1"}
+    expected = {
+        "torch": "2.13.0",
+        "vllm": "0.30.0",
+        "transformers": "5.15.0",
+        "accelerate": "1.15.0",
+        "peft": "0.21.1",
+        "bitsandbytes": "0.50.0",
+    }
+    assert module["EXPECTED_GPU_VERSIONS"] == expected
+    assert version_mismatches({**expected, "torch": "2.13.0+cu130"}, expected) == {}
     assert version_mismatches(
-        {"torch": "2.10.0+cu128", "vllm": "0.19.1"}, expected
-    ) == {}
-    assert version_mismatches(
-        {"torch": "2.5.1+cu121", "vllm": "0.19.1"}, expected
-    ) == {"torch": {"expected": "2.10.0", "actual": "2.5.1+cu121"}}
+        {**expected, "vllm": "0.19.1"}, expected
+    ) == {"vllm": {"expected": "0.30.0", "actual": "0.19.1"}}
 
 
 def test_environment_audit_reports_physical_cuda_visibility(monkeypatch) -> None:

@@ -1,5 +1,4 @@
-# Optional Qwen3.5 Gated DeltaNet Triton acceleration.
-# On NVIDIA driver 535 this package is accepted only after its real GPU probe
-# succeeds; it is not required for installation, data processing, or vLLM.
+# Opt-in Qwen3.8 Gated DeltaNet Triton acceleration for CUDA 13.0.
+# This package is not required for the base environment.
 -r requirements.txt
-flash-linear-attention==0.5.0
+flash-linear-attention[cuda]==0.5.2

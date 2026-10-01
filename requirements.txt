@@ -1,23 +1,19 @@
 # One activated Conda environment (Python 3.12) for data, vLLM generation,
 # training, and evaluation.
-# Target server: Ubuntu 20.04 (glibc 2.31), allocated GPUs 4-7 of 8x RTX 4090
-# (sm_89), CUDA toolkit 12.2, immutable NVIDIA driver 535.171.04.
+# Target server: Ubuntu 24.04, NVIDIA driver 580.173.02, CUDA 13.0.
 #
-# vLLM 0.19.1 supplies a manylinux_2_31 wheel and pins torch 2.10.0. That wheel
-# carries a newer CUDA 12.x runtime. Driver 535 satisfies NVIDIA's CUDA 12.x
-# minor-compatibility floor, but PTX/JIT paths still require the executable
-# probes in run.sh. Never enable VLLM_ENABLE_CUDA_COMPATIBILITY on GeForce GPUs.
+# Install the cu130 PyPI wheel stack below in Python 3.12 Conda.
 #
-# flash-linear-attention is deliberately optional; install
-# requirements-optional.txt only after the base smoke test succeeds.
+# flash-linear-attention is opt-in; install requirements-optional.txt only when
+# its acceleration is desired.
 setuptools>=77.0.3,<81
-torch==2.10.0
-vllm==0.19.1
-transformers==5.5.3
-accelerate==1.13.0
-peft==0.18.1
-bitsandbytes==0.49.2
-safetensors>=0.4.5
+torch==2.13.0
+vllm==0.30.0
+transformers==5.15.0
+accelerate==1.15.0
+peft==0.21.1
+bitsandbytes==0.50.0
+safetensors>=0.6.2
 sentencepiece>=0.2
 numpy==2.2.6
 PyYAML>=6.0
