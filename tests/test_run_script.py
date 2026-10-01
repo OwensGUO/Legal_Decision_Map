@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_SCRIPT = ROOT / "run.sh"
@@ -43,16 +47,79 @@ def test_run_script_dry_run_lists_gpu_phases_in_safe_order() -> None:
     ]
     positions = [output.index(item) for item in phases]
     assert positions == sorted(positions)
-    assert "torch==2.10.0" in output
+    assert "torch==2.13.0" in output
+    assert "vllm==0.30.0" in output
+    assert "CUDA 13.0" in output
+    assert "/data/cguo/Qwen3.5-9B" in output
+    assert "/data/cguo/Qwen3.8-27B" in output
+    assert "/data/cguo/datasets/CAIL2018" in output
+    assert "/data/cguo/datasets/CMDL" in output
+    assert "configs/cf/qwen38_27b.yaml" in output
+    assert "counterfactuals/qwen38" in output
     assert "vllm serve" in output
     assert "--language-model-only" in output
     assert "--disable-custom-all-reduce" in output
-    assert "--enforce-eager" in output
+    assert "--enable-prefix-caching" in output
+    assert "--enforce-eager" not in output
     assert "NCCL_P2P_DISABLE=1" in output
     assert "--resume" in output
     assert "scripts/probe_gpu_stack.py" in output
+    assert "--output" in output
+    assert "gpu-probe.json" in output
+    assert "CUDA_VISIBLE_DEVICES=4\\,5\\,6\\,7" in output
+    assert "--num_processes 4" in output
     assert output.index("scripts/audit_data.py") < output.index("scripts/build_dataset.py")
     assert output.index("validate\\ vLLM\\ JSON") < output.index("generate_counterfactuals.py")
+
+
+def test_dry_run_selects_qwen36_without_reusing_qwen38_counterfactuals() -> None:
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "MODE": "smoke", "GENERATOR_MODEL": "qwen36"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "/data/cguo/Qwen3.6-27B" in result.stdout
+    assert "configs/cf/qwen36_27b.yaml" in result.stdout
+    assert "counterfactuals/qwen36" in result.stdout
+    assert "counterfactuals/qwen38" not in result.stdout
+    assert "--served-model-name Qwen3.6-27B" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "setting", [{"GENERATOR_MODEL": "unknown"}, {"P2P_POLICY": "unknown"}]
+)
+def test_invalid_generator_or_p2p_policy_aborts_before_any_phase(setting) -> None:
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, **setting},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "[phase]" not in result.stdout
+
+
+@pytest.mark.parametrize("policy,disabled", [("enable", False), ("disable", True)])
+def test_dry_run_respects_explicit_p2p_policy(policy, disabled) -> None:
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "MODE": "smoke", "P2P_POLICY": policy, "VLLM_ENFORCE_EAGER": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    command = next(line for line in result.stdout.splitlines() if "vllm serve" in line)
+    assert ("NCCL_P2P_DISABLE=1" in command) is disabled
+    assert ("--disable-custom-all-reduce" in command) is disabled
+    assert "--enforce-eager" in command
 
 
 def test_optional_fla_install_is_explicit() -> None:
@@ -168,11 +235,11 @@ def test_failed_real_vllm_probe_aborts_before_generation(tmp_path) -> None:
     cail = tmp_path / "cail"
     cmdl = tmp_path / "cmdl"
     qwen35 = tmp_path / "qwen35"
-    qwen36 = tmp_path / "qwen36"
-    for path in (cail, cmdl, qwen35, qwen36):
+    qwen38 = tmp_path / "qwen38"
+    for path in (cail, cmdl, qwen35, qwen38):
         path.mkdir()
     (qwen35 / "config.json").write_text("{}", encoding="utf-8")
-    (qwen36 / "config.json").write_text("{}", encoding="utf-8")
+    (qwen38 / "config.json").write_text("{}", encoding="utf-8")
     result = subprocess.run(
         ["bash", str(RUN_SCRIPT)],
         cwd=ROOT,
@@ -185,7 +252,7 @@ def test_failed_real_vllm_probe_aborts_before_generation(tmp_path) -> None:
             "CAIL_ROOT": str(cail),
             "CMDL_ROOT": str(cmdl),
             "QWEN35_PATH": str(qwen35),
-            "QWEN36_PATH": str(qwen36),
+            "QWEN38_PATH": str(qwen38),
             "OUTPUT_ROOT": str(tmp_path / "outputs"),
         },
         capture_output=True,
@@ -195,6 +262,125 @@ def test_failed_real_vllm_probe_aborts_before_generation(tmp_path) -> None:
     assert result.returncode != 0
     assert "vLLM real generation probe failed" in result.stderr
     assert "[phase] generate counterfactuals" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "policy,probe_json,disabled",
+    [
+        ("auto", '{"peer_access":{"all_pairs_accessible":true}}', False),
+        ("auto", '{"peer_access":{"all_pairs_accessible":false}}', True),
+        ("auto", '{"peer_access":{"all_pairs_accessible":"true"}}', True),
+        ("auto", '{"peer_access":{"all_pairs_accessible":1}}', True),
+        ("auto", '{"peer_access":null}', True),
+        ("auto", '{}', True),
+        ("auto", 'invalid JSON', True),
+        ("auto", 'missing', True),
+        ("enable", '{"peer_access":{"all_pairs_accessible":false}}', False),
+        ("disable", '{"peer_access":{"all_pairs_accessible":true}}', True),
+    ],
+)
+def test_real_server_p2p_flags_follow_policy_and_boolean_probe(
+    tmp_path, policy, probe_json, disabled
+) -> None:
+    """Keep orchestration real while replacing GPU/server boundary commands."""
+    conda_prefix = tmp_path / "conda"
+    binary_dir = conda_prefix / "bin"
+    binary_dir.mkdir(parents=True)
+    launch_args = tmp_path / "server-args.json"
+    fake_python = binary_dir / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import os, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[0].endswith('probe_gpu_stack.py'):\n"
+        "    payload = os.environ['TEST_PROBE_JSON']\n"
+        "    if payload != 'missing':\n"
+        "        pathlib.Path(args[args.index('--output') + 1]).write_text(payload)\n"
+        "elif args[0] == '-c' and not args[1].startswith(\n"
+        "    ('import sys; assert', 'import accelerate')\n"
+        "):\n"
+        f"    os.execv({sys.executable!r}, [{sys.executable!r}, *args])\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_setsid = binary_dir / "setsid"
+    fake_setsid.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "os.execvp(sys.argv[1], sys.argv[1:])\n",
+        encoding="utf-8",
+    )
+    fake_setsid.chmod(0o755)
+    fake_vllm = binary_dir / "vllm"
+    fake_vllm.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "payload = {'arguments': sys.argv[1:], 'p2p_disable': os.getenv('NCCL_P2P_DISABLE'), "
+        "'gpu_ids': os.getenv('CUDA_VISIBLE_DEVICES')}\n"
+        "pathlib.Path(os.environ['TEST_LAUNCH_ARGS']).write_text(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+    fake_vllm.chmod(0o755)
+    fake_curl = binary_dir / "curl"
+    fake_curl.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  */v1/chat/completions*) exit 22 ;;\n"
+        "  *) test -f \"$TEST_LAUNCH_ARGS\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    (binary_dir / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (binary_dir / "sleep").chmod(0o755)
+    paths = {name: tmp_path / name for name in ("cail", "cmdl", "qwen35", "qwen38")}
+    for path in paths.values():
+        path.mkdir()
+    for name in ("qwen35", "qwen38"):
+        (paths[name] / "config.json").write_text("{}", encoding="utf-8")
+    output_root = tmp_path / "outputs"
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{binary_dir}:{os.environ['PATH']}",
+            "CONDA_PREFIX": str(conda_prefix),
+            "MODE": "smoke",
+            "P2P_POLICY": policy,
+            "NCCL_P2P_DISABLE": "1",
+            "TEST_PROBE_JSON": probe_json,
+            "TEST_LAUNCH_ARGS": str(launch_args),
+            "CAIL_ROOT": str(paths["cail"]),
+            "CMDL_ROOT": str(paths["cmdl"]),
+            "QWEN35_PATH": str(paths["qwen35"]),
+            "QWEN38_PATH": str(paths["qwen38"]),
+            "OUTPUT_ROOT": str(output_root),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode != 0
+    assert "vLLM real generation probe failed" in result.stderr
+    assert "[phase] generate counterfactuals" not in result.stdout
+    launch = json.loads(launch_args.read_text(encoding="utf-8"))
+    arguments = launch["arguments"]
+    assert launch["p2p_disable"] == ("1" if disabled else None)
+    assert ("--disable-custom-all-reduce" in arguments) is disabled
+    assert "--enforce-eager" not in arguments
+    assert "--enable-prefix-caching" in arguments
+    assert launch["gpu_ids"] == "4,5,6,7"
+    assert arguments[arguments.index("--tensor-parallel-size") + 1] == "4"
+    assert arguments[arguments.index("--host") + 1] == "127.0.0.1"
+    if probe_json != "missing":
+        assert (output_root / "gpu-probe.json").read_text() == probe_json
+    summary = json.loads((output_root / "run-summary.json").read_text())
+    assert summary["status"] == "failed"
+    assert summary["generator_model"] == "qwen38"
+    assert summary["generator_path"] == str(paths["qwen38"])
+    assert summary["p2p_policy"] == policy
 
 
 def test_dry_run_selects_latest_available_training_checkpoint() -> None:

@@ -23,6 +23,8 @@ Common overrides:
   CAIL_ROOT=/data/.../CAIL2018     CMDL_ROOT=/data/.../CMDL
   QWEN35_PATH=/data/.../Qwen3.5-9B
   QWEN36_PATH=/data/.../Qwen3.6-27B
+  QWEN38_PATH=/data/.../Qwen3.8-27B
+  GENERATOR_MODEL=qwen38|qwen36   Counterfactual generator (default qwen38)
   ROBERTA_PATH=/data/.../roberta     LAWFORMER_PATH=/data/.../Lawformer
   GPU_IDS=4,5,6,7                 OUTPUT_ROOT=/data/.../outputs
   NUM_PROCESSES=4                 EXPERIMENTS="M" SEEDS="42"
@@ -30,10 +32,10 @@ Common overrides:
   MOCK_GENERATOR=1                Use the deterministic mock generator
   INFER_MANAGED=0                 Use an already-running vLLM endpoint
   INFER_HOST=127.0.0.1            INFER_PORT=30000 INFER_TIMEOUT=1800
-  INFER_MODEL_NAME=Qwen3.6-27B    Served model name for probes and requests
+  INFER_MODEL_NAME=Qwen3.8-27B    Served model name for probes and requests
   INFER_GPU_MEMORY=0.90           vLLM --gpu-memory-utilization
-  VLLM_ENFORCE_EAGER=1           Avoid CUDA graphs on the driver-535 smoke path
-  VLLM_DISABLE_P2P=1             Set NCCL_P2P_DISABLE=1 for RTX 4090
+  VLLM_ENFORCE_EAGER=1           Opt out of CUDA graphs (default 0)
+  P2P_POLICY=auto|enable|disable  Auto enables P2P only after a positive GPU probe
   DATA_LIMIT=N CF_LIMIT=N EVAL_LIMIT=N MAX_STEPS=N
   BOOTSTRAP_ITERATIONS=2000       Group-clustered bootstrap resamples
   CHECKPOINT_EVERY=100             Save resumable training state every N updates
@@ -65,10 +67,12 @@ done
 MODE="${MODE:-main}"
 GPU_IDS="${GPU_IDS:-4,5,6,7}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
-CAIL_ROOT="${CAIL_ROOT:-/data/chenguo/datasets/CAIL2018}"
-CMDL_ROOT="${CMDL_ROOT:-/data/chenguo/datasets/CMDL}"
-QWEN35_PATH="${QWEN35_PATH:-/data/chenguo/Qwen3.5-9B}"
-QWEN36_PATH="${QWEN36_PATH:-/data/chenguo/Qwen3.6-27B}"
+CAIL_ROOT="${CAIL_ROOT:-/data/cguo/datasets/CAIL2018}"
+CMDL_ROOT="${CMDL_ROOT:-/data/cguo/datasets/CMDL}"
+QWEN35_PATH="${QWEN35_PATH:-/data/cguo/Qwen3.5-9B}"
+QWEN36_PATH="${QWEN36_PATH:-/data/cguo/Qwen3.6-27B}"
+QWEN38_PATH="${QWEN38_PATH:-/data/cguo/Qwen3.8-27B}"
+GENERATOR_MODEL="${GENERATOR_MODEL:-qwen38}"
 ROBERTA_PATH="${ROBERTA_PATH:-/data/chenguo/models/RoBERTa}"
 LAWFORMER_PATH="${LAWFORMER_PATH:-/data/chenguo/models/Lawformer}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/outputs}"
@@ -77,13 +81,36 @@ INFER_PORT="${INFER_PORT:-30000}"
 INFER_TIMEOUT="${INFER_TIMEOUT:-1800}"
 INFER_MANAGED="${INFER_MANAGED:-1}"
 INFER_GPU_MEMORY="${INFER_GPU_MEMORY:-0.90}"
-INFER_MODEL_NAME="${INFER_MODEL_NAME:-Qwen3.6-27B}"
-VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
-VLLM_DISABLE_P2P="${VLLM_DISABLE_P2P:-1}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
+P2P_POLICY="${P2P_POLICY:-auto}"
 MOCK_GENERATOR="${MOCK_GENERATOR:-0}"
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
 INSTALL_FLA="${INSTALL_FLA:-0}"
 BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-}"
+
+case "$GENERATOR_MODEL" in
+  qwen38)
+    GENERATOR_PATH="$QWEN38_PATH"
+    GENERATOR_CONFIG="$ROOT_DIR/configs/cf/qwen38_27b.yaml"
+    INFER_MODEL_NAME="${INFER_MODEL_NAME:-Qwen3.8-27B}"
+    ;;
+  qwen36)
+    GENERATOR_PATH="$QWEN36_PATH"
+    GENERATOR_CONFIG="$ROOT_DIR/configs/cf/qwen36_27b.yaml"
+    INFER_MODEL_NAME="${INFER_MODEL_NAME:-Qwen3.6-27B}"
+    ;;
+  *)
+    printf 'Invalid GENERATOR_MODEL=%s; expected qwen38 or qwen36.\n' "$GENERATOR_MODEL" >&2
+    exit 2
+    ;;
+esac
+case "$P2P_POLICY" in
+  auto|enable|disable) ;;
+  *)
+    printf 'Invalid P2P_POLICY=%s; expected auto, enable, or disable.\n' "$P2P_POLICY" >&2
+    exit 2
+    ;;
+esac
 
 case "$MODE" in
   smoke)
@@ -191,10 +218,10 @@ write_run_summary() {
     return
   fi
   mkdir -p "$OUTPUT_ROOT"
-  python -c 'import json,sys; from pathlib import Path; destination=Path(sys.argv[1]); payload={"status":sys.argv[2],"exit_status":int(sys.argv[3]),"started_at":sys.argv[4],"completed_at":sys.argv[5],"mode":sys.argv[6],"gpu_ids":sys.argv[7].split(","),"experiments":sys.argv[8].split(),"seeds":[int(item) for item in sys.argv[9].split()],"output_root":sys.argv[10]}; destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")' \
+  python -c 'import json,sys; from pathlib import Path; destination=Path(sys.argv[1]); payload={"status":sys.argv[2],"exit_status":int(sys.argv[3]),"started_at":sys.argv[4],"completed_at":sys.argv[5],"mode":sys.argv[6],"gpu_ids":sys.argv[7].split(","),"experiments":sys.argv[8].split(),"seeds":[int(item) for item in sys.argv[9].split()],"output_root":sys.argv[10],"generator_model":sys.argv[11],"generator_path":sys.argv[12],"p2p_policy":sys.argv[13]}; destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")' \
     "$OUTPUT_ROOT/run-summary.json" "$status" "$exit_status" "$PIPELINE_STARTED_AT" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MODE" "$GPU_IDS" "$EXPERIMENTS" "$SEEDS" \
-    "$OUTPUT_ROOT"
+    "$OUTPUT_ROOT" "$GENERATOR_MODEL" "$GENERATOR_PATH" "$P2P_POLICY"
   SUMMARY_WRITTEN=1
 }
 
@@ -235,8 +262,10 @@ cleanup() {
 trap cleanup EXIT
 
 phase "environment"
-printf '[requirement] activated Conda, Python 3.12, torch==2.10.0 (CUDA 12.x), vllm==0.19.1, %s CUDA GPUs\n' \
+printf '[requirement] activated Conda, Python 3.12, torch==2.13.0 (CUDA 13.0), vllm==0.30.0, %s CUDA GPUs\n' \
   "$NUM_PROCESSES"
+printf '[info] GENERATOR_MODEL=%s; generator path: %s; P2P_POLICY=%s\n' \
+  "$GENERATOR_MODEL" "$GENERATOR_PATH" "$P2P_POLICY"
 if [[ "$DRY_RUN" != "1" ]]; then
   if [[ -z "${CONDA_PREFIX:-}" ]]; then
     printf 'Error: activate the intended Conda environment before running this script.\n' >&2
@@ -264,14 +293,14 @@ if [[ "$INSTALL_DEPS" == "1" ]]; then
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  print_command python -c "verify Python 3.12, torch==2.10.0 with CUDA 12.x, a CUDA kernel, and ${NUM_PROCESSES} GPUs"
+  print_command python -c "verify Python 3.12, torch==2.13.0 with CUDA 13.0, a CUDA kernel, and ${NUM_PROCESSES} GPUs"
 else
   python -c 'import accelerate, bitsandbytes, httpx, numpy, peft, pynvml, safetensors, sentencepiece, tensorboard, transformers, vllm, yaml'
   [[ -d "$CAIL_ROOT" ]] || { printf 'Missing CAIL_ROOT: %s\n' "$CAIL_ROOT" >&2; exit 1; }
   [[ -d "$CMDL_ROOT" ]] || { printf 'Missing CMDL_ROOT: %s\n' "$CMDL_ROOT" >&2; exit 1; }
   [[ -f "$QWEN35_PATH/config.json" ]] || { printf 'Missing Qwen3.5 config: %s/config.json\n' "$QWEN35_PATH" >&2; exit 1; }
   if [[ "$MOCK_GENERATOR" != "1" ]]; then
-    [[ -f "$QWEN36_PATH/config.json" ]] || { printf 'Missing Qwen3.6 config: %s/config.json\n' "$QWEN36_PATH" >&2; exit 1; }
+    [[ -f "$GENERATOR_PATH/config.json" ]] || { printf 'Missing %s generator config: %s/config.json\n' "$GENERATOR_MODEL" "$GENERATOR_PATH" >&2; exit 1; }
   fi
   if [[ "$needs_roberta" == "1" ]]; then
     [[ -f "$ROBERTA_PATH/config.json" ]] || { printf 'Missing B1 model: %s/config.json\n' "$ROBERTA_PATH" >&2; exit 1; }
@@ -283,20 +312,41 @@ fi
 run_cmd python "$ROOT_DIR/scripts/audit_environment.py" --limit "$NUM_PROCESSES"
 run_cmd python "$ROOT_DIR/scripts/check_requirements.py" --model-path "$QWEN35_PATH" --limit "$NUM_PROCESSES"
 run_cmd python -m pip check
-gpu_probe=(python "$ROOT_DIR/scripts/probe_gpu_stack.py" --limit "$NUM_PROCESSES")
+GPU_PROBE_PATH="$OUTPUT_ROOT/gpu-probe.json"
+gpu_probe=(python "$ROOT_DIR/scripts/probe_gpu_stack.py" --limit "$NUM_PROCESSES" --output "$GPU_PROBE_PATH")
 if [[ "$INSTALL_FLA" == "1" ]]; then
   gpu_probe+=(--probe-fla)
 fi
 if [[ "$DRY_RUN" == "1" ]]; then
   print_command env "CUDA_VISIBLE_DEVICES=$GPU_IDS" "${gpu_probe[@]}"
 else
+  mkdir -p "$OUTPUT_ROOT"
   env "CUDA_VISIBLE_DEVICES=$GPU_IDS" "${gpu_probe[@]}"
 fi
 
+P2P_DISABLED=1
+if [[ "$P2P_POLICY" == "enable" ]]; then
+  P2P_DISABLED=0
+elif [[ "$P2P_POLICY" == "auto" && "$DRY_RUN" != "1" ]]; then
+  if python -c 'import json,sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        payload = json.load(source)
+    accessible = payload["peer_access"]["all_pairs_accessible"] is True
+except (OSError, ValueError, KeyError, TypeError):
+    accessible = False
+sys.exit(0 if accessible else 1)' "$GPU_PROBE_PATH"; then
+    P2P_DISABLED=0
+  fi
+elif [[ "$P2P_POLICY" == "auto" ]]; then
+  printf '[info] P2P auto dry-run uses disabled flags until the real GPU probe confirms peer access.\n'
+fi
+printf '[info] P2P_POLICY=%s; P2P/custom all-reduce disabled=%s\n' "$P2P_POLICY" "$P2P_DISABLED"
+
 CAIL_PROCESSED="$OUTPUT_ROOT/processed/cail_small"
 CMDL_PROCESSED="$OUTPUT_ROOT/processed/cmdl_small"
-CAIL_CF="$OUTPUT_ROOT/counterfactuals/cail.jsonl"
-CMDL_CF="$OUTPUT_ROOT/counterfactuals/cmdl.jsonl"
+CAIL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cail.jsonl"
+CMDL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cmdl.jsonl"
 
 phase "audit data"
 run_cmd python "$ROOT_DIR/scripts/audit_data.py" \
@@ -317,25 +367,27 @@ run_cmd python "$ROOT_DIR/scripts/build_dataset.py" \
   --set "data.root=$CMDL_ROOT"
 
 phase "start vLLM"
-# Qwen3.6 ships a vision tower; --language-model-only skips loading it. The PyTorch sampler
-# avoids FlashInfer JIT compilation against the server's older CUDA 12.2 toolkit.
+# Skip the vision tower for text-only generation and avoid unnecessary sampler JIT.
 vllm_environment=(
-  env "CUDA_VISIBLE_DEVICES=$GPU_IDS" VLLM_USE_FLASHINFER_SAMPLER=0
+  env -u NCCL_P2P_DISABLE "CUDA_VISIBLE_DEVICES=$GPU_IDS" VLLM_USE_FLASHINFER_SAMPLER=0
 )
-if [[ "$VLLM_DISABLE_P2P" == "1" ]]; then
+if [[ "$P2P_DISABLED" == "1" ]]; then
   vllm_environment+=(NCCL_P2P_DISABLE=1)
 fi
 vllm_command=(
   "${vllm_environment[@]}"
-  vllm serve "$QWEN36_PATH"
+  vllm serve "$GENERATOR_PATH"
   --served-model-name "$INFER_MODEL_NAME"
   --tensor-parallel-size "$NUM_PROCESSES"
   --host "$INFER_HOST" --port "$INFER_PORT"
   --max-model-len 8192
   --language-model-only
-  --disable-custom-all-reduce
+  --enable-prefix-caching
   --gpu-memory-utilization "$INFER_GPU_MEMORY"
 )
+if [[ "$P2P_DISABLED" == "1" ]]; then
+  vllm_command+=(--disable-custom-all-reduce)
+fi
 if [[ "$VLLM_ENFORCE_EAGER" == "1" ]]; then
   vllm_command+=(--enforce-eager)
 fi
@@ -423,7 +475,7 @@ generate_counterfactuals() {
   local output_path=$2
   local command=(
     python "$ROOT_DIR/scripts/generate_counterfactuals.py"
-    --config "$ROOT_DIR/configs/cf/qwen36_27b.yaml"
+    --config "$GENERATOR_CONFIG"
     --input "$input_path" --output "$output_path"
     --limit "$CF_LIMIT" --resume --execute
     --set "generator.model_path=$INFER_MODEL_NAME"
