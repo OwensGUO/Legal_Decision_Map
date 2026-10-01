@@ -17,7 +17,7 @@
 - Default datasets are `/data/cguo/datasets/CMDL` and `/data/cguo/datasets/CAIL2018`.
 - Never modify source models or datasets; all artifacts stay below `OUTPUT_ROOT`.
 - Disable Qwen thinking and require JSON output for every counterfactual request.
-- Do not install flash-linear-attention in the base environment; version 0.5.2 remains opt-in and must pass a real kernel probe.
+- Do not install flash-linear-attention in the base environment; version 0.5.2 remains opt-in and unapproved for project use until an actual model-relevant FLA operation succeeds on the target GPU. The current `--probe-fla` only imports FLA and runs a generic Triton addition kernel; it is preliminary and does not satisfy that gate.
 - Preserve `GPU_IDS`, `NUM_PROCESSES`, local-only serving, fail-fast probes, resume behavior, and process-group cleanup.
 
 ---

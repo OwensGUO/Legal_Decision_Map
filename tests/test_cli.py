@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import runpy
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 
+from legal_landscape.config import load_config, parse_overrides
 from legal_landscape.data.build import build_dataset
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +49,27 @@ def test_all_cli_help_paths() -> None:
 def test_counterfactual_cli_defaults_to_qwen38_config() -> None:
     module = runpy.run_path(str(ROOT / "scripts" / "generate_counterfactuals.py"))
     assert module["parser"]().parse_args([]).config == "configs/cf/qwen38_27b.yaml"
+
+
+def test_readme_real_generation_uses_manual_service_model_alias() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    commands = [
+        shlex.split(line)
+        for block in readme.split("```bash\n")[1:]
+        for line in block.split("```", 1)[0].replace("\\\n", "").splitlines()
+        if "vllm serve " in line or "python scripts/generate_counterfactuals.py " in line
+    ]
+    [service] = [command for command in commands if "--served-model-name" in command]
+    alias = service[service.index("--served-model-name") + 1]
+    real_generation = [
+        command for command in commands if "--execute" in command and "--mock" not in command
+    ]
+    assert real_generation
+    module = runpy.run_path(str(ROOT / "scripts" / "generate_counterfactuals.py"))
+    for command in real_generation:
+        args = module["parser"]().parse_args(command[2:])
+        config = load_config(ROOT / args.config, env={}, overrides=parse_overrides(args.set))
+        assert config["generator"]["model_path"] == alias
 
 
 def test_standalone_configs_use_current_server_paths() -> None:

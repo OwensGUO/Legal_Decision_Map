@@ -73,9 +73,17 @@ vLLM. `pip check`, exact version checks, a CUDA kernel, BF16 matmul, and an NF4
 operation are mandatory gates.
 
 `flash-linear-attention[cuda]==0.5.2` remains optional. It is not part of the
-first smoke run because its Triton extension must be proven against torch 2.13 and CUDA 13
-on the actual server. The Transformers implementation is the correctness
-fallback.
+first smoke run. The current `--probe-fla` imports `fla` and runs only a generic
+Triton addition kernel; this is a preliminary compatibility probe, not proof
+of a working FLA attention kernel. Keep FLA uninstalled/disabled and not
+approved for project use until an actual model-relevant FLA operation executes
+successfully on the target GPU with the target stack. Neither local tests nor
+the current automated probe satisfies that gate. Use a separate validation
+environment for preliminary optional-package investigation, and keep the
+Transformers implementation as the project fallback until approval. The
+`INSTALL_FLA=1` interface triggers installation (when `INSTALL_DEPS=1`) and the
+preliminary check; it does not enforce the actual FLA operation gate and must
+remain unset for project runs until that gate succeeds.
 
 ## 4. Runtime and performance policy
 

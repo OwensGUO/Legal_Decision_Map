@@ -1,5 +1,7 @@
 # Opt-in Qwen3.8 Gated DeltaNet Triton acceleration for CUDA 13.0.
-# Run a real GPU kernel probe successfully before using this package.
+# Project use requires a successful model-relevant FLA operation on the target GPU.
+# --probe-fla only imports FLA and runs a generic Triton add compatibility probe.
+# Keep FLA absent/disabled until the actual FLA operation gate succeeds.
 # This package is not required for the base environment.
 -r requirements.txt
 flash-linear-attention[cuda]==0.5.2

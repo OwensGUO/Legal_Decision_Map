@@ -160,9 +160,14 @@ stop with diagnostics that include the driver, PyTorch CUDA runtime, visible
 GPU mapping, and relevant service log tail.
 
 `flash-linear-attention[cuda]==0.5.2` is an optional acceleration extra, not a core
-requirement. Its Triton kernels must pass a dedicated probe before use. Without
-it, Transformers uses its supported fallback path. Only opt in after the base
-smoke pipeline and a real FLA kernel probe succeed on the target server.
+requirement. The current `--probe-fla` imports `fla` and executes only a generic
+Triton addition kernel. It is a preliminary compatibility probe and does not
+exercise an FLA attention operation. Keep FLA uninstalled/disabled and not
+approved for project use until an actual model-relevant FLA operation executes
+successfully on the target GPU, after the base smoke pipeline. Neither the
+current automated probe nor local CPU acceptance satisfies this gate. Optional
+installation for preliminary investigation belongs in a separate validation
+environment; the project uses the Transformers fallback until approved.
 
 ## Testing and acceptance
 
@@ -188,7 +193,10 @@ external API or account service is used.
 
 `run.sh` requires an already activated Conda environment with Python 3.12. It
 installs or changes dependencies only when `INSTALL_DEPS=1` is explicitly set;
-`INSTALL_FLA=1` separately opts into the optional linear-attention accelerator.
+`INSTALL_FLA=1` requests optional installation (with `INSTALL_DEPS=1`) and the
+preliminary FLA-import/generic-Triton check. It does not enforce the actual FLA
+operation gate; operators must leave it unset and FLA absent/disabled until
+that gate succeeds on the target GPU.
 The default physical GPU allocation is exactly `4,5,6,7`, exposed to vLLM and
 Accelerate through `CUDA_VISIBLE_DEVICES` while child processes use local ranks
 0 through 3.

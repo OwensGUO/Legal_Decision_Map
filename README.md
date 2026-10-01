@@ -44,8 +44,8 @@ MODE=smoke bash run.sh
 目标服务器为 Ubuntu 24.04 x86-64、NVIDIA 驱动 580.173.02、CUDA 13.0，默认分配
 四张 RTX 4090（物理编号 `4,5,6,7`）。请新建环境，不要原地升级旧环境。
 
-基础环境不安装可选的 `flash-linear-attention[cuda]==0.5.2`。只有基础
-`MODE=smoke` 已通过且需要 Gated DeltaNet 加速时，才安装并执行真实内核探针：
+基础环境不安装可选的 `flash-linear-attention[cuda]==0.5.2`。基础 `MODE=smoke`
+通过后，需要排查 FLA 兼容性时，只在独立验证环境中安装并执行以下初步检查：
 
 ```bash
 python -m pip install -r requirements-optional.txt
@@ -55,8 +55,10 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/probe_gpu_stack.py --limit 4 --probe
 `requirements.txt` 是依赖的权威列表：`torch==2.13.0`、`vllm==0.30.0`、
 `transformers==5.15.0`、`accelerate==1.15.0`、`peft==0.21.1`、
 `bitsandbytes==0.50.0`，使用 CUDA 13 的预构建 wheel，不隐式源码编译 vLLM。
-FLA 安装成功不代表可用，必须通过上述实际 GPU 内核探针；缺少 FLA 时使用
-Transformers 回退实现。
+`--probe-fla` 仅导入 `fla` 并运行通用 Triton 加法内核，属于初步兼容性检查，
+没有执行 FLA 注意力操作。安装成功或该检查通过都不批准项目使用 FLA。在目标 GPU
+上成功执行与本项目模型相关的真实 FLA 操作之前，项目环境应保持 FLA 未安装/禁用，
+使用 Transformers 回退实现；本地测试和当前自动探针均不能满足该实际内核门槛。
 
 “pip 安装成功”不视为验收成功；必须通过精确版本检查、`pip check`、CUDA 内核、
 BF16、NF4 及 vLLM 的真实非思考 JSON 生成探针。请勿设置
@@ -113,8 +115,10 @@ bash run.sh
 ```
 
 默认不会修改依赖；只有显式设置 `INSTALL_DEPS=1` 才会安装 `requirements.txt`。
-`INSTALL_DEPS=1 INSTALL_FLA=1` 才会额外安装并探测 FLA。`INSTALL_FLA=1` 会对已安装
-的 FLA 执行真实内核探针。`MOCK_GENERATOR=1 MODE=smoke bash run.sh` 可跳过生成服务，
+`INSTALL_DEPS=1 INSTALL_FLA=1` 会额外安装 FLA；`INSTALL_FLA=1` 会执行上述 FLA
+导入/通用 Triton 初步检查。该开关不会验证 FLA 注意力内核；在目标 GPU 的模型相关
+FLA 操作成功之前，不要为项目设置此开关或安装 FLA。
+`MOCK_GENERATOR=1 MODE=smoke bash run.sh` 可跳过生成服务，
 用于检查数据到训练的控制流；`INFER_MANAGED=0` 表示复用已运行的本地 vLLM 服务，
 `INFER_HOST`、`INFER_PORT`、`INFER_GPU_MEMORY` 调整地址与显存占用比例（不使用
 `VLLM_*` 前缀，因为 `VLLM_PORT` 等是 vLLM 自身的内部变量）。常用覆盖
@@ -265,11 +269,14 @@ python scripts/generate_counterfactuals.py \
   --config configs/cf/qwen38_27b.yaml \
   --input outputs/processed/cail_small/train.jsonl \
   --output outputs/counterfactuals/qwen38/cail.jsonl \
+  --set generator.model_path=Qwen3.8-27B \
   --limit 12 --resume --execute
 ```
 
 输出保存原案件 ID、类型、前后因素、changed_fields、rule_id、模型/提示版本、采样参数、
 种子、原始响应、重试次数和逐项验证结果。`--resume` 按稳定 generation ID 跳过完成项。
+真实生成命令的 `generator.model_path` 会成为 HTTP 请求的 `model` 字段，因此必须与
+第 7 节 `--served-model-name` 的别名一致；更换服务别名时同步调整该覆盖值。
 
 ## 9. 训练 dry-run 与 dummy 验证
 
