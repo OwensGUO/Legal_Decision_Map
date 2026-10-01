@@ -347,6 +347,7 @@ CAIL_PROCESSED="$OUTPUT_ROOT/processed/cail_small"
 CMDL_PROCESSED="$OUTPUT_ROOT/processed/cmdl_small"
 CAIL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cail.jsonl"
 CMDL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cmdl.jsonl"
+RUNS_ROOT="$OUTPUT_ROOT/runs/$GENERATOR_MODEL"
 
 phase "audit data"
 run_cmd python "$ROOT_DIR/scripts/audit_data.py" \
@@ -518,7 +519,7 @@ run_training() {
   local counterfactual=$3
   local experiment=$4
   local seed=$5
-  local run_root="$OUTPUT_ROOT/runs/$dataset/$experiment/seed-$seed"
+  local run_root="$RUNS_ROOT/$dataset/$experiment/seed-$seed"
   local training_root="$run_root/training"
   local prediction_root="$run_root/predictions"
   local selected_model
@@ -584,13 +585,13 @@ phase "evaluate"
 for dataset in cail cmdl; do
   for experiment in "${experiment_list[@]}"; do
     for seed in "${seed_list[@]}"; do
-      run_root="$OUTPUT_ROOT/runs/$dataset/$experiment/seed-$seed"
+      run_root="$RUNS_ROOT/$dataset/$experiment/seed-$seed"
       static_predictions="$run_root/predictions/static.jsonl"
       counterfactual_predictions="$run_root/predictions/counterfactual.jsonl"
       static_reference=""
       counterfactual_reference=""
       if [[ "$experiment" != "B3" && "$has_b3" == "1" ]]; then
-        b3_root="$OUTPUT_ROOT/runs/$dataset/B3/seed-$seed/predictions"
+        b3_root="$RUNS_ROOT/$dataset/B3/seed-$seed/predictions"
         if [[ "$DRY_RUN" == "1" || -s "$b3_root/static.jsonl" ]]; then
           static_reference="$b3_root/static.jsonl"
         fi

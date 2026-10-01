@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -208,6 +209,60 @@ def test_main_dry_run_trains_b3_and_pairs_m_evaluation_against_it() -> None:
     assert sum("--reference-input" in line for line in result.stdout.splitlines()) == 5
 
 
+@pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
+def test_generator_namespaces_training_predictions_evaluation_and_b3_references(
+    tmp_path, generator
+) -> None:
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "MODE": "main",
+            "GENERATOR_MODEL": generator,
+            "OUTPUT_ROOT": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    commands = [
+        shlex.split(line[2:])
+        for line in result.stdout.splitlines()
+        if line.startswith("$ ")
+    ]
+    training = [args for args in commands if str(ROOT / "scripts/train_model.py") in args]
+    evaluations = [args for args in commands if str(ROOT / "scripts/evaluate_model.py") in args]
+    assert len(training) == 4
+    assert len(evaluations) == 10
+    for args in training:
+        dataset = Path(args[args.index("--train-data") + 1]).parent.name.removesuffix("_small")
+        experiment = args[args.index("--experiment") + 1]
+        run_root = tmp_path / "runs" / generator / dataset / experiment / "seed-42"
+        assert args[args.index("--output-dir") + 1] == str(run_root / "training")
+        assert args[args.index("--prediction-dir") + 1] == str(run_root / "predictions")
+        assert args[args.index("--train-data") + 1] == str(
+            tmp_path / "processed" / f"{dataset}_small" / "train.jsonl"
+        )
+    references = []
+    for args in evaluations:
+        input_path = Path(args[args.index("--input") + 1])
+        output_path = Path(args[args.index("--output") + 1])
+        assert input_path.is_relative_to(tmp_path / "runs" / generator)
+        assert input_path.parent.name == "predictions"
+        assert output_path.parent == input_path.parent.parent / "results"
+        if "--reference-input" in args:
+            reference = Path(args[args.index("--reference-input") + 1])
+            dataset = input_path.relative_to(tmp_path / "runs" / generator).parts[0]
+            assert reference == (
+                tmp_path / "runs" / generator / dataset / "B3" / "seed-42"
+                / "predictions" / input_path.name
+            )
+            references.append(reference)
+    assert len(references) == 5
+
+
 def test_failed_real_vllm_probe_aborts_before_generation(tmp_path) -> None:
     conda_prefix = tmp_path / "conda"
     binary_dir = conda_prefix / "bin"
@@ -383,11 +438,12 @@ def test_real_server_p2p_flags_follow_policy_and_boolean_probe(
     assert summary["p2p_policy"] == policy
 
 
-def test_dry_run_selects_latest_available_training_checkpoint() -> None:
+@pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
+def test_dry_run_selects_latest_available_training_checkpoint(generator) -> None:
     with TemporaryDirectory() as directory:
         output = Path(directory)
         for dataset in ("cail", "cmdl"):
-            training = output / "runs" / dataset / "M" / "seed-42" / "training"
+            training = output / "runs" / generator / dataset / "M" / "seed-42" / "training"
             older = training / "checkpoint-step-00000010"
             newer = training / "checkpoint-step-00000020"
             older.mkdir(parents=True)
@@ -399,7 +455,12 @@ def test_dry_run_selects_latest_available_training_checkpoint() -> None:
         result = subprocess.run(
             ["bash", str(RUN_SCRIPT), "--dry-run"],
             cwd=ROOT,
-            env={**os.environ, "MODE": "smoke", "OUTPUT_ROOT": str(output)},
+            env={
+                **os.environ,
+                "MODE": "smoke",
+                "GENERATOR_MODEL": generator,
+                "OUTPUT_ROOT": str(output),
+            },
             capture_output=True,
             text=True,
             check=False,
@@ -407,3 +468,32 @@ def test_dry_run_selects_latest_available_training_checkpoint() -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.count("--resume-from-checkpoint") == 2
     assert result.stdout.count("checkpoint-step-00000020") == 2
+
+
+def test_switching_generator_ignores_other_generator_and_legacy_checkpoints(tmp_path) -> None:
+    for prefix in (tmp_path / "runs" / "qwen38", tmp_path / "runs"):
+        for dataset in ("cail", "cmdl"):
+            checkpoint = prefix / dataset / "M" / "seed-42" / "training" / "checkpoint-final"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "training_progress.json").write_text("{}", encoding="utf-8")
+    for generator, expected_resume_count in (("qwen38", 2), ("qwen36", 0)):
+        result = subprocess.run(
+            ["bash", str(RUN_SCRIPT), "--dry-run"],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "MODE": "smoke",
+                "GENERATOR_MODEL": generator,
+                "OUTPUT_ROOT": str(tmp_path),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.count("--resume-from-checkpoint") == expected_resume_count
+        if generator == "qwen38":
+            checkpoint = tmp_path / "runs/qwen38/cail/M/seed-42/training/checkpoint-final"
+            assert str(checkpoint) in result.stdout
+        else:
+            assert f"{tmp_path}/runs/qwen38" not in result.stdout
