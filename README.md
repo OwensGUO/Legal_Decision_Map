@@ -77,13 +77,14 @@ bash run.sh --dry-run
 MODE=smoke bash run.sh
 ```
 
-运行进度默认采用 `PROGRESS=auto`：终端中的动态进度会显示任务计数、耗时和剩余时间；
-重定向到日志时改为定期输出完整文本行（约每 30 秒一次），避免光标控制字符。
+运行进度默认采用 `PROGRESS=auto`：`stderr` 连接 TTY 时使用动态进度，显示任务计数、
+耗时和剩余时间；将 `stderr` 重定向到日志时改为定期输出完整文本行（约每 30 秒一次），
+避免光标控制字符。仅重定向 `stdout` 不会关闭动态进度。
 也可用 `PROGRESS=always` 强制动态显示，或用 `PROGRESS=never` 始终输出适合日志的
 文本进度。设置 `NO_COLOR=1` 可保留进度显示并关闭颜色：
 
 ```bash
-# 默认：终端动态显示，日志定期输出文本
+# 默认：stderr 是终端时动态显示，stderr 重定向到日志时定期输出文本
 MODE=smoke PROGRESS=auto bash run.sh
 
 # 强制使用适合日志的纯文本进度
@@ -101,9 +102,10 @@ NO_COLOR=1 MODE=smoke bash run.sh
 反事实断点续跑会将已完成请求计入初始进度；训练从检查点恢复时，初始计数从已完成的
 优化器更新开始。分布式训练和预测只由主进程显示进度，避免多卡重复输出。
 
-普通运行的阶段消息和内部进度发往 `stderr`，脚本生成的 JSON 仍保留在 `stdout`，
-因此分别重定向时可继续解析 JSON。`--dry-run` 的阶段和模拟命令会打印到 `stdout`，
-且不会使用动态控制字符。例如，纯文本日志中的顶层消息形如：
+普通运行的阶段消息和内部进度发往 `stderr`，各 Python 子命令的 JSON `stdout` 不会被进度条控制字符污染。
+一键脚本的 `stdout` 还包含 requirement/info 消息和多个子命令输出，不能作为单个 JSON 文档解析；
+需要正式结果时，应读取 `OUTPUT_ROOT` 下具体的 JSON/JSONL 文件。`--dry-run` 的阶段和模拟命令会
+打印到 `stdout`，且不会使用动态控制字符。例如，纯文本日志中的顶层消息形如：
 
 ```text
 [phase 1/9] environment

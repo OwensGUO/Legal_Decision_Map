@@ -22,8 +22,15 @@ def test_readme_documents_progress_controls() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for value in ("PROGRESS=auto", "PROGRESS=always", "PROGRESS=never", "NO_COLOR"):
         assert value in readme
-    assert "stderr" in readme
-    assert "stdout" in readme
+    for statement in (
+        "`stderr` 连接 TTY 时使用动态进度",
+        "将 `stderr` 重定向到日志时改为定期输出完整文本行",
+        "仅重定向 `stdout` 不会关闭动态进度",
+        "各 Python 子命令的 JSON `stdout` 不会被进度条控制字符污染",
+        "一键脚本的 `stdout` 还包含 requirement/info 消息和多个子命令输出",
+        "应读取 `OUTPUT_ROOT` 下具体的 JSON/JSONL 文件",
+    ):
+        assert statement in readme
 
 
 @pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
