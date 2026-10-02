@@ -103,6 +103,25 @@ def test_rich_renderer_respects_color_width_ascii_and_final_status():
     assert "\x1b[" not in stream.getvalue()
 
 
+def test_rich_renderer_uses_ascii_for_named_non_utf8_locale():
+    stream = io.StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={
+            "PROGRESS": "always",
+            "NO_COLOR": "1",
+            "COLUMNS": "80",
+            "LC_ALL": "en_US.ISO-8859-1",
+        },
+        is_terminal=True,
+    ) as reporter:
+        with reporter.task("CAIL", total=2) as task:
+            task.advance()
+    assert all(ord(character) < 128 for character in stream.getvalue())
+    assert "1/2" in stream.getvalue()
+    assert "completed" in stream.getvalue()
+
+
 def test_rich_initialization_failure_falls_back_to_plain(monkeypatch):
     stream = io.StringIO()
     monkeypatch.setattr(
@@ -120,6 +139,34 @@ def test_rich_initialization_failure_falls_back_to_plain(monkeypatch):
             task.advance()
     assert "Fallback" in stream.getvalue()
     assert "completed" in stream.getvalue()
+
+
+def test_rich_start_failure_falls_back_once_and_preserves_business_state(monkeypatch):
+    class BrokenRenderer:
+        def start(self):
+            raise RuntimeError("start failed")
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        "legal_landscape.progress._new_rich_progress", lambda *args: BrokenRenderer()
+    )
+    stream = io.StringIO()
+    business_calls = 0
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "always"},
+        is_terminal=True,
+        plain_interval=0,
+    ) as reporter:
+        with reporter.task("Generate", total=1) as task:
+            business_calls += 1
+            task.advance()
+    rendered = stream.getvalue()
+    assert business_calls == 1
+    assert rendered.count("fallback") == 1
+    assert "1/1 completed" in rendered
 
 
 def test_rich_update_failure_preserves_completed_count(monkeypatch):
@@ -151,3 +198,35 @@ def test_rich_update_failure_preserves_completed_count(monkeypatch):
     rendered = stream.getvalue()
     assert rendered.count("fallback") == 1
     assert "2/3 completed" in rendered
+
+
+def test_rich_stop_failure_preserves_final_status_and_count(monkeypatch):
+    class BrokenRenderer:
+        def start(self):
+            pass
+
+        def add_task(self, *args, **kwargs):
+            return 1
+
+        def update(self, *args, **kwargs):
+            pass
+
+        def stop(self):
+            raise RuntimeError("stop failed")
+
+    monkeypatch.setattr(
+        "legal_landscape.progress._new_rich_progress", lambda *args: BrokenRenderer()
+    )
+    stream = io.StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "always"},
+        is_terminal=True,
+        plain_interval=0,
+    ) as reporter:
+        with reporter.task("Recover", total=3, completed=1) as task:
+            task.advance(valid=2)
+    rendered = stream.getvalue()
+    assert rendered.count("fallback") == 1
+    assert "2/3 completed" in rendered
+    assert "valid=2" in rendered

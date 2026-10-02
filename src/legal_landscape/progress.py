@@ -6,6 +6,7 @@ import os
 import sys
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
+from locale import getpreferredencoding
 from time import monotonic
 from typing import Literal, Protocol, Self, TextIO
 
@@ -224,8 +225,12 @@ def _new_rich_progress(
 ) -> Progress:
     raw_width = environ.get("COLUMNS", "")
     width = int(raw_width) if raw_width.isdecimal() and int(raw_width) > 0 else None
-    locale = environ.get("LC_ALL", environ.get("LC_CTYPE", environ.get("LANG", "")))
-    ascii_only = locale in {"C", "POSIX"}
+    locale = next(
+        (environ[key] for key in ("LC_ALL", "LC_CTYPE", "LANG") if environ.get(key)),
+        getpreferredencoding(False),
+    )
+    encoding = locale.split(".", 1)[-1].split("@", 1)[0]
+    ascii_only = encoding.casefold().replace("-", "").replace("_", "") != "utf8"
     console = Console(
         file=stream,
         force_terminal=True,
@@ -271,6 +276,7 @@ class _RichTask(AbstractContextManager["_RichTask"]):
         self.task_id: int | None = None
         self.plain_task: _PlainTask | None = None
         self.finished = False
+        self.final_status: str | None = None
 
     def _details(self) -> str:
         return " ".join(f"{key}={_single_line(value)}" for key, value in self.fields.items())
@@ -350,6 +356,7 @@ class _RichTask(AbstractContextManager["_RichTask"]):
             return
         self.fields.update(fields)
         self.finished = True
+        self.final_status = status
         if self.plain_task is not None:
             self.plain_task._finish(status, **fields)
         else:
@@ -367,6 +374,8 @@ class _RichTask(AbstractContextManager["_RichTask"]):
         if not self.finished:
             self._finish("failed" if exc[0] is not None else "completed")
         self.reporter.active.remove(self)
+        if self.reporter.plain is None:
+            self.reporter.finished.append(self)
         return False
 
 
@@ -385,6 +394,7 @@ class RichProgressReporter(AbstractContextManager["RichProgressReporter"]):
         self.plain_interval = plain_interval
         self.plain: PlainProgressReporter | None = None
         self.active: list[_RichTask] = []
+        self.finished: list[_RichTask] = []
 
     def _fallback(self) -> None:
         if self.plain is not None:
@@ -400,6 +410,11 @@ class RichProgressReporter(AbstractContextManager["RichProgressReporter"]):
         self.stream.flush()
         for task in self.active:
             task._activate_plain()
+        for task in self.finished:
+            plain_task = _PlainTask(
+                self.plain, task.description, task.total, task.completed, dict(task.fields)
+            )
+            plain_task._finish(task.final_status or "completed")
 
     def _render(self, operation: Callable[[Progress], object]) -> None:
         if self.plain is not None:
@@ -421,6 +436,7 @@ class RichProgressReporter(AbstractContextManager["RichProgressReporter"]):
     def __exit__(self, *exc: object) -> bool:
         if self.plain is None:
             self._render(lambda progress: progress.stop())
+        self.finished.clear()
         return False
 
     def task(
