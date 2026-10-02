@@ -6,12 +6,14 @@ import runpy
 import shlex
 import subprocess
 import sys
+from io import StringIO
 from pathlib import Path
 
 import yaml
 
 from legal_landscape.config import load_config, parse_overrides
 from legal_landscape.data.build import build_dataset
+from legal_landscape.progress import create_progress_reporter
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = (
@@ -139,7 +141,7 @@ def test_heavy_clis_default_to_dry_run() -> None:
         assert json.loads(result.stdout)["dry_run"] is True
 
 
-def test_build_dataset_writes_traceable_processed_records(tmp_path) -> None:
+def test_build_dataset_progress_writes_traceable_processed_records(tmp_path) -> None:
     source = tmp_path / "source" / "exercise_contest"
     source.mkdir(parents=True)
     row = {
@@ -187,8 +189,35 @@ def test_build_dataset_writes_traceable_processed_records(tmp_path) -> None:
     assert processed["factors"]["amount"] == 1000.0
     assert (output / "manifest.json").is_file()
 
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/build_dataset.py"),
+            "--config",
+            str(config_path),
+            "--output-dir",
+            str(tmp_path / "cli-processed"),
+            "--limit",
+            "1",
+            "--execute",
+        ],
+        cwd=ROOT,
+        env={**_env(), "PROGRESS": "never"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["dataset"] == "cail"
+    assert "Assign groups" in result.stderr
+    assert "Build train" in result.stderr
+    assert "Build valid" in result.stderr
+    assert "Build test" in result.stderr
+    assert "\x1b[" not in result.stderr
 
-def test_build_dataset_keeps_cross_split_group_only_in_held_out_split(tmp_path) -> None:
+
+def test_build_dataset_progress_counts_dropped_and_short_splits(tmp_path) -> None:
     source = tmp_path / "source" / "exercise_contest"
     source.mkdir(parents=True)
     duplicate = {
@@ -232,7 +261,14 @@ def test_build_dataset_keeps_cross_split_group_only_in_held_out_split(tmp_path) 
     )
 
     output = tmp_path / "processed"
-    summary = build_dataset(config_path, output)
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "never"},
+        is_terminal=False,
+        plain_interval=0,
+    ) as progress:
+        summary = build_dataset(config_path, output, limit=5, progress=progress)
 
     assert (output / "train.jsonl").read_text(encoding="utf-8") == ""
     [valid_record] = [
@@ -250,6 +286,13 @@ def test_build_dataset_keeps_cross_split_group_only_in_held_out_split(tmp_path) 
         "cross_split_groups": 1,
         "dropped_units": {"train": 1, "valid": 0, "test": 0},
     }
+    lines = stream.getvalue().splitlines()
+    assert sum("Assign groups" in line and "progress" in line for line in lines) == 3
+    for split, accepted, dropped in (("train", 0, 1), ("valid", 1, 0), ("test", 1, 0)):
+        task_lines = [line for line in lines if f"Build {split}" in line]
+        assert len([line for line in task_lines if "progress" in line]) == 1
+        assert "1/5 completed" in task_lines[-1]
+        assert f"accepted={accepted} dropped={dropped} processed=1" in task_lines[-1]
 
 
 def test_environment_and_requirement_dry_runs_are_read_only() -> None:

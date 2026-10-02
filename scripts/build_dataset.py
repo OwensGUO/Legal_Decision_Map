@@ -9,6 +9,7 @@ from pathlib import Path
 
 from legal_landscape.config import parse_overrides
 from legal_landscape.data.build import build_dataset
+from legal_landscape.progress import create_progress_reporter
 
 
 def parser() -> argparse.ArgumentParser:
@@ -37,12 +38,14 @@ def main() -> int:
             )
         )
         return 0
-    summary = build_dataset(
-        args.config,
-        args.output_dir,
-        limit=args.limit,
-        overrides=parse_overrides(args.set),
-    )
+    with create_progress_reporter() as progress:
+        summary = build_dataset(
+            args.config,
+            args.output_dir,
+            limit=args.limit,
+            overrides=parse_overrides(args.set),
+            progress=progress,
+        )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

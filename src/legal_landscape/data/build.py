@@ -13,6 +13,7 @@ from legal_landscape.data.cmdl import iter_cmdl
 from legal_landscape.data.manifest import build_manifest
 from legal_landscape.data.sanitize import sanitize_text
 from legal_landscape.factors.extract import extract_factors
+from legal_landscape.progress import NullProgressReporter, ProgressReporter
 
 _SPLIT_PRIORITY = {"train": 0, "valid": 1, "test": 2}
 
@@ -45,19 +46,32 @@ def _iter_cases(
 
 
 def _assign_groups_to_splits(
-    data: dict[str, Any], paths: dict[str, Path], *, limit: int | None
+    data: dict[str, Any], paths: dict[str, Path], *, limit: int | None,
+    progress: ProgressReporter,
 ) -> tuple[dict[str, str], set[str]]:
     """Assign duplicate source groups to the most held-out official split."""
     assignments: dict[str, str] = {}
     cross_split_groups: set[str] = set()
-    for split, source in paths.items():
-        for case in _iter_cases(data, source, split=split, limit=limit):
-            previous = assignments.setdefault(case.group_id, split)
-            if previous == split:
-                continue
-            cross_split_groups.add(case.group_id)
-            if _SPLIT_PRIORITY[split] > _SPLIT_PRIORITY[previous]:
-                assignments[case.group_id] = split
+    processed = 0
+    with progress.task(
+        f"Assign groups · {data['dataset']}",
+        total=len(paths) * limit if limit is not None else None,
+        dataset=data["dataset"],
+        pass_name="assignment",
+        split="all",
+        accepted=0,
+        dropped=0,
+    ) as task:
+        for split, source in paths.items():
+            for case in _iter_cases(data, source, split=split, limit=limit):
+                previous = assignments.setdefault(case.group_id, split)
+                if previous != split:
+                    cross_split_groups.add(case.group_id)
+                    if _SPLIT_PRIORITY[split] > _SPLIT_PRIORITY[previous]:
+                        assignments[case.group_id] = split
+                processed += 1
+                task.advance(split=split, accepted=processed)
+        task.succeed(processed=processed)
     return assignments, cross_split_groups
 
 
@@ -67,9 +81,11 @@ def build_dataset(
     *,
     limit: int | None = None,
     overrides: dict[str, Any] | None = None,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     """Stream all configured splits into auditable processed records."""
     config = load_config(config_path, overrides=overrides)
+    reporter = progress if progress is not None else NullProgressReporter()
     data = config["data"]
     paths = _source_paths(data)
     destination = Path(output_dir)
@@ -78,31 +94,44 @@ def build_dataset(
     charges: set[str] = set()
     articles: set[str] = set()
     group_splits, cross_split_groups = _assign_groups_to_splits(
-        data, paths, limit=limit
+        data, paths, limit=limit, progress=reporter
     )
     dropped_units = dict.fromkeys(paths, 0)
     for split, source in paths.items():
         iterator = _iter_cases(data, source, split=split, limit=limit)
         count = 0
         output_path = destination / f"{split}.jsonl"
-        with output_path.open("w", encoding="utf-8") as handle:
-            for case in iterator:
-                if group_splits[case.group_id] != split:
-                    dropped_units[split] += 1
-                    continue
-                sanitized = sanitize_text(case.fact_raw, charges=case.charges)
-                factors = extract_factors(case.fact_raw, target_defendant=case.target_defendant)
-                record = {
-                    **case.to_dict(),
-                    "fact_conservative": sanitized.conservative,
-                    "fact_strict": sanitized.strict,
-                    "redactions": [asdict(item) for item in sanitized.redactions],
-                    "factors": factors.to_dict(),
-                }
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                charges.update(case.charges)
-                articles.update(case.conviction_articles)
-                count += 1
+        with reporter.task(
+            f"Build {split} · {data['dataset']}",
+            total=limit,
+            dataset=data["dataset"],
+            pass_name="build",
+            split=split,
+            accepted=0,
+            dropped=0,
+        ) as task:
+            with output_path.open("w", encoding="utf-8") as handle:
+                for case in iterator:
+                    if group_splits[case.group_id] != split:
+                        dropped_units[split] += 1
+                    else:
+                        sanitized = sanitize_text(case.fact_raw, charges=case.charges)
+                        factors = extract_factors(
+                            case.fact_raw, target_defendant=case.target_defendant
+                        )
+                        record = {
+                            **case.to_dict(),
+                            "fact_conservative": sanitized.conservative,
+                            "fact_strict": sanitized.strict,
+                            "redactions": [asdict(item) for item in sanitized.redactions],
+                            "factors": factors.to_dict(),
+                        }
+                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        charges.update(case.charges)
+                        articles.update(case.conviction_articles)
+                        count += 1
+                    task.advance(accepted=count, dropped=dropped_units[split])
+            task.succeed(processed=count + dropped_units[split])
         split_units[split] = count
     manifest = [entry.to_dict() for entry in build_manifest(list(paths.values()))]
     (destination / "manifest.json").write_text(
