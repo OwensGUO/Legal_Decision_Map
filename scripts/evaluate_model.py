@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -168,8 +167,10 @@ def main() -> int:
     available_bootstrap_names = tuple(
         name for name in bootstrap_names(args.kind) if name in metrics
     )
-    print(f"Evaluating {args.kind} predictions", file=sys.stderr)
-    with create_progress_reporter() as progress:
+    with (
+        create_progress_reporter() as progress,
+        progress.task(f"Evaluating {args.kind} predictions", total=None),
+    ):
         confidence_intervals = bootstrap_metric_set(
             rows,
             lambda sample: calculate_metrics(args.kind, sample),

@@ -135,6 +135,9 @@ def test_rich_stream_failure_on_lifecycle_fallback_preserves_business_exception(
         def update(self, *args, **kwargs):
             pass
 
+        def stop_task(self, *args):
+            pass
+
         def stop(self):
             if failure_point == "stop":
                 raise RuntimeError("stop failed")
@@ -355,6 +358,9 @@ def test_rich_stop_failure_preserves_final_status_and_count(monkeypatch):
             return 1
 
         def update(self, *args, **kwargs):
+            pass
+
+        def stop_task(self, *args):
             pass
 
         def stop(self):

@@ -106,6 +106,7 @@ WAIT_DYNAMIC_VISIBLE=0
 WAIT_TERMINAL_MODE=0
 WAIT_COMPACT=0
 PROGRESS_DYNAMIC=0
+PROGRESS_STREAM_FAILED=0
 if [[ "$DRY_RUN" != "1" ]] && { [[ "$PROGRESS" == "always" ]] || { [[ "$PROGRESS" == "auto" ]] && [[ -t 2 ]]; }; }; then
   PROGRESS_DYNAMIC=1
 fi
@@ -220,8 +221,18 @@ phase_log() {
   if [[ "$DRY_RUN" == "1" ]]; then
     printf '%s\n' "$1"
   else
-    printf '%s\n' "$1" >&2
+    progress_write '%s\n' "$1"
   fi
+}
+
+progress_write() {
+  [[ "$PROGRESS_STREAM_FAILED" == "0" ]] || return 0
+  # Isolate SIGPIPE and diagnostics while retaining the original stderr target.
+  if (trap '' PIPE; printf "$@" >&3) 3>&2 2>/dev/null; then
+    return 0
+  fi
+  PROGRESS_STREAM_FAILED=1
+  return 0
 }
 
 finish_phase() {
@@ -254,7 +265,7 @@ plain_vllm_wait() {
   local elapsed=$1
   local label="Waiting for vLLM (${elapsed}s/${INFER_TIMEOUT}s)"
   if [[ "$WAIT_COMPACT" == "0" ]]; then
-    printf '%s\n' "$label" >&2
+    progress_write '%s\n' "$label"
     return
   fi
   if (( ${#label} >= WAIT_WIDTH )); then
@@ -269,7 +280,7 @@ plain_vllm_wait() {
   if (( ${#label} >= WAIT_WIDTH )); then
     label="${label:0:$((WAIT_WIDTH - 1))}"
   fi
-  printf '%s\n' "$label" >&2
+  progress_write '%s\n' "$label"
 }
 
 render_vllm_wait() {
@@ -286,7 +297,7 @@ render_vllm_wait() {
   fi
   if (( ${#label} >= WAIT_WIDTH )); then
     if [[ "$WAIT_DYNAMIC_VISIBLE" == "1" ]]; then
-      printf '\r\033[2K' >&2
+      progress_write '\r\033[2K'
       WAIT_DYNAMIC_VISIBLE=0
     fi
     PROGRESS_DYNAMIC=0
@@ -295,7 +306,7 @@ render_vllm_wait() {
     WAIT_LAST_PLAIN_AT=$SECONDS
     return
   fi
-  printf '\r\033[2K%s' "$label" >&2
+  progress_write '\r\033[2K%s' "$label"
   WAIT_DYNAMIC_VISIBLE=1
   WAIT_FRAME_INDEX=$((WAIT_FRAME_INDEX + 1))
 }
@@ -330,7 +341,7 @@ update_vllm_wait() {
 finish_vllm_wait() {
   [[ "$WAIT_ACTIVE" == "1" ]] || return 0
   if [[ "$WAIT_DYNAMIC_VISIBLE" == "1" ]]; then
-    printf '\r\033[2K' >&2
+    progress_write '\r\033[2K'
     WAIT_DYNAMIC_VISIBLE=0
   fi
   local label="vLLM wait $1 after $((SECONDS - WAIT_STARTED_AT))s"
@@ -350,7 +361,7 @@ finish_vllm_wait() {
       label="${label:0:$((WAIT_WIDTH - 1))}"
     fi
   fi
-  printf '%s\n' "$label" >&2
+  progress_write '%s\n' "$label"
   WAIT_ACTIVE=0
 }
 
@@ -412,13 +423,13 @@ stop_inference_server() {
 }
 
 cleanup() {
-  exit_status=$?
+  local exit_status=$?
   trap - EXIT
   if [[ "$exit_status" != "0" ]]; then
-    finish_vllm_wait "failed"
-    finish_phase "failed"
+    finish_vllm_wait "failed" || true
+    finish_phase "failed" || true
   fi
-  stop_inference_server
+  stop_inference_server || true
   if [[ "$exit_status" != "0" && "$SUMMARY_WRITTEN" == "0" ]]; then
     write_run_summary "failed" "$exit_status" || true
   fi
