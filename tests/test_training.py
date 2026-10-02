@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import unittest
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+
+import pytest
 
 try:
     import torch
@@ -19,6 +23,470 @@ from legal_landscape.training.train import (
     training_plan,
     validate_resume_metadata,
 )
+
+
+class RecordingProgress:
+    def __init__(self, events):
+        self.events = events
+        self.tasks = []
+        self.started_tasks = []
+        self.closed = False
+
+    def __enter__(self):
+        self.events.append("reporter:enter")
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+        self.events.append("reporter:exit")
+        return False
+
+    @contextmanager
+    def task(self, description, *, total, completed=0, **fields):
+        state = {"description": description, "total": total, "completed": completed, **fields}
+        self.tasks.append(state)
+        self.started_tasks.append(dict(state))
+        self.events.append(f"task:enter:{description}")
+
+        def advance(amount=1, **updates):
+            state["completed"] += amount
+            state.update(updates)
+            self.events.append(("advance", description, dict(state)))
+
+        def update(**updates):
+            state.update(updates)
+            self.events.append(("update", description, dict(state)))
+
+        try:
+            yield SimpleNamespace(advance=advance, update=update)
+        finally:
+            self.events.append(f"task:exit:{description}")
+
+
+@pytest.mark.parametrize(
+    ("step", "maximum", "expected"),
+    [
+        (240, 1000, (240, 1000)),
+        (1200, 1000, (1000, 1000)),
+        (-5, 1000, (0, 1000)),
+        (0, -10, (0, 0)),
+        (2, 0, (0, 0)),
+    ],
+)
+def test_training_progress_starts_at_restored_optimizer_step(step, maximum, expected):
+    from legal_landscape.training.train import _training_progress_start
+
+    assert _training_progress_start(step, maximum) == expected
+
+
+def test_worker_progress_factory_is_disabled():
+    from legal_landscape.training.train import _progress_enabled_for_process
+
+    assert _progress_enabled_for_process(is_main_process=True) is True
+    assert _progress_enabled_for_process(is_main_process=False) is False
+
+
+def test_training_progress_reports_completed_optimizer_step_and_loss():
+    from legal_landscape.training.train import _report_optimizer_step
+
+    events = []
+    reporter = RecordingProgress(events)
+    with reporter.task("Train M", total=4, completed=2, experiment="M", loss="—") as task:
+        # The caller invokes the helper only after gradient accumulation completes.
+        for completed, step, loss in [(False, 2, 9.0), (True, 3, 1.25), (True, 4, 0.5)]:
+            if completed:
+                _report_optimizer_step(task, step, 4, loss)
+    updates = [event[2] for event in events if isinstance(event, tuple)]
+    assert [item["completed"] for item in updates] == [3, 4]
+    assert [item["step"] for item in updates] == [3, 4]
+    assert [item["loss"] for item in updates] == [1.25, 0.5]
+
+
+@pytest.fixture
+def training_progress_runtime(monkeypatch, tmp_path):
+    """Replace only unavailable model/GPU dependencies; execute the real loop and files."""
+    import sys
+
+    from legal_landscape.progress import NullProgressReporter
+    from legal_landscape.training import train
+
+    events = []
+
+    class Tensor:
+        def __init__(self, value, *, absorbed=False):
+            self.value = value
+            self.shape = (1, 1)
+            self.absorbed = absorbed
+
+        def detach(self):
+            return self
+
+        def __float__(self):
+            return float(self.value)
+
+        def cpu(self):
+            return self
+
+        def float(self):
+            return self
+
+        def argmax(self, **kwargs):
+            return Tensor([0])
+
+        def tolist(self):
+            if self.absorbed:
+                events.append("absorb")
+            return self.value
+
+    class Loader:
+        def __init__(self, records, **kwargs):
+            self.records = records
+
+        def __len__(self):
+            return len(self.records)
+
+        def __iter__(self):
+            records = (
+                reversed(self.records)
+                if self.records and "_prediction_index" in self.records[0]
+                else self.records
+            )
+            for record in records:
+                batch = {
+                    name: Tensor([[1]])
+                    for name in (
+                        "input_ids",
+                        "charge_targets",
+                        "article_targets",
+                        "article_mask",
+                        "penalty_targets",
+                        "sentence_targets",
+                        "sentence_mask",
+                        "factor_targets",
+                    )
+                }
+                if "_prediction_index" in record:
+                    index = Tensor([record["_prediction_index"]])
+                    if "parent_record" in record:
+                        batch = {"parent": batch, "counterfactual": batch, "pair_indices": index}
+                    else:
+                        batch["record_indices"] = index
+                yield batch
+
+    class Predictor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def parameters(self):
+            return [SimpleNamespace(requires_grad=True)]
+
+        def train(self):
+            events.append("train")
+
+        def eval(self):
+            events.append("eval")
+
+        def __call__(self, *args):
+            return {
+                "charge_logits": Tensor([[0.8]]),
+                "article_logits": Tensor([[0.7]]),
+                "penalty_type_logits": Tensor([[1.0]]),
+                "sentence_months": Tensor([12.0]),
+            }
+
+    class Optimizer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def step(self):
+            events.append("optimizer")
+
+        def zero_grad(self):
+            pass
+
+    class Writer:
+        def __init__(self, *args):
+            pass
+
+        def add_scalar(self, name, value, step):
+            events.append(("tensorboard", step))
+
+        def close(self):
+            events.append("writer:close")
+
+    records = [
+        {
+            "case_id": f"c{i}",
+            "group_id": f"g{i}",
+            "charges": ["盗窃"],
+            "conviction_articles": ["criminal_law:264"],
+            "penalty_type": "fixed_term",
+            "imprisonment_months": 12,
+        }
+        for i in range(4)
+    ]
+    train_path = tmp_path / "train.jsonl"
+    train_path.write_text("".join(json.dumps(row) + "\n" for row in records))
+    evaluation_path = tmp_path / "evaluation.jsonl"
+    evaluation_path.write_text("".join(json.dumps(row) + "\n" for row in records[:2]))
+    pairs_path = tmp_path / "pairs.jsonl"
+    pairs_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "parent_case_id": row["case_id"],
+                    "intervention_type": "invariant",
+                    "validation": {"valid": True, "parsed": {"counterfactual_text": "改写事实"}},
+                }
+            )
+            + "\n"
+            for row in records[:2]
+        )
+    )
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "charge_vocabulary": ["盗窃"],
+                "article_vocabulary": ["criminal_law:264"],
+                "penalty_vocabulary": ["fixed_term"],
+            }
+        )
+    )
+    inspected = train.InspectedModelConfig("fake", (), "fake", "fake", (), False, 1)
+    monkeypatch.setattr(train, "load_backbone", lambda config: (object(), inspected))
+    monkeypatch.setattr(train, "set_deterministic_seed", lambda seed: None)
+    monkeypatch.setattr(train, "validate_loss_breakdown", lambda *args, **kwargs: None)
+    losses = SimpleNamespace(
+        **{
+            name: Tensor(0.5)
+            for name in (
+                "charge",
+                "article",
+                "sentence",
+                "invariant",
+                "boundary",
+                "response",
+                "factor",
+                "total",
+            )
+        }
+    )
+    modules = {
+        "torch": SimpleNamespace(
+            nn=SimpleNamespace(Module=object),
+            optim=SimpleNamespace(AdamW=Optimizer),
+            no_grad=nullcontext,
+            sigmoid=lambda value: value,
+        ),
+        "torch.utils.data": SimpleNamespace(DataLoader=Loader),
+        "torch.utils.tensorboard": SimpleNamespace(SummaryWriter=Writer),
+        "transformers": SimpleNamespace(
+            AutoTokenizer=SimpleNamespace(
+                from_pretrained=lambda *args, **kwargs: SimpleNamespace(pad_token_id=0)
+            )
+        ),
+        "legal_landscape.models.losses": SimpleNamespace(compute_typed_losses=lambda **kw: losses),
+        "legal_landscape.models.predictor": SimpleNamespace(LegalLandscapePredictor=Predictor),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    def run(*, is_main=True, restored_step=0, max_steps=2, fail_gather=False):
+        class Accelerator:
+            def __init__(self, **kwargs):
+                self.is_main_process = is_main
+                self.num_processes = 2
+                self.sync_gradients = False
+                self.microbatches = 0
+
+            def prepare(self, *args):
+                return args if len(args) > 1 else args[0]
+
+            @contextmanager
+            def accumulate(self, predictor):
+                self.microbatches += 1
+                self.sync_gradients = self.microbatches % 2 == 0
+                yield
+
+            def backward(self, loss):
+                pass
+
+            def wait_for_everyone(self):
+                pass
+
+            def save_state(self, path):
+                from pathlib import Path
+
+                Path(path).mkdir(parents=True, exist_ok=True)
+                events.append("checkpoint")
+
+            def load_state(self, path):
+                events.append("restore")
+
+            def gather_for_metrics(self, values):
+                events.append("gather")
+                if fail_gather:
+                    raise RuntimeError("gather failed")
+                values[-1].absorbed = True
+                return values
+
+        monkeypatch.setitem(sys.modules, "accelerate", SimpleNamespace(Accelerator=Accelerator))
+        reporter = RecordingProgress(events)
+        enabled_values = []
+
+        def factory(*, enabled):
+            enabled_values.append(enabled)
+            return reporter if enabled else NullProgressReporter()
+
+        resume = None
+        if restored_step:
+            resume = tmp_path / "resume"
+            resume.mkdir(exist_ok=True)
+            (resume / "training_progress.json").write_text(
+                json.dumps(
+                    {
+                        "steps": restored_step,
+                        "completed_microbatches": 0,
+                        "seed": 42,
+                        "input_identity": {
+                            "train": train._file_identity(train_path),
+                            "counterfactual": train._file_identity(pairs_path),
+                        },
+                        "case_sampler": {"epoch": 0, "start_index": 0, "seed": 42},
+                        "pair_sampler": None,
+                    }
+                )
+            )
+        result = train.run_real_training(
+            {
+                "model": {"path": "fake"},
+                "training": {
+                    "max_steps": max_steps,
+                    "epochs": 1,
+                    "gradient_accumulation_steps": 2,
+                    "checkpoint_every": 1,
+                },
+            },
+            train_data=train_path,
+            output_dir=tmp_path / "output",
+            experiment_name="B3",
+            counterfactual_data=pairs_path,
+            evaluation_data=evaluation_path,
+            resume_from_checkpoint=resume,
+            progress_factory=factory,
+        )
+        return result, reporter, enabled_values
+
+    return run, events, tmp_path
+
+
+def test_training_progress_factory_tracks_real_loop_optimizer_steps(training_progress_runtime):
+    run, events, root = training_progress_runtime
+    result, reporter, enabled = run()
+    assert enabled == [True]
+    training_updates = [
+        event[2] for event in events if isinstance(event, tuple) and event[1] == "Train B3"
+    ]
+    assert [item["completed"] for item in training_updates] == [1, 2]
+    assert [item["loss"] for item in training_updates] == [0.5, 0.5]
+    assert result["steps"] == 2
+    assert reporter.closed
+    logs = [json.loads(line) for line in (root / "output/train.jsonl").read_text().splitlines()]
+    assert [item["step"] for item in logs] == [1, 2]
+    assert events.index(("tensorboard", 1)) < events.index("checkpoint")
+
+
+def test_training_progress_worker_uses_null_reporter(training_progress_runtime):
+    run, events, root = training_progress_runtime
+    result, reporter, enabled = run(is_main=False)
+    assert enabled == [False]
+    assert reporter.tasks == []
+    assert "reporter:enter" not in events
+    assert not (root / "output/train.jsonl").exists()
+    assert result["steps"] == 2
+
+
+@pytest.mark.parametrize(("restored", "expected"), [(1, 2), (5, 5)])
+def test_training_progress_resume_clamps_display_only(
+    training_progress_runtime, restored, expected
+):
+    run, events, _root = training_progress_runtime
+    result, reporter, _enabled = run(restored_step=restored)
+    assert result["steps"] == expected
+    initial = reporter.tasks[0]
+    assert initial["total"] == 2
+    assert initial["completed"] == 2
+    assert reporter.started_tasks[0]["completed"] == min(restored, 2)
+    if restored > 2:
+        assert "optimizer" not in events
+    assert reporter.closed
+
+
+@pytest.mark.parametrize(("loader", "expected"), [([], 0), ([1, 2, 3], 3)])
+def test_prediction_progress_total_counts_loader_batches(loader, expected):
+    from legal_landscape.training.train import _prediction_progress_total
+
+    assert _prediction_progress_total(loader) == expected
+
+
+def test_prediction_progress_batches_have_independent_kind_and_counts():
+    from legal_landscape.training.train import _prediction_progress_total, _report_prediction_batch
+
+    events = []
+    reporter = RecordingProgress(events)
+    for kind, loader in [("static", [1, 2, 3]), ("counterfactual", [1, 2])]:
+        with reporter.task(
+            kind, total=_prediction_progress_total(loader), kind=kind, batches=0
+        ) as task:
+            for batches, _batch in enumerate(loader, start=1):
+                _report_prediction_batch(task, kind, batches)
+    updates = [event[2] for event in events if isinstance(event, tuple)]
+    assert [(item["kind"], item["batches"], item["completed"]) for item in updates] == [
+        ("static", 1, 1),
+        ("static", 2, 2),
+        ("static", 3, 3),
+        ("counterfactual", 1, 1),
+        ("counterfactual", 2, 2),
+    ]
+
+
+def test_prediction_progress_advances_after_gather_and_absorption(training_progress_runtime):
+    run, events, root = training_progress_runtime
+    result, reporter, _enabled = run()
+    predictions = [task for task in reporter.tasks if "kind" in task]
+    assert [
+        (task["kind"], task["total"], task["completed"], task["batches"]) for task in predictions
+    ] == [("static", 2, 2, 2), ("counterfactual", 2, 2, 2)]
+    transitions = [
+        "advance" if isinstance(event, tuple) else event
+        for event in events
+        if event in ("gather", "absorb") or (isinstance(event, tuple) and event[0] == "advance")
+    ]
+    assert transitions == ["gather", "absorb", "advance"] * 4
+    static_rows = [
+        json.loads(row)
+        for row in (root / "output/predictions/static.jsonl").read_text().splitlines()
+    ]
+    pair_rows = [
+        json.loads(row)
+        for row in (root / "output/predictions/counterfactual.jsonl").read_text().splitlines()
+    ]
+    assert [row["case_id"] for row in static_rows] == ["c0", "c1"]
+    assert [row["case_id"] for row in pair_rows] == ["c0", "c1"]
+    assert "static_predictions" in result and "counterfactual_predictions" in result
+    assert events.index("task:exit:Predict static") < events.index(
+        "task:enter:Predict counterfactual"
+    )
+    assert events[-1] == "reporter:exit"
+
+
+def test_prediction_progress_failed_gather_does_not_advance_and_closes(training_progress_runtime):
+    run, events, _root = training_progress_runtime
+    with pytest.raises(RuntimeError, match="gather failed"):
+        run(fail_gather=True)
+    assert not any(isinstance(event, tuple) and event[0] == "advance" for event in events)
+    assert "task:exit:Predict static" in events
+    assert events[-1] == "reporter:exit"
 
 
 class TrainingPlanTests(unittest.TestCase):

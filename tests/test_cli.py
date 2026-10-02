@@ -142,6 +142,35 @@ def test_heavy_clis_default_to_dry_run() -> None:
         assert json.loads(result.stdout)["dry_run"] is True
 
 
+def test_training_progress_closes_before_cli_prints_final_json(monkeypatch, capsys):
+    module = runpy.run_path(str(ROOT / "scripts" / "train_model.py"))
+    main = module["main"]
+    events = []
+
+    def run_training(config, *, progress_factory, **kwargs):
+        with progress_factory() as reporter:
+            with reporter.task("Train CLI", total=1) as task:
+                task.advance()
+        events.append("progress:closed")
+        return {"steps": 1}
+
+    def final_print(value):
+        assert events == ["progress:closed"]
+        assert json.loads(value) == {"steps": 1}
+        events.append("json:printed")
+        print(value)
+
+    monkeypatch.setitem(main.__globals__, "run_real_training", run_training)
+    monkeypatch.setitem(main.__globals__, "print", final_print)
+    monkeypatch.setenv("PROGRESS", "never")
+    monkeypatch.setattr(sys, "argv", ["train_model.py", "--execute", "--train-data", "fixture"])
+    assert main() == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"steps": 1}
+    assert "Train CLI: 1/1 completed" in captured.err
+    assert events == ["progress:closed", "json:printed"]
+
+
 def test_generate_counterfactuals_progress_stays_in_stderr(tmp_path) -> None:
     source = LegalFactors(amount=1000.0, restitution=False, conduct="秘密窃取")
     target = LegalFactors(amount=1000.0, restitution=True, conduct="秘密窃取")

@@ -7,6 +7,7 @@ import argparse
 import json
 
 from legal_landscape.config import load_config, parse_overrides
+from legal_landscape.progress import create_progress_reporter
 from legal_landscape.training.train import run_dummy_train_step, run_real_training, training_plan
 
 
@@ -65,6 +66,7 @@ def main() -> int:
         experiment_name=args.experiment,
         limit=args.limit,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        progress_factory=create_progress_reporter,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
