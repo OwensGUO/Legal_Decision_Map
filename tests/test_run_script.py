@@ -18,6 +18,41 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_SCRIPT = ROOT / "run.sh"
 
 
+def _run_dry_run(**overrides: str) -> subprocess.CompletedProcess[str]:
+    environment = dict(os.environ)
+    environment.pop("SMOKE_MAX_LENGTH", None)
+    environment.update(overrides)
+    return subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _training_lengths(
+    result: subprocess.CompletedProcess[str], *, experiment: str | None = None
+) -> dict[str, str]:
+    assert result.returncode == 0, result.stderr
+    lengths: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line.startswith("$ ") or "scripts/train_model.py" not in line:
+            continue
+        arguments = shlex.split(line[2:])
+        current_experiment = arguments[arguments.index("--experiment") + 1]
+        if experiment is not None and current_experiment != experiment:
+            continue
+        train_data = Path(arguments[arguments.index("--train-data") + 1])
+        dataset = train_data.parent.name.removesuffix("_small")
+        setting = next(
+            argument for argument in arguments if argument.startswith("model.max_length=")
+        )
+        lengths[dataset] = setting.split("=", 1)[1]
+    return lengths
+
+
 def test_readme_documents_progress_controls() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for value in ("PROGRESS=auto", "PROGRESS=always", "PROGRESS=never", "NO_COLOR"):
@@ -31,6 +66,14 @@ def test_readme_documents_progress_controls() -> None:
         "应读取 `OUTPUT_ROOT` 下具体的 JSON/JSONL 文件",
     ):
         assert statement in readme
+
+
+def test_readme_documents_smoke_training_length() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "`MODE=smoke` 默认将 CAIL 和 CMDL 的训练最大长度限制为 1024" in readme
+    assert "SMOKE_MAX_LENGTH=768 MODE=smoke bash run.sh" in readme
+    assert "`MODE=main` 和 `MODE=matrix` 仍使用正式长度：CAIL 4096、CMDL 8192" in readme
 
 
 @pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
@@ -123,6 +166,34 @@ def test_run_script_has_valid_shell_syntax_and_help() -> None:
     )
     assert help_result.returncode == 0, help_result.stderr
     assert "MODE=main|smoke|matrix" in help_result.stdout
+    assert "SMOKE_MAX_LENGTH=1024" in help_result.stdout
+
+
+def test_smoke_uses_memory_safe_training_length_by_default() -> None:
+    result = _run_dry_run(MODE="smoke")
+
+    assert _training_lengths(result) == {"cail": "1024", "cmdl": "1024"}
+
+
+def test_smoke_training_length_can_be_overridden() -> None:
+    result = _run_dry_run(MODE="smoke", SMOKE_MAX_LENGTH="768")
+
+    assert _training_lengths(result) == {"cail": "768", "cmdl": "768"}
+
+
+def test_main_keeps_production_training_lengths() -> None:
+    result = _run_dry_run(MODE="main")
+
+    assert _training_lengths(result, experiment="M") == {"cail": "4096", "cmdl": "8192"}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_smoke_rejects_invalid_max_length(value: str) -> None:
+    result = _run_dry_run(MODE="smoke", SMOKE_MAX_LENGTH=value)
+
+    assert result.returncode == 2
+    assert f"SMOKE_MAX_LENGTH must be a positive integer, got {value}." in result.stderr
+    assert "[phase" not in result.stdout
 
 
 def test_dry_run_numbers_all_phases_without_terminal_control() -> None:

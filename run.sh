@@ -38,6 +38,7 @@ Common overrides:
   P2P_POLICY=auto|enable|disable  Auto enables P2P only after a positive GPU probe
   PROGRESS=auto|always|never      Terminal progress display (default auto)
   DATA_LIMIT=N CF_LIMIT=N EVAL_LIMIT=N MAX_STEPS=N
+  SMOKE_MAX_LENGTH=1024          Smoke training token limit
   BOOTSTRAP_ITERATIONS=2000       Group-clustered bootstrap resamples
   CHECKPOINT_EVERY=100             Save resumable training state every N updates
   INSTALL_FLA=1                  Install and probe optional FLA/Triton kernels
@@ -146,6 +147,7 @@ case "$MODE" in
     CF_LIMIT="${CF_LIMIT:-12}"
     EVAL_LIMIT="${EVAL_LIMIT:-16}"
     MAX_STEPS="${MAX_STEPS:-1}"
+    SMOKE_MAX_LENGTH="${SMOKE_MAX_LENGTH:-1024}"
     BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-50}"
     EXPERIMENTS="${EXPERIMENTS:-M}"
     SEEDS="${SEEDS:-42}"
@@ -173,6 +175,11 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+if [[ "$MODE" == "smoke" ]] && [[ ! "$SMOKE_MAX_LENGTH" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'SMOKE_MAX_LENGTH must be a positive integer, got %s.\n' "$SMOKE_MAX_LENGTH" >&2
+  exit 2
+fi
 
 IFS=',' read -r -a gpu_list <<< "$GPU_IDS"
 IFS=' ' read -r -a experiment_list <<< "$EXPERIMENTS"
@@ -706,9 +713,16 @@ max_length_for_experiment() {
   local dataset=$2
   case "$experiment" in
     B1) printf '512' ;;
-    B2) printf '4096' ;;
     *)
-      if [[ "$dataset" == "cmdl" ]]; then printf '8192'; else printf '4096'; fi
+      if [[ "$MODE" == "smoke" ]]; then
+        printf '%s' "$SMOKE_MAX_LENGTH"
+      elif [[ "$experiment" == "B2" ]]; then
+        printf '4096'
+      elif [[ "$dataset" == "cmdl" ]]; then
+        printf '8192'
+      else
+        printf '4096'
+      fi
       ;;
   esac
 }

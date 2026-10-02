@@ -77,6 +77,16 @@ bash run.sh --dry-run
 MODE=smoke bash run.sh
 ```
 
+`MODE=smoke` 默认将 CAIL 和 CMDL 的训练最大长度限制为 1024，以降低 Qwen3.5-9B
+在普通案件、父案件和反事实案件三路前向计算时的峰值显存。显存更小的机器可进一步覆盖：
+
+```bash
+SMOKE_MAX_LENGTH=768 MODE=smoke bash run.sh
+```
+
+`MODE=main` 和 `MODE=matrix` 仍使用正式长度：CAIL 4096、CMDL 8192；
+`SMOKE_MAX_LENGTH` 不会改变正式实验配置。
+
 运行进度默认采用 `PROGRESS=auto`：`stderr` 连接 TTY 时使用动态进度，显示任务计数、
 耗时、吞吐率和有观测后计算的剩余时间；将 `stderr` 重定向到日志时改为定期输出完整文本行
 （约每 30 秒一次），同样包含吞吐率与预计剩余时间，
