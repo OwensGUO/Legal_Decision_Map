@@ -103,6 +103,8 @@ PHASE_STARTED_AT=0
 PIPELINE_STARTED_SECONDS=$SECONDS
 WAIT_ACTIVE=0
 WAIT_DYNAMIC_VISIBLE=0
+WAIT_TERMINAL_MODE=0
+WAIT_COMPACT=0
 PROGRESS_DYNAMIC=0
 if [[ "$DRY_RUN" != "1" ]] && { [[ "$PROGRESS" == "always" ]] || { [[ "$PROGRESS" == "auto" ]] && [[ -t 2 ]]; }; }; then
   PROGRESS_DYNAMIC=1
@@ -251,6 +253,10 @@ vllm_wait_width() {
 plain_vllm_wait() {
   local elapsed=$1
   local label="Waiting for vLLM (${elapsed}s/${INFER_TIMEOUT}s)"
+  if [[ "$WAIT_COMPACT" == "0" ]]; then
+    printf '%s\n' "$label" >&2
+    return
+  fi
   if (( ${#label} >= WAIT_WIDTH )); then
     label="vLLM ${elapsed}s/${INFER_TIMEOUT}s"
   fi
@@ -284,6 +290,7 @@ render_vllm_wait() {
       WAIT_DYNAMIC_VISIBLE=0
     fi
     PROGRESS_DYNAMIC=0
+    WAIT_COMPACT=1
     plain_vllm_wait "$elapsed"
     WAIT_LAST_PLAIN_AT=$SECONDS
     return
@@ -299,7 +306,8 @@ start_vllm_wait() {
   WAIT_LAST_PLAIN_AT=$SECONDS
   WAIT_FRAME_INDEX=0
   WAIT_DYNAMIC_VISIBLE=0
-  vllm_wait_width
+  WAIT_TERMINAL_MODE=$PROGRESS_DYNAMIC
+  WAIT_COMPACT=0
   if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
     render_vllm_wait
   else
@@ -311,7 +319,9 @@ update_vllm_wait() {
   if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
     render_vllm_wait
   elif (( SECONDS - WAIT_LAST_PLAIN_AT >= 30 )); then
-    vllm_wait_width
+    if [[ "$WAIT_COMPACT" == "1" ]]; then
+      vllm_wait_width
+    fi
     plain_vllm_wait "$((SECONDS - WAIT_STARTED_AT))"
     WAIT_LAST_PLAIN_AT=$SECONDS
   fi
@@ -323,20 +333,22 @@ finish_vllm_wait() {
     printf '\r\033[2K' >&2
     WAIT_DYNAMIC_VISIBLE=0
   fi
-  vllm_wait_width
   local label="vLLM wait $1 after $((SECONDS - WAIT_STARTED_AT))s"
-  if (( ${#label} >= WAIT_WIDTH )); then
-    label="vLLM $1 $((SECONDS - WAIT_STARTED_AT))s"
-  fi
-  if (( ${#label} >= WAIT_WIDTH )); then
-    if [[ "$1" == "ready" ]]; then
-      label="vLLM ok"
-    else
-      label="vLLM !"
+  if [[ "$WAIT_TERMINAL_MODE" == "1" ]]; then
+    vllm_wait_width
+    if (( ${#label} >= WAIT_WIDTH )); then
+      label="vLLM $1 $((SECONDS - WAIT_STARTED_AT))s"
     fi
-  fi
-  if (( ${#label} >= WAIT_WIDTH )); then
-    label="${label:0:$((WAIT_WIDTH - 1))}"
+    if (( ${#label} >= WAIT_WIDTH )); then
+      if [[ "$1" == "ready" ]]; then
+        label="vLLM ok"
+      else
+        label="vLLM !"
+      fi
+    fi
+    if (( ${#label} >= WAIT_WIDTH )); then
+      label="${label:0:$((WAIT_WIDTH - 1))}"
+    fi
   fi
   printf '%s\n' "$label" >&2
   WAIT_ACTIVE=0

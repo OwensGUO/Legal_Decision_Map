@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -602,7 +605,9 @@ def test_real_server_p2p_flags_follow_policy_and_boolean_probe(
     assert summary["p2p_policy"] == policy
 
 
-def _run_fake_vllm_wait(tmp_path, *, health_mode, progress, columns=None, no_color=False):
+def _run_fake_vllm_wait(
+    tmp_path, *, health_mode, progress, columns=None, no_color=False, stderr_tty=False
+):
     binary_dir = tmp_path / "conda/bin"
     binary_dir.mkdir(parents=True)
     launch_marker = tmp_path / "vllm-launched"
@@ -673,11 +678,43 @@ def _run_fake_vllm_wait(tmp_path, *, health_mode, progress, columns=None, no_col
         environment["COLUMNS"] = str(columns)
     if no_color:
         environment["NO_COLOR"] = "1"
-    result = subprocess.run(
-        ["bash", str(RUN_SCRIPT)], cwd=ROOT, env=environment,
-        capture_output=True, check=False, timeout=15,
-    )
-    return result.stderr.decode("utf-8"), result.returncode
+    if stderr_tty:
+        master_fd, slave_fd = os.openpty()
+        try:
+            process = subprocess.Popen(
+                ["bash", str(RUN_SCRIPT)], cwd=ROOT, env=environment,
+                stdout=subprocess.DEVNULL, stderr=slave_fd,
+            )
+            os.close(slave_fd)
+            chunks = []
+            deadline = time.monotonic() + 15
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([master_fd], [], [], remaining)[0]:
+                    process.kill()
+                    process.wait()
+                    raise subprocess.TimeoutExpired(process.args, 15)
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            stderr = b"".join(chunks)
+            returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+        finally:
+            os.close(master_fd)
+    else:
+        result = subprocess.run(
+            ["bash", str(RUN_SCRIPT)], cwd=ROOT, env=environment,
+            capture_output=True, check=False, timeout=15,
+        )
+        stderr = result.stderr
+        returncode = result.returncode
+    return stderr.decode("utf-8"), returncode
 
 
 @pytest.mark.parametrize(
@@ -726,6 +763,29 @@ def test_auto_with_redirected_stderr_stays_plain(tmp_path) -> None:
     )
     assert returncode == 1
     assert "Waiting for vLLM (0s/30s)\n" in stderr
+    assert "\x1b[" not in stderr
+
+
+def test_auto_with_tty_stderr_uses_dynamic_wait(tmp_path) -> None:
+    stderr, returncode = _run_fake_vllm_wait(
+        tmp_path, health_mode="ready", progress="auto", stderr_tty=True
+    )
+    assert returncode == 1
+    assert "Waiting for vLLM" in stderr
+    assert "\r\x1b[2K" in stderr
+
+
+@pytest.mark.parametrize("progress", ["never", "auto"])
+@pytest.mark.parametrize("columns", [4, 8])
+def test_plain_wait_keeps_full_records_despite_narrow_columns(
+    tmp_path, columns, progress
+) -> None:
+    stderr, returncode = _run_fake_vllm_wait(
+        tmp_path, health_mode="ready", progress=progress, columns=columns
+    )
+    assert returncode == 1
+    assert "Waiting for vLLM (0s/30s)\n" in stderr
+    assert re.search(r"vLLM wait ready after \d+s\n", stderr)
     assert "\x1b[" not in stderr
 
 
