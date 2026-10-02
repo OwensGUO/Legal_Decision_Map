@@ -14,6 +14,152 @@ from legal_landscape.progress import (
 )
 
 
+class FailingProgressStream(io.StringIO):
+    def __init__(self, *, operation, fail_on, error=BrokenPipeError):
+        super().__init__()
+        self.operation = operation
+        self.fail_on = fail_on
+        self.error = error
+        self.write_calls = 0
+        self.flush_calls = 0
+
+    def write(self, value):
+        self.write_calls += 1
+        if self.operation == "write" and self.write_calls == self.fail_on:
+            raise self.error("progress stream unavailable")
+        return super().write(value)
+
+    def flush(self):
+        self.flush_calls += 1
+        if self.operation == "flush" and self.flush_calls == self.fail_on:
+            raise self.error("progress stream unavailable")
+        return super().flush()
+
+
+def test_progress_terminal_detection_stream_failure_preserves_business():
+    class UndetectableStream(io.StringIO):
+        def isatty(self):
+            raise OSError("terminal disappeared")
+
+    business = []
+    with create_progress_reporter(
+        stream=UndetectableStream(), environ={"PROGRESS": "auto"}
+    ) as reporter:
+        with reporter.task("Train", total=1) as task:
+            business.append("optimizer")
+            task.advance()
+    assert business == ["optimizer"]
+
+
+@pytest.mark.parametrize("operation", ["write", "flush"])
+@pytest.mark.parametrize("fail_on", [1, 2, 3], ids=["start", "intermediate", "terminal"])
+@pytest.mark.parametrize("error", [BrokenPipeError, OSError, ValueError])
+def test_plain_stream_failure_preserves_business_and_stops_retrying(operation, fail_on, error):
+    stream = FailingProgressStream(operation=operation, fail_on=fail_on, error=error)
+    business = []
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, plain_interval=0
+    ) as reporter:
+        with reporter.task("Train", total=1) as task:
+            business.append("optimizer")
+            task.advance()
+        with reporter.task("Save checkpoint", total=1) as task:
+            business.append("checkpoint")
+            task.advance()
+        business.append("writer:close")
+    assert business == ["optimizer", "checkpoint", "writer:close"]
+    assert getattr(stream, f"{operation}_calls") == fail_on
+
+
+@pytest.mark.parametrize("operation", ["write", "flush"])
+def test_plain_stream_failure_on_task_exit_preserves_original_business_exception(operation):
+    stream = FailingProgressStream(operation=operation, fail_on=2)
+    original = RuntimeError("original training failure")
+    with pytest.raises(RuntimeError) as caught:
+        with create_progress_reporter(stream=stream, environ={"PROGRESS": "never"}) as reporter:
+            with reporter.task("Train", total=1):
+                raise original
+    assert caught.value is original
+
+
+@pytest.mark.parametrize("operation", ["write", "flush"])
+@pytest.mark.parametrize("fail_on", [1, 2], ids=["fallback-notice", "snapshot"])
+def test_rich_stream_failure_during_fallback_does_not_repeat_business(
+    monkeypatch, operation, fail_on
+):
+    class BrokenRenderer:
+        def start(self):
+            pass
+
+        def add_task(self, *args, **kwargs):
+            return 1
+
+        def update(self, *args, **kwargs):
+            raise RuntimeError("render failed")
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        "legal_landscape.progress._new_rich_progress", lambda *args: BrokenRenderer()
+    )
+    stream = FailingProgressStream(operation=operation, fail_on=fail_on)
+    business = []
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "always"}, is_terminal=True, plain_interval=0
+    ) as reporter:
+        with reporter.task("Train", total=2) as task:
+            business.append("first")
+            task.advance()
+            business.append("second")
+            task.advance()
+        with reporter.task("Checkpoint", total=1) as task:
+            business.append("checkpoint")
+            task.advance()
+    assert business == ["first", "second", "checkpoint"]
+    assert getattr(stream, f"{operation}_calls") == fail_on
+
+
+@pytest.mark.parametrize("failure_point", ["initialization", "start", "stop"])
+def test_rich_stream_failure_on_lifecycle_fallback_preserves_business_exception(
+    monkeypatch, failure_point
+):
+    class BrokenRenderer:
+        def start(self):
+            if failure_point == "start":
+                raise RuntimeError("start failed")
+
+        def add_task(self, *args, **kwargs):
+            return 1
+
+        def update(self, *args, **kwargs):
+            pass
+
+        def stop(self):
+            if failure_point == "stop":
+                raise RuntimeError("stop failed")
+
+    def new_renderer(*args):
+        if failure_point == "initialization":
+            raise RuntimeError("initialization failed")
+        return BrokenRenderer()
+
+    monkeypatch.setattr("legal_landscape.progress._new_rich_progress", new_renderer)
+    stream = FailingProgressStream(operation="write", fail_on=1)
+    business = []
+    original = RuntimeError("original business failure")
+    with pytest.raises(RuntimeError) as caught:
+        with create_progress_reporter(
+            stream=stream, environ={"PROGRESS": "always"}, is_terminal=True
+        ) as reporter:
+            with reporter.task("Train", total=1):
+                business.append("entered")
+                raise original
+    assert business == ["entered"]
+    assert caught.value is original
+    assert stream.write_calls == 1
+
+
 @pytest.mark.parametrize(
     ("mode", "is_terminal", "expected"),
     [

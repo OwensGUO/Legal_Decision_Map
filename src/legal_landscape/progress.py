@@ -146,8 +146,7 @@ class _PlainTask(AbstractContextManager["_PlainTask"]):
         line = f"{_single_line(self.description)}: {count} {status} elapsed={elapsed:.1f}s"
         if details:
             line += f" {details}"
-        self.reporter.stream.write(line + "\n")
-        self.reporter.stream.flush()
+        self.reporter._write(line + "\n")
 
     def _intermediate(self) -> None:
         now = self.reporter.clock()
@@ -195,6 +194,17 @@ class PlainProgressReporter(AbstractContextManager["PlainProgressReporter"]):
         self.stream = stream
         self.clock = clock
         self.interval = interval
+        self._stream_failed = False
+
+    def _write(self, message: str) -> None:
+        if self._stream_failed:
+            return
+        try:
+            self.stream.write(message)
+            self.stream.flush()
+        except Exception:
+            # Progress is presentation only; stop touching a broken output stream.
+            self._stream_failed = True
 
     def __enter__(self) -> Self:
         return self
@@ -406,8 +416,7 @@ class RichProgressReporter(AbstractContextManager["RichProgressReporter"]):
         self.plain = PlainProgressReporter(
             self.stream, clock=self.clock, interval=self.plain_interval
         )
-        self.stream.write("Progress renderer fallback to plain logs\n")
-        self.stream.flush()
+        self.plain._write("Progress renderer fallback to plain logs\n")
         for task in self.active:
             task._activate_plain()
         for task in self.finished:
@@ -463,16 +472,21 @@ def create_progress_reporter(
         return NullProgressReporter()
     target = sys.stderr if stream is None else stream
     environment = os.environ if environ is None else environ
+    if is_terminal is None:
+        try:
+            is_terminal = target.isatty()
+        except Exception:
+            is_terminal = False
     dynamic = resolve_dynamic_progress(
         environment.get("PROGRESS", "auto"),
-        is_terminal=target.isatty() if is_terminal is None else is_terminal,
+        is_terminal=is_terminal,
     )
     if not dynamic:
         return PlainProgressReporter(target, clock=clock, interval=plain_interval)
     try:
         progress = _new_rich_progress(target, environment, clock)
     except Exception:
-        target.write("Progress renderer fallback to plain logs\n")
-        target.flush()
-        return PlainProgressReporter(target, clock=clock, interval=plain_interval)
+        plain = PlainProgressReporter(target, clock=clock, interval=plain_interval)
+        plain._write("Progress renderer fallback to plain logs\n")
+        return plain
     return RichProgressReporter(progress, target, clock=clock, plain_interval=plain_interval)
