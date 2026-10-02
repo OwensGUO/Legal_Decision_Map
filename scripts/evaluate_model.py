@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from legal_landscape.evaluation.static_metrics import (
     sentence_class,
     sentence_metrics,
 )
+from legal_landscape.progress import create_progress_reporter
 
 DEFAULT_PRIMARY_ENDPOINTS = {
     "static": (
@@ -166,63 +168,72 @@ def main() -> int:
     available_bootstrap_names = tuple(
         name for name in bootstrap_names(args.kind) if name in metrics
     )
-    confidence_intervals = bootstrap_metric_set(
-        rows,
-        lambda sample: calculate_metrics(args.kind, sample),
-        available_bootstrap_names,
-        iterations=args.bootstrap_iterations,
-        seed=args.bootstrap_seed,
-    )
-    payload: dict[str, Any] = {
-        **metrics,
-        "confidence_intervals": confidence_intervals,
-        "bootstrap": {
-            "iterations": args.bootstrap_iterations,
-            "seed": args.bootstrap_seed,
-            "cluster_key": "group_id",
-        },
-    }
-    if args.reference_input is not None:
-        reference = read_rows(args.reference_input, args.limit)
-        endpoint_names = (
-            tuple(item.strip() for item in args.primary_endpoints.split(",") if item.strip())
-            if args.primary_endpoints
-            else tuple(
-                name for name in DEFAULT_PRIMARY_ENDPOINTS[args.kind] if name in metrics
-            )
+    print(f"Evaluating {args.kind} predictions", file=sys.stderr)
+    with create_progress_reporter() as progress:
+        confidence_intervals = bootstrap_metric_set(
+            rows,
+            lambda sample: calculate_metrics(args.kind, sample),
+            available_bootstrap_names,
+            iterations=args.bootstrap_iterations,
+            seed=args.bootstrap_seed,
+            progress=progress,
         )
-        if not endpoint_names or len(endpoint_names) > 5:
-            raise ValueError("primary endpoints must contain between one and five metrics")
-        unknown = [name for name in endpoint_names if name not in metrics]
-        if unknown:
-            raise ValueError(f"unknown primary endpoints: {', '.join(unknown)}")
-        comparisons: dict[str, dict[str, float | int]] = {}
-        raw_p_values: dict[str, float] = {}
-        for name in endpoint_names:
-            comparison = paired_cluster_test(
-                rows,
-                reference,
-                lambda sample, metric_name=name: float(
-                    calculate_metrics(args.kind, sample)[metric_name]
-                ),
-                iterations=args.bootstrap_iterations,
-                seed=args.bootstrap_seed,
+        payload: dict[str, Any] = {
+            **metrics,
+            "confidence_intervals": confidence_intervals,
+            "bootstrap": {
+                "iterations": args.bootstrap_iterations,
+                "seed": args.bootstrap_seed,
+                "cluster_key": "group_id",
+            },
+        }
+        if args.reference_input is not None:
+            reference = read_rows(args.reference_input, args.limit)
+            endpoint_names = (
+                tuple(item.strip() for item in args.primary_endpoints.split(",") if item.strip())
+                if args.primary_endpoints
+                else tuple(
+                    name for name in DEFAULT_PRIMARY_ENDPOINTS[args.kind] if name in metrics
+                )
             )
-            comparisons[name] = comparison
-            raw_p_values[name] = float(comparison["p_value"])
-        finite_p_values = {
-            name: value for name, value in raw_p_values.items() if math.isfinite(value)
-        }
-        adjusted = holm_adjust(finite_p_values)
-        adjusted.update(
-            {name: float("nan") for name, value in raw_p_values.items() if not math.isfinite(value)}
-        )
-        payload["comparison"] = {
-            "reference_input": str(args.reference_input),
-            "endpoints": comparisons,
-            "raw_p_values": raw_p_values,
-            "holm_adjusted_p_values": adjusted,
-        }
+            if not endpoint_names or len(endpoint_names) > 5:
+                raise ValueError("primary endpoints must contain between one and five metrics")
+            unknown = [name for name in endpoint_names if name not in metrics]
+            if unknown:
+                raise ValueError(f"unknown primary endpoints: {', '.join(unknown)}")
+            comparisons: dict[str, dict[str, float | int]] = {}
+            raw_p_values: dict[str, float] = {}
+            for name in endpoint_names:
+                comparison = paired_cluster_test(
+                    rows,
+                    reference,
+                    lambda sample, metric_name=name: float(
+                        calculate_metrics(args.kind, sample)[metric_name]
+                    ),
+                    iterations=args.bootstrap_iterations,
+                    seed=args.bootstrap_seed,
+                    progress=progress,
+                    description=f"Paired bootstrap · {name}",
+                )
+                comparisons[name] = comparison
+                raw_p_values[name] = float(comparison["p_value"])
+            finite_p_values = {
+                name: value for name, value in raw_p_values.items() if math.isfinite(value)
+            }
+            adjusted = holm_adjust(finite_p_values)
+            adjusted.update(
+                {
+                    name: float("nan")
+                    for name, value in raw_p_values.items()
+                    if not math.isfinite(value)
+                }
+            )
+            payload["comparison"] = {
+                "reference_input": str(args.reference_input),
+                "endpoints": comparisons,
+                "raw_p_values": raw_p_values,
+                "holm_adjusted_p_values": adjusted,
+            }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=2))

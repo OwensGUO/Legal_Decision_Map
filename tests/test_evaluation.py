@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from io import StringIO
+
 import numpy as np
 import pytest
 
@@ -18,6 +20,7 @@ from legal_landscape.evaluation.static_metrics import (
     sentence_class,
     sentence_metrics,
 )
+from legal_landscape.progress import PlainProgressReporter
 
 
 def test_charge_metrics_have_hand_checked_values() -> None:
@@ -178,6 +181,72 @@ def test_paired_cluster_test_requires_matching_groups_and_reports_difference() -
 
     with pytest.raises(ValueError, match="identical group IDs"):
         paired_cluster_test(candidate, reference[:1], metric, iterations=10)
+
+
+@pytest.mark.parametrize("operation", ("cluster", "metric_set", "paired"))
+def test_bootstrap_progress_advances_once_per_resample(operation: str) -> None:
+    rows = [{"group_id": "g1", "value": 1.0}]
+    stream = StringIO()
+    reporter = PlainProgressReporter(stream, clock=lambda: 0.0, interval=0.0)
+    calls = 0
+
+    def metric(sample):
+        nonlocal calls
+        calls += 1
+        return float(sample[0]["value"])
+
+    if operation == "cluster":
+        cluster_bootstrap(rows, metric, iterations=40, progress=reporter)
+        assert calls == 41
+    elif operation == "metric_set":
+        bootstrap_metric_set(
+            rows, lambda sample: {"value": metric(sample)}, ("value",),
+            iterations=40, progress=reporter,
+        )
+        assert calls == 41
+    else:
+        paired_cluster_test(
+            rows, rows, metric, iterations=40, progress=reporter,
+            description="Paired bootstrap · value",
+        )
+        assert calls == 82
+
+    lines = stream.getvalue().splitlines()
+    assert len([line for line in lines if " progress " in line]) == 40
+    assert ": 0/40 started " in lines[0]
+    assert ": 40/40 completed " in lines[-1]
+
+
+@pytest.mark.parametrize("operation", ("cluster", "metric_set", "paired"))
+def test_bootstrap_progress_fails_and_preserves_metric_error(operation: str) -> None:
+    rows = [{"group_id": "g1", "value": 1.0}]
+    stream = StringIO()
+    reporter = PlainProgressReporter(stream, clock=lambda: 0.0, interval=0.0)
+    error = RuntimeError("metric failed")
+    calls = 0
+
+    def failing_metric(sample):
+        nonlocal calls
+        calls += 1
+        if calls < (2 if operation == "cluster" else 3):
+            if operation == "metric_set":
+                return {"value": 1.0}
+            return 1.0
+        raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        if operation == "cluster":
+            cluster_bootstrap(rows, failing_metric, iterations=40, progress=reporter)
+        elif operation == "metric_set":
+            bootstrap_metric_set(
+                rows, failing_metric, ("value",), iterations=40, progress=reporter,
+            )
+        else:
+            paired_cluster_test(
+                rows, rows, failing_metric, iterations=40, progress=reporter,
+            )
+    assert caught.value is error
+    assert ": 1/40 failed " in stream.getvalue()
 
 
 def test_sentence_metrics_can_match_single_charge_training_eligibility() -> None:

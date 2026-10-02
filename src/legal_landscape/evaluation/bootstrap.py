@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from legal_landscape.progress import NullProgressReporter, ProgressReporter
+
 
 def _group_rows(
     rows: list[dict[str, Any]], group_key: str
@@ -32,6 +34,7 @@ def cluster_bootstrap(
     iterations: int = 2000,
     seed: int = 42,
     group_key: str = "group_id",
+    progress: ProgressReporter | None = None,
 ) -> dict[str, float | int]:
     if iterations <= 0:
         raise ValueError("iterations must be positive")
@@ -41,10 +44,15 @@ def cluster_bootstrap(
     keys = tuple(groups)
     generator = np.random.default_rng(seed)
     estimates = np.empty(iterations, dtype=float)
-    for index in range(iterations):
-        selected = generator.choice(keys, size=len(keys), replace=True)
-        sample = [row for key in selected for row in groups[str(key)]]
-        estimates[index] = metric(sample)
+    reporter = progress or NullProgressReporter()
+    with reporter.task(
+        "Bootstrap confidence intervals", total=iterations, groups=len(groups)
+    ) as task:
+        for index in range(iterations):
+            selected = generator.choice(keys, size=len(keys), replace=True)
+            sample = [row for key in selected for row in groups[str(key)]]
+            estimates[index] = metric(sample)
+            task.advance()
     lower, upper = _interval(estimates)
     return {
         "estimate": float(metric(rows)),
@@ -63,6 +71,7 @@ def bootstrap_metric_set(
     iterations: int = 2000,
     seed: int = 42,
     group_key: str = "group_id",
+    progress: ProgressReporter | None = None,
 ) -> dict[str, dict[str, float | int]]:
     """Bootstrap several scalar metrics using the same sampled group clusters."""
     if iterations <= 0:
@@ -79,12 +88,17 @@ def bootstrap_metric_set(
     samples = {name: np.empty(iterations, dtype=float) for name in names}
     keys = tuple(groups)
     generator = np.random.default_rng(seed)
-    for index in range(iterations):
-        selected = generator.choice(keys, size=len(keys), replace=True)
-        sample = [row for key in selected for row in groups[str(key)]]
-        values = metric(sample)
-        for name in names:
-            samples[name][index] = float(values[name])
+    reporter = progress or NullProgressReporter()
+    with reporter.task(
+        "Bootstrap confidence intervals", total=iterations, groups=len(groups)
+    ) as task:
+        for index in range(iterations):
+            selected = generator.choice(keys, size=len(keys), replace=True)
+            sample = [row for key in selected for row in groups[str(key)]]
+            values = metric(sample)
+            for name in names:
+                samples[name][index] = float(values[name])
+            task.advance()
     result: dict[str, dict[str, float | int]] = {}
     for name in names:
         lower, upper = _interval(samples[name])
@@ -106,6 +120,8 @@ def paired_cluster_test(
     iterations: int = 2000,
     seed: int = 42,
     group_key: str = "group_id",
+    progress: ProgressReporter | None = None,
+    description: str = "Paired bootstrap",
 ) -> dict[str, float | int]:
     """Compare two systems with paired whole-group bootstrap resampling."""
     if iterations <= 0:
@@ -117,15 +133,18 @@ def paired_cluster_test(
     keys = tuple(sorted(candidate_groups))
     generator = np.random.default_rng(seed)
     differences = np.empty(iterations, dtype=float)
-    for index in range(iterations):
-        selected = generator.choice(keys, size=len(keys), replace=True)
-        candidate_sample = [
-            row for key in selected for row in candidate_groups[str(key)]
-        ]
-        reference_sample = [
-            row for key in selected for row in reference_groups[str(key)]
-        ]
-        differences[index] = float(metric(candidate_sample)) - float(metric(reference_sample))
+    reporter = progress or NullProgressReporter()
+    with reporter.task(description, total=iterations, groups=len(keys)) as task:
+        for index in range(iterations):
+            selected = generator.choice(keys, size=len(keys), replace=True)
+            candidate_sample = [
+                row for key in selected for row in candidate_groups[str(key)]
+            ]
+            reference_sample = [
+                row for key in selected for row in reference_groups[str(key)]
+            ]
+            differences[index] = float(metric(candidate_sample)) - float(metric(reference_sample))
+            task.advance()
     finite = differences[np.isfinite(differences)]
     if not finite.size:
         p_value = float("nan")

@@ -497,7 +497,7 @@ def test_environment_audit_reports_physical_cuda_visibility(monkeypatch) -> None
     assert payload["cuda_visible_devices"] == ["4", "5", "6", "7"]
 
 
-def test_evaluation_cli_writes_bootstrap_and_five_holm_results(tmp_path) -> None:
+def test_evaluation_cli_bootstrap_progress_and_five_holm_results(tmp_path) -> None:
     candidate = [
         {
             "group_id": "g1",
@@ -561,12 +561,16 @@ def test_evaluation_cli_writes_bootstrap_and_five_holm_results(tmp_path) -> None
             "20",
         ],
         cwd=ROOT,
-        env=_env(),
+        env={**_env(), "PROGRESS": "never"},
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == json.loads(output_path.read_text(encoding="utf-8"))
+    assert "Evaluating static predictions" in result.stderr
+    assert "Bootstrap confidence intervals: 20/20 completed" in result.stderr
+    assert "Paired bootstrap · charge_macro_f1: 20/20 completed" in result.stderr
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     required = {
         f"{task}_{metric}"
