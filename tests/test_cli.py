@@ -13,6 +13,7 @@ import yaml
 
 from legal_landscape.config import load_config, parse_overrides
 from legal_landscape.data.build import build_dataset
+from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 from legal_landscape.progress import create_progress_reporter
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +140,38 @@ def test_heavy_clis_default_to_dry_run() -> None:
         )
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["dry_run"] is True
+
+
+def test_generate_counterfactuals_progress_stays_in_stderr(tmp_path) -> None:
+    source = LegalFactors(amount=1000.0, restitution=False, conduct="秘密窃取")
+    target = LegalFactors(amount=1000.0, restitution=True, conduct="秘密窃取")
+    spec = InterventionSpec(
+        "case-1", "某甲", "sentence_rank", source, target, None, -1, ("restitution",), "r2"
+    )
+    input_path = tmp_path / "requests.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {"parent_text": "某甲秘密取得财物，涉案1000元。", "spec": spec.to_dict()},
+            ensure_ascii=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable, str(ROOT / "scripts/generate_counterfactuals.py"),
+            "--mock", "--execute", "--input", str(input_path),
+            "--output", str(tmp_path / "outputs" / "generated.jsonl"),
+        ],
+        cwd=ROOT,
+        env={**_env(), "PROGRESS": "never"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["generated"] == 1
+    assert "Generate counterfactuals: 1/1 completed" in result.stderr
+    assert "valid=1 invalid=0 failed=0 resumed=0 duplicate=0" in result.stderr
 
 
 def test_build_dataset_progress_writes_traceable_processed_records(tmp_path) -> None:

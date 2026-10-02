@@ -23,6 +23,7 @@ from legal_landscape.counterfactual.provenance import (
     generator_identity,
 )
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
+from legal_landscape.progress import create_progress_reporter
 
 
 def parser() -> argparse.ArgumentParser:
@@ -133,20 +134,22 @@ def main() -> int:
         max_source_chars=int(max_source_chars) if max_source_chars is not None else None,
     )
     try:
-        result = generate_records(
-            requests,
-            generator,
-            args.output,
-            generator_identity=identity,
-            provenance_manifest=manifest,
-            prompt_version=PROMPT_VERSION,
-            sampling=sampling,
-            seed=int(config.get("seed", 42)),
-            retries=int(config.get("retries", 2)),
-            resume=args.resume,
-            min_similarity=float(config.get("min_similarity", 0.5)),
-            concurrency=concurrency,
-        )
+        with create_progress_reporter() as progress:
+            result = generate_records(
+                requests,
+                generator,
+                args.output,
+                generator_identity=identity,
+                provenance_manifest=manifest,
+                prompt_version=PROMPT_VERSION,
+                sampling=sampling,
+                seed=int(config.get("seed", 42)),
+                retries=int(config.get("retries", 2)),
+                resume=args.resume,
+                min_similarity=float(config.get("min_similarity", 0.5)),
+                concurrency=concurrency,
+                progress=progress,
+            )
     finally:
         if isinstance(generator, VLLMHTTPGenerator):
             generator.close()

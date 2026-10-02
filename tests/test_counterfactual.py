@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 
 import pytest
 
@@ -14,6 +15,7 @@ from legal_landscape.counterfactual.generate import (
 from legal_landscape.counterfactual.provenance import generator_identity
 from legal_landscape.counterfactual.validators import validate_generation
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
+from legal_landscape.progress import create_progress_reporter
 
 
 def test_qwen38_config_uses_local_bf16_primary_model() -> None:
@@ -96,16 +98,25 @@ def test_validator_rejects_identity_label_sentence_leakage_and_unchanged_text() 
 def test_generate_records_persists_provenance_and_resumes(tmp_path) -> None:
     output = tmp_path / "generated.jsonl"
     request = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec())
-    records = generate_records(
-        [request],
-        MockGenerator(),
-        output,
-        generator_identity=generator_identity({"selector": "mock"}, mock=True),
-        prompt_version="v1",
-        sampling={"temperature": 0.0},
-        seed=42,
-        retries=1,
-    ).records
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
+    ) as progress:
+        records = generate_records(
+            [request],
+            MockGenerator(),
+            output,
+            generator_identity=generator_identity({"selector": "mock"}, mock=True),
+            prompt_version="v1",
+            sampling={"temperature": 0.0},
+            seed=42,
+            retries=1,
+            progress=progress,
+        ).records
+    assert stream.getvalue().splitlines()[-1].endswith(
+        "valid=1 invalid=0 failed=0 resumed=0 duplicate=0"
+    )
+    assert "Generate counterfactuals: 1/1 completed" in stream.getvalue().splitlines()[-1]
     assert len(records) == 1
     record = records[0]
     assert record["parent_case_id"] == "c1"
@@ -116,20 +127,29 @@ def test_generate_records_persists_provenance_and_resumes(tmp_path) -> None:
     assert record["validation"]["valid"] is True
     assert len(output.read_text(encoding="utf-8").splitlines()) == 1
 
-    repeated = generate_records(
-        [request],
-        MockGenerator(),
-        output,
-        generator_identity=generator_identity({"selector": "mock"}, mock=True),
-        prompt_version="v1",
-        sampling={},
-        seed=42,
-        retries=1,
-        resume=True,
-    )
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
+    ) as progress:
+        repeated = generate_records(
+            [request],
+            MockGenerator(),
+            output,
+            generator_identity=generator_identity({"selector": "mock"}, mock=True),
+            prompt_version="v1",
+            sampling={},
+            seed=42,
+            retries=1,
+            resume=True,
+            progress=progress,
+        )
     assert repeated.records == []
     assert repeated.skipped_completed == 1
     assert len(output.read_text(encoding="utf-8").splitlines()) == 1
+    assert "Generate counterfactuals: 1/1 completed" in stream.getvalue().splitlines()[-1]
+    assert stream.getvalue().splitlines()[-1].endswith(
+        "valid=0 invalid=0 failed=0 resumed=1 duplicate=0"
+    )
 
 
 def test_generate_records_retries_invalid_output(tmp_path) -> None:
@@ -141,19 +161,28 @@ def test_generate_records_retries_invalid_output(tmp_path) -> None:
             return "not-json"
 
     generator = BrokenGenerator()
-    records = generate_records(
-        [GenerationRequest("某甲事实。", _spec())],
-        generator,
-        tmp_path / "failed.jsonl",
-        generator_identity=generator_identity({"selector": "broken"}, mock=True),
-        prompt_version="v1",
-        sampling={},
-        seed=1,
-        retries=2,
-    ).records
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
+    ) as progress:
+        records = generate_records(
+            [GenerationRequest("某甲事实。", _spec())],
+            generator,
+            tmp_path / "failed.jsonl",
+            generator_identity=generator_identity({"selector": "broken"}, mock=True),
+            prompt_version="v1",
+            sampling={},
+            seed=1,
+            retries=2,
+            progress=progress,
+        ).records
     assert generator.calls == 3
     assert records[0]["validation"]["valid"] is False
     assert records[0]["retry_count"] == 2
+    assert "Generate counterfactuals: 1/1 completed" in stream.getvalue().splitlines()[-1]
+    assert stream.getvalue().splitlines()[-1].endswith(
+        "valid=0 invalid=1 failed=0 resumed=0 duplicate=0"
+    )
 
 
 def test_persisted_rows_identify_selected_checkpoints_and_reject_incompatible_resume(tmp_path):
@@ -312,18 +341,27 @@ def test_concurrent_generation_writes_every_request_once(tmp_path) -> None:
         for index in range(20)
     ]
     output = tmp_path / "concurrent.jsonl"
-    result = generate_records(
-        requests + requests[:3],
-        MockGenerator(),
-        output,
-        generator_identity=generator_identity({"selector": "mock"}, mock=True),
-        prompt_version="v2",
-        sampling={},
-        seed=42,
-        retries=0,
-        concurrency=8,
-    )
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
+    ) as progress:
+        result = generate_records(
+            requests + requests[:3],
+            MockGenerator(),
+            output,
+            generator_identity=generator_identity({"selector": "mock"}, mock=True),
+            prompt_version="v2",
+            sampling={},
+            seed=42,
+            retries=0,
+            concurrency=8,
+            progress=progress,
+        )
     assert result.skipped_duplicate == 3
+    assert "Generate counterfactuals: 23/23 completed" in stream.getvalue().splitlines()[-1]
+    assert stream.getvalue().splitlines()[-1].endswith(
+        "valid=20 invalid=0 failed=0 resumed=0 duplicate=3"
+    )
     lines = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert sorted(item["generation_id"] for item in lines) == sorted(
         request.generation_id for request in requests
@@ -348,22 +386,93 @@ def test_transport_failures_are_not_written_and_rejections_are(tmp_path) -> None
     )
     rejected = GenerationRequest("某甲事实。", _spec())
     output = tmp_path / "flaky.jsonl"
-    result = generate_records(
-        [down, rejected],
-        FlakyGenerator(),
-        output,
-        generator_identity=generator_identity({"selector": "mock"}, mock=True),
-        prompt_version="v2",
-        sampling={},
-        seed=1,
-        retries=2,
-        concurrency=2,
-    )
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
+    ) as progress:
+        result = generate_records(
+            [down, rejected],
+            FlakyGenerator(),
+            output,
+            generator_identity=generator_identity({"selector": "mock"}, mock=True),
+            prompt_version="v2",
+            sampling={},
+            seed=1,
+            retries=2,
+            concurrency=2,
+            progress=progress,
+        )
     assert [item["generation_id"] for item in result.failed] == [down.generation_id]
+    assert "Generate counterfactuals: 2/2 completed" in stream.getvalue().splitlines()[-1]
+    assert stream.getvalue().splitlines()[-1].endswith(
+        "valid=0 invalid=1 failed=1 resumed=0 duplicate=0"
+    )
     [record] = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert record["generation_id"] == rejected.generation_id
     assert record["validation"]["valid"] is False
     assert record["validation"]["errors"][0].startswith("request_rejected")
+
+
+def test_generate_records_progress_counts_resumed_and_duplicate_requests(tmp_path) -> None:
+    output = tmp_path / "generated.jsonl"
+    completed = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec())
+    pending = GenerationRequest(
+        "某甲秘密取得财物，涉案1000元并认罪。案件二。",
+        InterventionSpec.from_dict({**_spec().to_dict(), "parent_case_id": "c2"}),
+    )
+    identity = generator_identity({"selector": "mock"}, mock=True)
+    generate_records(
+        [completed], MockGenerator(), output,
+        generator_identity=identity, prompt_version="v2", sampling={}, seed=1, retries=0,
+    )
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
+    ) as progress:
+        result = generate_records(
+            [completed, pending, pending], MockGenerator(), output,
+            generator_identity=identity, prompt_version="v2", sampling={}, seed=1, retries=0,
+            resume=True, concurrency=2, progress=progress,
+        )
+    assert result.skipped_completed == 1
+    assert result.skipped_duplicate == 1
+    lines = stream.getvalue().splitlines()
+    assert "Generate counterfactuals: 2/3 started" in lines[0]
+    assert "Generate counterfactuals: 3/3 completed" in lines[-1]
+    assert lines[-1].endswith("valid=1 invalid=0 failed=0 resumed=1 duplicate=1")
+
+
+def test_generate_records_progress_counts_valid_and_transport_failure(tmp_path) -> None:
+    from legal_landscape.counterfactual.generate import GenerationTransportError
+
+    class MixedGenerator:
+        def generate(self, parent_text, spec, *, seed):
+            if spec.parent_case_id == "down":
+                raise GenerationTransportError("connection refused")
+            return MockGenerator().generate(parent_text, spec, seed=seed)
+
+    valid = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec())
+    down = GenerationRequest(
+        "某甲秘密取得财物，涉案1000元并认罪。",
+        InterventionSpec.from_dict({**_spec().to_dict(), "parent_case_id": "down"}),
+    )
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
+    ) as progress:
+        result = generate_records(
+            [valid, down], MixedGenerator(), tmp_path / "mixed.jsonl",
+            generator_identity=generator_identity({"selector": "mock"}, mock=True),
+            prompt_version="v2", sampling={}, seed=1, retries=0, concurrency=2,
+            progress=progress,
+        )
+    assert len(result.records) == 1
+    assert len(result.failed) == 1
+    lines = [line for line in stream.getvalue().splitlines() if " progress " in line]
+    assert len(lines) == 2
+    final = stream.getvalue().splitlines()[-1]
+    assert "Generate counterfactuals: 2/2 completed" in final
+    assert final.endswith("valid=1 invalid=0 failed=1 resumed=0 duplicate=0")
 
 
 def test_http_generator_retries_server_errors_and_rejects_client_errors() -> None:

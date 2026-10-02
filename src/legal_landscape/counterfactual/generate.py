@@ -17,6 +17,7 @@ from legal_landscape.counterfactual.prompts import build_messages
 from legal_landscape.counterfactual.provenance import MANIFEST_NAME, ensure_manifest
 from legal_landscape.counterfactual.validators import ValidationResult, validate_generation
 from legal_landscape.factors.schema import InterventionSpec
+from legal_landscape.progress import NullProgressReporter, ProgressReporter
 
 
 class CounterfactualGenerator(Protocol):
@@ -245,6 +246,7 @@ def generate_records(
     min_similarity: float = 0.5,
     concurrency: int = 1,
     provenance_manifest: str | Path | None = None,
+    progress: ProgressReporter | None = None,
 ) -> GenerationResult:
     """Generate validated records concurrently and durably append each completed request.
 
@@ -286,7 +288,20 @@ def generate_records(
             min_similarity=min_similarity,
         )
 
+    reporter = progress if progress is not None else NullProgressReporter()
+    valid = 0
+    invalid = 0
     with (
+        reporter.task(
+            "Generate counterfactuals",
+            total=len(requests),
+            completed=outcome.skipped_completed + outcome.skipped_duplicate,
+            valid=0,
+            invalid=0,
+            failed=0,
+            resumed=outcome.skipped_completed,
+            duplicate=outcome.skipped_duplicate,
+        ) as progress_task,
         destination.open("a" if resume else "w", encoding="utf-8") as handle,
         ThreadPoolExecutor(max_workers=concurrency) as executor,
     ):
@@ -312,10 +327,16 @@ def generate_records(
                     outcome.failed.append(
                         {"generation_id": request.generation_id, "error": str(exc)}
                     )
+                    progress_task.advance(failed=len(outcome.failed))
                     continue
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
                 outcome.records.append(record)
+                if record["validation"]["valid"]:
+                    valid += 1
+                else:
+                    invalid += 1
+                progress_task.advance(valid=valid, invalid=invalid)
             refill()
     return outcome
