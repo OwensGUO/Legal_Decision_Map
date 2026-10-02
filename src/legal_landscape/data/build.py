@@ -55,7 +55,7 @@ def _assign_groups_to_splits(
     processed = 0
     with progress.task(
         f"Assign groups · {data['dataset']}",
-        total=len(paths) * limit if limit is not None else None,
+        total=len(paths) * limit if data["dataset"] == "cail" and limit is not None else None,
         dataset=data["dataset"],
         pass_name="assignment",
         split="all",
@@ -103,7 +103,7 @@ def build_dataset(
         output_path = destination / f"{split}.jsonl"
         with reporter.task(
             f"Build {split} · {data['dataset']}",
-            total=limit,
+            total=limit if data["dataset"] == "cail" else None,
             dataset=data["dataset"],
             pass_name="build",
             split=split,

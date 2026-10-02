@@ -295,6 +295,52 @@ def test_build_dataset_progress_counts_dropped_and_short_splits(tmp_path) -> Non
         assert f"accepted={accepted} dropped={dropped} processed=1" in task_lines[-1]
 
 
+def test_build_dataset_progress_counts_expanded_cmdl_cases_without_known_total(tmp_path) -> None:
+    source = tmp_path / "source" / "small"
+    source.mkdir(parents=True)
+    row = {
+        "fact": "甲乙共同实施盗窃。",
+        "defendants": ["甲", "乙"],
+        "outcomes": [
+            {"name": name, "judgment": [{"accusation": "盗窃罪", "penalty": {"imprisonment": 12}}]}
+            for name in ("甲", "乙")
+        ],
+    }
+    for split in ("train", "valid", "test"):
+        (source / f"{split}_small.jsonl").write_text(
+            json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"data": {"dataset": "cmdl", "root": str(tmp_path / "source")}}),
+        encoding="utf-8",
+    )
+    stream = StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "never"},
+        is_terminal=False,
+        plain_interval=0,
+    ) as progress:
+        summary = build_dataset(config_path, tmp_path / "processed", limit=1, progress=progress)
+
+    assert summary["split_units"] == {"train": 0, "valid": 0, "test": 2}
+    lines = stream.getvalue().splitlines()
+    for label, processed, accepted, dropped in (
+        ("Assign groups", 6, 6, 0),
+        ("Build train", 2, 0, 2),
+        ("Build valid", 2, 0, 2),
+        ("Build test", 2, 2, 0),
+    ):
+        task_lines = [line for line in lines if label in line]
+        assert len([line for line in task_lines if " progress " in line]) == processed
+        assert f"{processed}/? completed" in task_lines[-1]
+        assert (
+            f"accepted={accepted} dropped={dropped} processed={processed}"
+            in task_lines[-1]
+        )
+
+
 def test_environment_and_requirement_dry_runs_are_read_only() -> None:
     for name in ("audit_environment.py", "check_requirements.py", "probe_gpu_stack.py"):
         result = subprocess.run(
