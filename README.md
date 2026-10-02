@@ -77,6 +77,43 @@ bash run.sh --dry-run
 MODE=smoke bash run.sh
 ```
 
+运行进度默认采用 `PROGRESS=auto`：终端中的动态进度会显示任务计数、耗时和剩余时间；
+重定向到日志时改为定期输出完整文本行（约每 30 秒一次），避免光标控制字符。
+也可用 `PROGRESS=always` 强制动态显示，或用 `PROGRESS=never` 始终输出适合日志的
+文本进度。设置 `NO_COLOR=1` 可保留进度显示并关闭颜色：
+
+```bash
+# 默认：终端动态显示，日志定期输出文本
+MODE=smoke PROGRESS=auto bash run.sh
+
+# 强制使用适合日志的纯文本进度
+MODE=smoke PROGRESS=never bash run.sh
+
+# 保留进度显示，但关闭颜色
+NO_COLOR=1 MODE=smoke bash run.sh
+```
+
+一键流程依次显示九个顶层阶段：`environment`、`validate generator provenance`、
+`audit data`、`build datasets`、`start vLLM`、`generate counterfactuals`、
+`stop vLLM`、`train and export predictions`、`evaluate`。每个阶段都有 `1/9` 至
+`9/9` 的编号、开始消息和带耗时的完成消息。阶段内部的进度按实际工作量计数，包括
+数据分组与各 split 构建、反事实请求、训练优化器更新、预测批次和 bootstrap 重采样。
+反事实断点续跑会将已完成请求计入初始进度；训练从检查点恢复时，初始计数从已完成的
+优化器更新开始。分布式训练和预测只由主进程显示进度，避免多卡重复输出。
+
+普通运行的阶段消息和内部进度发往 `stderr`，脚本生成的 JSON 仍保留在 `stdout`，
+因此分别重定向时可继续解析 JSON。`--dry-run` 的阶段和模拟命令会打印到 `stdout`，
+且不会使用动态控制字符。例如，纯文本日志中的顶层消息形如：
+
+```text
+[phase 1/9] environment
+[phase 1/9] environment completed in 0s
+[phase 2/9] validate generator provenance
+```
+
+启动 vLLM 时会持续显示已等待时间和超时上限；服务就绪时间不可预知，因此该阶段
+刻意不显示虚构的完成百分比。
+
 小规模验证成功后，主实验一键执行：
 
 ```bash

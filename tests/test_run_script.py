@@ -18,6 +18,14 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_SCRIPT = ROOT / "run.sh"
 
 
+def test_readme_documents_progress_controls() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for value in ("PROGRESS=auto", "PROGRESS=always", "PROGRESS=never", "NO_COLOR"):
+        assert value in readme
+    assert "stderr" in readme
+    assert "stdout" in readme
+
+
 @pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
 def test_provenance_preflight_guards_both_generator_namespaces_before_server(tmp_path, generator):
     result = subprocess.run(
