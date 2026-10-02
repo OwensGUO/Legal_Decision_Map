@@ -85,6 +85,13 @@ directly to `torch.autograd.backward` during parent recomputation, so they must 
 second time. Zero anchors/zero output gradients ensure all predictor heads participate in each DDP
 backward without changing numerical gradients.
 
+Each rank can receive a different pair type after distributed data sharding. Before conditionally
+executing a parent branch, all ranks sum two small requirement flags through Accelerate. If any rank
+needs parent charge or sentence outputs, every rank follows the same graph-free parent forward and
+parent-recompute backward schedule; locally unused parent outputs receive zero gradients. The parent
+branch is skipped only when the global batch is boundary-only, preventing mismatched DDP collective
+sequences.
+
 ## Quality Impact
 
 Phase-6 counterfactual generation is untouched: model, prompts, sampling, validation, and stored
@@ -101,7 +108,10 @@ time rather than reduced data or model quality.
 - Fake-runtime orchestration verifies the first parent call is graph-free, the parent is recomputed,
   pair loss is backpropagated once, parent output gradients are injected once, and the optimizer is
   called once.
-- Boundary-only pair batches skip parent recomputation when both parent-output gradients are absent.
+- Globally boundary-only pair batches skip parent computation, while a boundary-only rank follows
+  the parent schedule when another rank requires it.
+- A two-process CPU/Gloo test verifies heterogeneous local pair types produce identical global parent
+  requirements on every rank.
 - Existing supervised staging, loss logging, progress, checkpoint, prediction, and full-suite tests
   remain green.
 - Server acceptance uses `SMOKE_MAX_LENGTH=512` first and default 1024 only after 512 passes.

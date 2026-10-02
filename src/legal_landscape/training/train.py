@@ -9,6 +9,7 @@ import math
 import os
 import random
 from collections.abc import Callable, Sized
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -581,6 +582,101 @@ _LOSS_VALUE_NAMES = (
     "total",
 )
 
+_PREDICTOR_BACKWARD_OUTPUT_NAMES = (
+    "charge_logits",
+    "article_logits",
+    "penalty_type_logits",
+    "sentence_by_charge",
+    "sentence_months",
+    "factor_logits",
+)
+
+
+@dataclass(frozen=True)
+class _RngSnapshot:
+    cpu_state: Any
+    cuda_state: Any | None
+    cuda_device: Any | None
+
+
+def _capture_rng_state(torch_module: Any, device: Any) -> _RngSnapshot:
+    cuda_device = device if getattr(device, "type", None) == "cuda" else None
+    cuda_state = None
+    if cuda_device is not None and torch_module.cuda.is_available():
+        cuda_state = torch_module.cuda.get_rng_state(cuda_device).clone()
+    return _RngSnapshot(
+        cpu_state=torch_module.get_rng_state().clone(),
+        cuda_state=cuda_state,
+        cuda_device=cuda_device,
+    )
+
+
+@contextmanager
+def _replay_rng_state(torch_module: Any, snapshot: _RngSnapshot):
+    current = _capture_rng_state(torch_module, snapshot.cuda_device)
+    try:
+        torch_module.set_rng_state(snapshot.cpu_state)
+        if snapshot.cuda_state is not None:
+            torch_module.cuda.set_rng_state(snapshot.cuda_state, device=snapshot.cuda_device)
+        yield
+    finally:
+        try:
+            torch_module.set_rng_state(current.cpu_state)
+        finally:
+            if current.cuda_state is not None:
+                torch_module.cuda.set_rng_state(current.cuda_state, device=current.cuda_device)
+
+
+def _distributed_parent_requirements(
+    torch_module: Any,
+    accelerator: Any,
+    pair_types: tuple[str, ...],
+    device: Any,
+) -> tuple[bool, bool]:
+    local_requirements = torch_module.tensor(
+        (
+            int("invariant" in pair_types),
+            int("sentence_rank" in pair_types),
+        ),
+        device=device,
+        dtype=torch_module.int64,
+    )
+    global_requirements = accelerator.reduce(local_requirements, reduction="sum")
+    return (
+        bool(global_requirements[0].item()),
+        bool(global_requirements[1].item()),
+    )
+
+
+def _zero_output_anchor(outputs: dict[str, Any]) -> Any:
+    anchor = outputs[_PREDICTOR_BACKWARD_OUTPUT_NAMES[0]].sum() * 0.0
+    for name in _PREDICTOR_BACKWARD_OUTPUT_NAMES[1:]:
+        anchor = anchor + outputs[name].sum() * 0.0
+    return anchor
+
+
+def _backward_recomputed_parent(
+    torch_module: Any,
+    outputs: dict[str, Any],
+    *,
+    charge_gradient: Any | None,
+    sentence_gradient: Any | None,
+) -> None:
+    gradients = tuple(
+        (
+            charge_gradient
+            if name == "charge_logits" and charge_gradient is not None
+            else sentence_gradient
+            if name == "sentence_months" and sentence_gradient is not None
+            else torch_module.zeros_like(outputs[name])
+        )
+        for name in _PREDICTOR_BACKWARD_OUTPUT_NAMES
+    )
+    torch_module.autograd.backward(
+        tuple(outputs[name] for name in _PREDICTOR_BACKWARD_OUTPUT_NAMES),
+        grad_tensors=gradients,
+    )
+
 
 def _detached_loss_values(losses: Any) -> dict[str, float]:
     return {name: float(getattr(losses, name).detach()) for name in _LOSS_VALUE_NAMES}
@@ -1128,20 +1224,51 @@ def run_real_training(
                                 pair_sampler.next_epoch()
                                 pair_iterator = iter(pair_loader)  # type: ignore[arg-type]
                                 pair_batch = next(pair_iterator)
-                            parent_output = predictor(
-                                pair_batch["parent"]["input_ids"],
-                                pair_batch["parent"].get("attention_mask"),
+                            pair_types = pair_batch["pair_types"]
+                            needs_parent_charge, needs_parent_sentence = (
+                                _distributed_parent_requirements(
+                                    torch,
+                                    accelerator,
+                                    pair_types,
+                                    pair_batch["parent"]["input_ids"].device,
+                                )
                             )
+                            parent_charge = None
+                            parent_sentence = None
+                            parent_rng = None
+                            if needs_parent_charge or needs_parent_sentence:
+                                parent_rng = _capture_rng_state(
+                                    torch,
+                                    pair_batch["parent"]["input_ids"].device,
+                                )
+                                with torch.no_grad():
+                                    parent_output = predictor(
+                                        pair_batch["parent"]["input_ids"],
+                                        pair_batch["parent"].get("attention_mask"),
+                                    )
+                                if needs_parent_charge:
+                                    parent_charge = (
+                                        parent_output["charge_logits"]
+                                        .detach()
+                                        .requires_grad_(True)
+                                    )
+                                if needs_parent_sentence:
+                                    parent_sentence = (
+                                        parent_output["sentence_months"]
+                                        .detach()
+                                        .requires_grad_(True)
+                                    )
+                                del parent_output
                             cf_output = predictor(
                                 pair_batch["counterfactual"]["input_ids"],
                                 pair_batch["counterfactual"].get("attention_mask"),
                             )
                             paired_losses = compute_typed_losses(
-                                pair_types=pair_batch["pair_types"],
-                                parent_charge_logits=parent_output["charge_logits"],
+                                pair_types=pair_types,
+                                parent_charge_logits=parent_charge,
                                 counterfactual_charge_logits=cf_output["charge_logits"],
                                 target_charge_indices=pair_batch["target_charge_indices"],
-                                parent_sentence=parent_output["sentence_months"],
+                                parent_sentence=parent_sentence,
                                 counterfactual_sentence=cf_output["sentence_months"],
                                 rank_direction=pair_batch["rank_direction"],
                                 rank_margin=float(training.get("rank_margin", 1.0)),
@@ -1152,12 +1279,50 @@ def run_real_training(
                                 destination / "loss_diagnostic.json",
                                 step=step,
                             )
-                            accelerator.backward(paired_losses.total)
+                            paired_backward = paired_losses.total + _zero_output_anchor(cf_output)
+                            accelerator.backward(paired_backward)
                             loss_values = _sum_loss_values(
                                 loss_values, _detached_loss_values(paired_losses)
                             )
+                            parent_charge_gradient = None
+                            if parent_charge is not None:
+                                parent_charge_gradient = (
+                                    parent_charge.grad.detach()
+                                    if parent_charge.grad is not None
+                                    else torch.zeros_like(parent_charge)
+                                )
+                            parent_sentence_gradient = None
+                            if parent_sentence is not None:
+                                parent_sentence_gradient = (
+                                    parent_sentence.grad.detach()
+                                    if parent_sentence.grad is not None
+                                    else torch.zeros_like(parent_sentence)
+                                )
+                            del cf_output, paired_backward, paired_losses
+                            del parent_charge, parent_sentence
+                            if (
+                                parent_charge_gradient is not None
+                                or parent_sentence_gradient is not None
+                            ):
+                                if parent_rng is None:
+                                    raise RuntimeError(
+                                        "parent gradients exist without an RNG snapshot"
+                                    )
+                                with _replay_rng_state(torch, parent_rng):
+                                    parent_output = predictor(
+                                        pair_batch["parent"]["input_ids"],
+                                        pair_batch["parent"].get("attention_mask"),
+                                    )
+                                    _backward_recomputed_parent(
+                                        torch,
+                                        parent_output,
+                                        charge_gradient=parent_charge_gradient,
+                                        sentence_gradient=parent_sentence_gradient,
+                                    )
+                                del parent_output
+                            del parent_charge_gradient, parent_sentence_gradient, parent_rng
                             pair_count = len(pair_batch["pair_types"])
-                            del parent_output, cf_output, paired_losses, pair_batch
+                            del pair_batch
                             if pair_sampler is not None:
                                 pair_sampler.advance(pair_count * accelerator.num_processes)
                         completed_optimizer_step = accelerator.sync_gradients
