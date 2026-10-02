@@ -63,6 +63,129 @@ class RecordingProgress:
             self.events.append(f"task:exit:{description}")
 
 
+def test_detached_loss_values_detaches_every_reporting_scalar():
+    from legal_landscape.training.train import _detached_loss_values
+
+    class Scalar:
+        def __init__(self, value):
+            self.value = value
+            self.detached = False
+
+        def detach(self):
+            self.detached = True
+            return self
+
+        def __float__(self):
+            return float(self.value)
+
+    names = (
+        "charge",
+        "article",
+        "sentence",
+        "invariant",
+        "boundary",
+        "response",
+        "factor",
+        "total",
+    )
+    scalars = {name: Scalar(index / 10) for index, name in enumerate(names, start=1)}
+
+    values = _detached_loss_values(SimpleNamespace(**scalars))
+
+    assert values == {name: index / 10 for index, name in enumerate(names, start=1)}
+    assert all(scalar.detached for scalar in scalars.values())
+
+
+def test_sum_loss_values_adds_each_component_without_mutating_inputs():
+    from legal_landscape.training.train import _sum_loss_values
+
+    first = {
+        "charge": 1.0,
+        "article": 2.0,
+        "sentence": 3.0,
+        "invariant": 0.0,
+        "boundary": 0.0,
+        "response": 0.0,
+        "factor": 4.0,
+        "total": 10.0,
+    }
+    second = {
+        "charge": 0.0,
+        "article": 0.0,
+        "sentence": 0.0,
+        "invariant": 5.0,
+        "boundary": 6.0,
+        "response": 7.0,
+        "factor": 0.0,
+        "total": 18.0,
+    }
+
+    combined = _sum_loss_values(first, second)
+
+    assert combined == {
+        "charge": 1.0,
+        "article": 2.0,
+        "sentence": 3.0,
+        "invariant": 5.0,
+        "boundary": 6.0,
+        "response": 7.0,
+        "factor": 4.0,
+        "total": 28.0,
+    }
+    assert first["total"] == 10.0
+    assert second["total"] == 18.0
+
+
+def test_sum_loss_values_rejects_empty_input():
+    from legal_landscape.training.train import _sum_loss_values
+
+    with pytest.raises(ValueError, match="at least one"):
+        _sum_loss_values()
+
+
+@pytest.mark.skipif(torch is None, reason="torch is not installed")
+def test_staged_backward_gradient_equivalence():
+    from legal_landscape.models.losses import compute_typed_losses
+
+    def supervised(parameter):
+        logits = torch.stack((parameter, -parameter)).unsqueeze(0)
+        return compute_typed_losses(
+            charge_logits=logits,
+            charge_targets=torch.tensor([[1.0, 0.0]]),
+        )
+
+    def paired(parameter):
+        parent = torch.stack((parameter * 2.0, -parameter)).unsqueeze(0)
+        counterfactual = torch.stack((parameter * 3.0, parameter)).unsqueeze(0)
+        return compute_typed_losses(
+            pair_types=("invariant",),
+            parent_charge_logits=parent,
+            counterfactual_charge_logits=counterfactual,
+        )
+
+    combined_parameter = torch.tensor(0.4, requires_grad=True)
+    combined = compute_typed_losses(
+        charge_logits=torch.stack(
+            (combined_parameter, -combined_parameter)
+        ).unsqueeze(0),
+        charge_targets=torch.tensor([[1.0, 0.0]]),
+        pair_types=("invariant",),
+        parent_charge_logits=torch.stack(
+            (combined_parameter * 2.0, -combined_parameter)
+        ).unsqueeze(0),
+        counterfactual_charge_logits=torch.stack(
+            (combined_parameter * 3.0, combined_parameter)
+        ).unsqueeze(0),
+    )
+    combined.total.backward()
+
+    staged_parameter = torch.tensor(0.4, requires_grad=True)
+    supervised(staged_parameter).total.backward()
+    paired(staged_parameter).total.backward()
+
+    torch.testing.assert_close(staged_parameter.grad, combined_parameter.grad)
+
+
 @pytest.mark.parametrize(
     ("step", "maximum", "expected"),
     [
@@ -152,7 +275,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
                 else self.records
             )
             for record in records:
-                batch = {
+                model_batch = {
                     name: Tensor([[1]])
                     for name in (
                         "input_ids",
@@ -165,10 +288,20 @@ def training_progress_runtime(monkeypatch, tmp_path):
                         "factor_targets",
                     )
                 }
+                if "parent_record" in record:
+                    batch = {
+                        "parent": model_batch,
+                        "counterfactual": model_batch,
+                        "pair_types": (record["intervention_type"],),
+                        "target_charge_indices": Tensor([0]),
+                        "rank_direction": Tensor([0.0]),
+                    }
+                else:
+                    batch = model_batch
                 if "_prediction_index" in record:
                     index = Tensor([record["_prediction_index"]])
                     if "parent_record" in record:
-                        batch = {"parent": batch, "counterfactual": batch, "pair_indices": index}
+                        batch["pair_indices"] = index
                     else:
                         batch["record_indices"] = index
                 yield batch
@@ -192,6 +325,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
                 "article_logits": Tensor([[0.7]]),
                 "penalty_type_logits": Tensor([[1.0]]),
                 "sentence_months": Tensor([12.0]),
+                "factor_logits": Tensor([[0.5]]),
             }
 
     class Optimizer:
@@ -256,21 +390,29 @@ def training_progress_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(train, "load_backbone", lambda config: (object(), inspected))
     monkeypatch.setattr(train, "set_deterministic_seed", lambda seed: None)
     monkeypatch.setattr(train, "validate_loss_breakdown", lambda *args, **kwargs: None)
-    losses = SimpleNamespace(
-        **{
-            name: Tensor(0.5)
-            for name in (
-                "charge",
-                "article",
-                "sentence",
-                "invariant",
-                "boundary",
-                "response",
-                "factor",
-                "total",
-            )
-        }
+    loss_names = (
+        "charge",
+        "article",
+        "sentence",
+        "invariant",
+        "boundary",
+        "response",
+        "factor",
+        "total",
     )
+
+    def compute_losses(**kwargs):
+        if kwargs.get("pair_types"):
+            values = {name: 0.0 for name in loss_names}
+            values["invariant"] = 0.25
+            values["total"] = 0.25
+        else:
+            values = {name: 0.0 for name in loss_names}
+            for name in ("charge", "article", "sentence", "factor"):
+                values[name] = 0.125
+            values["total"] = 0.5
+        return SimpleNamespace(**{name: Tensor(value) for name, value in values.items()})
+
     modules = {
         "torch": SimpleNamespace(
             nn=SimpleNamespace(Module=object),
@@ -285,19 +427,28 @@ def training_progress_runtime(monkeypatch, tmp_path):
                 from_pretrained=lambda *args, **kwargs: SimpleNamespace(pad_token_id=0)
             )
         ),
-        "legal_landscape.models.losses": SimpleNamespace(compute_typed_losses=lambda **kw: losses),
+        "legal_landscape.models.losses": SimpleNamespace(compute_typed_losses=compute_losses),
         "legal_landscape.models.predictor": SimpleNamespace(LegalLandscapePredictor=Predictor),
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    def run(*, is_main=True, restored_step=0, max_steps=2, fail_gather=False):
+    def run(
+        *,
+        is_main=True,
+        restored_step=0,
+        max_steps=2,
+        fail_gather=False,
+        experiment_name="B3",
+        gradient_accumulation_steps=2,
+    ):
         class Accelerator:
             def __init__(self, **kwargs):
                 self.is_main_process = is_main
                 self.num_processes = 2
                 self.sync_gradients = False
                 self.microbatches = 0
+                self.gradient_accumulation_steps = kwargs["gradient_accumulation_steps"]
 
             def prepare(self, *args):
                 return args if len(args) > 1 else args[0]
@@ -305,11 +456,13 @@ def training_progress_runtime(monkeypatch, tmp_path):
             @contextmanager
             def accumulate(self, predictor):
                 self.microbatches += 1
-                self.sync_gradients = self.microbatches % 2 == 0
+                self.sync_gradients = (
+                    self.microbatches % self.gradient_accumulation_steps == 0
+                )
                 yield
 
             def backward(self, loss):
-                pass
+                events.append(("backward", float(loss)))
 
             def wait_for_everyone(self):
                 pass
@@ -363,13 +516,13 @@ def training_progress_runtime(monkeypatch, tmp_path):
                 "training": {
                     "max_steps": max_steps,
                     "epochs": 1,
-                    "gradient_accumulation_steps": 2,
+                    "gradient_accumulation_steps": gradient_accumulation_steps,
                     "checkpoint_every": 1,
                 },
             },
             train_data=train_path,
             output_dir=tmp_path / "output",
-            experiment_name="B3",
+            experiment_name=experiment_name,
             counterfactual_data=pairs_path,
             evaluation_data=evaluation_path,
             resume_from_checkpoint=resume,
@@ -394,6 +547,55 @@ def test_training_progress_factory_tracks_real_loop_optimizer_steps(training_pro
     logs = [json.loads(line) for line in (root / "output/train.jsonl").read_text().splitlines()]
     assert [item["step"] for item in logs] == [1, 2]
     assert events.index(("tensorboard", 1)) < events.index("checkpoint")
+
+
+def test_m_staged_backward_uses_two_backwards_and_one_optimizer_call(
+    training_progress_runtime,
+):
+    run, events, root = training_progress_runtime
+
+    run(experiment_name="M", max_steps=1, gradient_accumulation_steps=1)
+
+    training_events = [
+        event
+        for event in events
+        if event == "optimizer" or (isinstance(event, tuple) and event[0] == "backward")
+    ]
+    assert training_events == [
+        ("backward", 0.5),
+        ("backward", 0.25),
+        "optimizer",
+    ]
+    log = json.loads((root / "output/train.jsonl").read_text().splitlines()[0])
+    assert log == {
+        "step": 1,
+        "charge": 0.125,
+        "article": 0.125,
+        "sentence": 0.125,
+        "invariant": 0.25,
+        "boundary": 0.0,
+        "response": 0.0,
+        "factor": 0.125,
+        "total": 0.75,
+    }
+
+
+def test_b3_staged_backward_keeps_one_backward_and_one_optimizer_call(
+    training_progress_runtime,
+):
+    run, events, _root = training_progress_runtime
+
+    run(experiment_name="B3", max_steps=1, gradient_accumulation_steps=1)
+
+    training_events = [
+        event
+        for event in events
+        if event == "optimizer" or (isinstance(event, tuple) and event[0] == "backward")
+    ]
+    assert training_events == [
+        ("backward", 0.5),
+        "optimizer",
+    ]
 
 
 def test_training_progress_worker_uses_null_reporter(training_progress_runtime):

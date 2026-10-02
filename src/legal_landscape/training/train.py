@@ -570,20 +570,33 @@ def run_dummy_train_step(*, seed: int = 42) -> float:
     return float(losses.total.detach().item())
 
 
+_LOSS_VALUE_NAMES = (
+    "charge",
+    "article",
+    "sentence",
+    "invariant",
+    "boundary",
+    "response",
+    "factor",
+    "total",
+)
+
+
+def _detached_loss_values(losses: Any) -> dict[str, float]:
+    return {name: float(getattr(losses, name).detach()) for name in _LOSS_VALUE_NAMES}
+
+
+def _sum_loss_values(*parts: dict[str, float]) -> dict[str, float]:
+    if not parts:
+        raise ValueError("at least one loss-value mapping is required")
+    return {name: sum(part[name] for part in parts) for name in _LOSS_VALUE_NAMES}
+
+
 def validate_loss_breakdown(losses: Any, diagnostic_path: str | Path, *, step: int) -> None:
     """Fail fast on NaN/Inf or a nonzero loss with no eligible samples."""
     errors: list[str] = []
     values: dict[str, float] = {}
-    for name in (
-        "charge",
-        "article",
-        "sentence",
-        "invariant",
-        "boundary",
-        "response",
-        "factor",
-        "total",
-    ):
+    for name in _LOSS_VALUE_NAMES:
         value = float(getattr(losses, name).detach().item())
         values[name] = value
         if not math.isfinite(value):
@@ -1077,7 +1090,33 @@ def run_real_training(
                 for batch in loader:
                     with accelerator.accumulate(predictor):
                         output = predictor(batch["input_ids"], batch.get("attention_mask"))
-                        pair_kwargs: dict[str, Any] = {}
+                        supervised_losses = compute_typed_losses(
+                            charge_logits=output["charge_logits"],
+                            charge_targets=batch["charge_targets"],
+                            article_logits=output["article_logits"],
+                            article_targets=batch["article_targets"],
+                            article_mask=batch["article_mask"],
+                            penalty_logits=output["penalty_type_logits"],
+                            penalty_targets=batch["penalty_targets"],
+                            sentence_predictions=output["sentence_months"],
+                            sentence_targets=batch["sentence_targets"],
+                            sentence_mask=batch["sentence_mask"],
+                            factor_logits=output["factor_logits"]
+                            if experiment.use_factors
+                            else None,
+                            factor_targets=batch["factor_targets"]
+                            if experiment.use_factors
+                            else None,
+                            weights=weights,
+                        )
+                        validate_loss_breakdown(
+                            supervised_losses,
+                            destination / "loss_diagnostic.json",
+                            step=step,
+                        )
+                        accelerator.backward(supervised_losses.total)
+                        loss_values = _detached_loss_values(supervised_losses)
+                        del output, supervised_losses
                         if pair_iterator is not None:
                             try:
                                 pair_batch = next(pair_iterator)
@@ -1097,44 +1136,30 @@ def run_real_training(
                                 pair_batch["counterfactual"]["input_ids"],
                                 pair_batch["counterfactual"].get("attention_mask"),
                             )
-                            pair_kwargs = {
-                                "pair_types": pair_batch["pair_types"],
-                                "parent_charge_logits": parent_output["charge_logits"],
-                                "counterfactual_charge_logits": cf_output["charge_logits"],
-                                "target_charge_indices": pair_batch["target_charge_indices"],
-                                "parent_sentence": parent_output["sentence_months"],
-                                "counterfactual_sentence": cf_output["sentence_months"],
-                                "rank_direction": pair_batch["rank_direction"],
-                                "rank_margin": float(training.get("rank_margin", 1.0)),
-                            }
+                            paired_losses = compute_typed_losses(
+                                pair_types=pair_batch["pair_types"],
+                                parent_charge_logits=parent_output["charge_logits"],
+                                counterfactual_charge_logits=cf_output["charge_logits"],
+                                target_charge_indices=pair_batch["target_charge_indices"],
+                                parent_sentence=parent_output["sentence_months"],
+                                counterfactual_sentence=cf_output["sentence_months"],
+                                rank_direction=pair_batch["rank_direction"],
+                                rank_margin=float(training.get("rank_margin", 1.0)),
+                                weights=weights,
+                            )
+                            validate_loss_breakdown(
+                                paired_losses,
+                                destination / "loss_diagnostic.json",
+                                step=step,
+                            )
+                            accelerator.backward(paired_losses.total)
+                            loss_values = _sum_loss_values(
+                                loss_values, _detached_loss_values(paired_losses)
+                            )
+                            pair_count = len(pair_batch["pair_types"])
+                            del parent_output, cf_output, paired_losses, pair_batch
                             if pair_sampler is not None:
-                                pair_sampler.advance(
-                                    len(pair_batch["pair_types"]) * accelerator.num_processes
-                                )
-                        losses = compute_typed_losses(
-                            charge_logits=output["charge_logits"],
-                            charge_targets=batch["charge_targets"],
-                            article_logits=output["article_logits"],
-                            article_targets=batch["article_targets"],
-                            article_mask=batch["article_mask"],
-                            penalty_logits=output["penalty_type_logits"],
-                            penalty_targets=batch["penalty_targets"],
-                            sentence_predictions=output["sentence_months"],
-                            sentence_targets=batch["sentence_targets"],
-                            sentence_mask=batch["sentence_mask"],
-                            factor_logits=output["factor_logits"]
-                            if experiment.use_factors
-                            else None,
-                            factor_targets=batch["factor_targets"]
-                            if experiment.use_factors
-                            else None,
-                            weights=weights,
-                            **pair_kwargs,
-                        )
-                        validate_loss_breakdown(
-                            losses, destination / "loss_diagnostic.json", step=step
-                        )
-                        accelerator.backward(losses.total)
+                                pair_sampler.advance(pair_count * accelerator.num_processes)
                         completed_optimizer_step = accelerator.sync_gradients
                         optimizer.step()
                         optimizer.zero_grad()
@@ -1143,25 +1168,10 @@ def run_real_training(
                     if completed_optimizer_step:
                         step += 1
                         _report_optimizer_step(
-                            train_progress, step, max_steps, float(losses.total.detach())
+                            train_progress, step, max_steps, loss_values["total"]
                         )
                     if completed_optimizer_step and accelerator.is_main_process:
-                        log = {
-                            "step": step,
-                            **{
-                                name: float(getattr(losses, name).detach())
-                                for name in (
-                                    "charge",
-                                    "article",
-                                    "sentence",
-                                    "invariant",
-                                    "boundary",
-                                    "response",
-                                    "factor",
-                                    "total",
-                                )
-                            },
-                        }
+                        log = {"step": step, **loss_values}
                         with log_path.open("a", encoding="utf-8") as handle:
                             handle.write(json.dumps(log) + "\n")
                         if writer is not None:
