@@ -88,7 +88,7 @@ MOCK_GENERATOR="${MOCK_GENERATOR:-0}"
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
 INSTALL_FLA="${INSTALL_FLA:-0}"
 BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-}"
-PROGRESS="${PROGRESS:-auto}"
+PROGRESS="${PROGRESS-auto}"
 case "$PROGRESS" in
   auto|always|never) ;;
   *)
@@ -102,6 +102,7 @@ PHASE_NAME=""
 PHASE_STARTED_AT=0
 PIPELINE_STARTED_SECONDS=$SECONDS
 WAIT_ACTIVE=0
+WAIT_DYNAMIC_VISIBLE=0
 PROGRESS_DYNAMIC=0
 if [[ "$DRY_RUN" != "1" ]] && { [[ "$PROGRESS" == "always" ]] || { [[ "$PROGRESS" == "auto" ]] && [[ -t 2 ]]; }; }; then
   PROGRESS_DYNAMIC=1
@@ -236,14 +237,59 @@ phase() {
   phase_log "[phase $PHASE_INDEX/$PHASE_TOTAL] $PHASE_NAME"
 }
 
+vllm_wait_width() {
+  WAIT_WIDTH="${COLUMNS:-80}"
+  if [[ -t 2 ]]; then
+    local terminal_size
+    terminal_size="$(stty size <&2 2>/dev/null || true)"
+    [[ -n "$terminal_size" ]] && WAIT_WIDTH="${terminal_size##* }"
+  fi
+  [[ "$WAIT_WIDTH" =~ ^[1-9][0-9]*$ ]] || WAIT_WIDTH=80
+  WAIT_WIDTH=$((10#$WAIT_WIDTH))
+}
+
+plain_vllm_wait() {
+  local elapsed=$1
+  local label="Waiting for vLLM (${elapsed}s/${INFER_TIMEOUT}s)"
+  if (( ${#label} >= WAIT_WIDTH )); then
+    label="vLLM ${elapsed}s/${INFER_TIMEOUT}s"
+  fi
+  if (( ${#label} >= WAIT_WIDTH )); then
+    label="vLLM ${elapsed}s"
+  fi
+  if (( ${#label} >= WAIT_WIDTH )); then
+    label="vLLM"
+  fi
+  if (( ${#label} >= WAIT_WIDTH )); then
+    label="${label:0:$((WAIT_WIDTH - 1))}"
+  fi
+  printf '%s\n' "$label" >&2
+}
+
 render_vllm_wait() {
   local elapsed=$((SECONDS - WAIT_STARTED_AT))
   local frames=('|' '/' '-' '\')
+  local label
   if [[ "$PROGRESS_UNICODE" == "1" ]]; then
     frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   fi
-  printf '\r\033[2K%s Waiting for vLLM (%ss/%ss)' \
-    "${frames[WAIT_FRAME_INDEX % ${#frames[@]}]}" "$elapsed" "$INFER_TIMEOUT" >&2
+  vllm_wait_width
+  label="${frames[WAIT_FRAME_INDEX % ${#frames[@]}]} Waiting for vLLM (${elapsed}s/${INFER_TIMEOUT}s)"
+  if (( ${#label} >= WAIT_WIDTH )); then
+    label="${frames[WAIT_FRAME_INDEX % ${#frames[@]}]} vLLM ${elapsed}s/${INFER_TIMEOUT}s"
+  fi
+  if (( ${#label} >= WAIT_WIDTH )); then
+    if [[ "$WAIT_DYNAMIC_VISIBLE" == "1" ]]; then
+      printf '\r\033[2K' >&2
+      WAIT_DYNAMIC_VISIBLE=0
+    fi
+    PROGRESS_DYNAMIC=0
+    plain_vllm_wait "$elapsed"
+    WAIT_LAST_PLAIN_AT=$SECONDS
+    return
+  fi
+  printf '\r\033[2K%s' "$label" >&2
+  WAIT_DYNAMIC_VISIBLE=1
   WAIT_FRAME_INDEX=$((WAIT_FRAME_INDEX + 1))
 }
 
@@ -252,10 +298,12 @@ start_vllm_wait() {
   WAIT_STARTED_AT=$SECONDS
   WAIT_LAST_PLAIN_AT=$SECONDS
   WAIT_FRAME_INDEX=0
+  WAIT_DYNAMIC_VISIBLE=0
+  vllm_wait_width
   if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
     render_vllm_wait
   else
-    printf 'Waiting for vLLM (0s/%ss)\n' "$INFER_TIMEOUT" >&2
+    plain_vllm_wait 0
   fi
 }
 
@@ -263,18 +311,34 @@ update_vllm_wait() {
   if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
     render_vllm_wait
   elif (( SECONDS - WAIT_LAST_PLAIN_AT >= 30 )); then
-    printf 'Waiting for vLLM (%ss/%ss)\n' \
-      "$((SECONDS - WAIT_STARTED_AT))" "$INFER_TIMEOUT" >&2
+    vllm_wait_width
+    plain_vllm_wait "$((SECONDS - WAIT_STARTED_AT))"
     WAIT_LAST_PLAIN_AT=$SECONDS
   fi
 }
 
 finish_vllm_wait() {
   [[ "$WAIT_ACTIVE" == "1" ]] || return 0
-  if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
+  if [[ "$WAIT_DYNAMIC_VISIBLE" == "1" ]]; then
     printf '\r\033[2K' >&2
+    WAIT_DYNAMIC_VISIBLE=0
   fi
-  printf 'vLLM wait %s after %ss\n' "$1" "$((SECONDS - WAIT_STARTED_AT))" >&2
+  vllm_wait_width
+  local label="vLLM wait $1 after $((SECONDS - WAIT_STARTED_AT))s"
+  if (( ${#label} >= WAIT_WIDTH )); then
+    label="vLLM $1 $((SECONDS - WAIT_STARTED_AT))s"
+  fi
+  if (( ${#label} >= WAIT_WIDTH )); then
+    if [[ "$1" == "ready" ]]; then
+      label="vLLM ok"
+    else
+      label="vLLM !"
+    fi
+  fi
+  if (( ${#label} >= WAIT_WIDTH )); then
+    label="${label:0:$((WAIT_WIDTH - 1))}"
+  fi
+  printf '%s\n' "$label" >&2
   WAIT_ACTIVE=0
 }
 
@@ -566,11 +630,13 @@ else
   until curl --silent --fail "http://${INFER_HOST}:${INFER_PORT}/health" >/dev/null; do
     update_vllm_wait
     if ! kill -0 "$INFER_PID" 2>/dev/null; then
+      finish_vllm_wait "failed"
       printf 'vLLM exited before becoming healthy; see %s/logs/vllm.log\n' \
         "$OUTPUT_ROOT" >&2
       exit 1
     fi
     if (( SECONDS >= deadline )); then
+      finish_vllm_wait "failed"
       printf 'Timed out waiting for vLLM; see %s/logs/vllm.log\n' "$OUTPUT_ROOT" >&2
       exit 1
     fi

@@ -135,11 +135,12 @@ def test_dry_run_numbers_all_phases_without_terminal_control() -> None:
     assert "\r" not in result.stdout + result.stderr
 
 
-def test_invalid_progress_mode_aborts_before_any_phase() -> None:
+@pytest.mark.parametrize("progress", ["sometimes", ""])
+def test_invalid_progress_mode_aborts_before_any_phase(progress) -> None:
     result = subprocess.run(
         ["bash", str(RUN_SCRIPT), "--dry-run"],
         cwd=ROOT,
-        env={**os.environ, "PROGRESS": "sometimes"},
+        env={**os.environ, "PROGRESS": progress},
         capture_output=True,
         text=True,
         check=False,
@@ -599,6 +600,143 @@ def test_real_server_p2p_flags_follow_policy_and_boolean_probe(
     assert summary["generator_model"] == "qwen38"
     assert summary["generator_path"] == str(paths["qwen38"])
     assert summary["p2p_policy"] == policy
+
+
+def _run_fake_vllm_wait(tmp_path, *, health_mode, progress, columns=None, no_color=False):
+    binary_dir = tmp_path / "conda/bin"
+    binary_dir.mkdir(parents=True)
+    launch_marker = tmp_path / "vllm-launched"
+    fake_python = binary_dir / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[0] == '-c' and not args[1].startswith("
+        "('import sys; assert', 'import accelerate')):\n"
+        f"    os.execv({sys.executable!r}, [{sys.executable!r}, *args])\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_setsid = binary_dir / "setsid"
+    fake_setsid.write_text(
+        f"#!{sys.executable}\nimport os, sys\n"
+        "os.execvp(sys.argv[1], sys.argv[1:])\n",
+        encoding="utf-8",
+    )
+    fake_setsid.chmod(0o755)
+    fake_vllm = binary_dir / "vllm"
+    fake_vllm.write_text(
+        f"#!{sys.executable}\nimport os, pathlib, time\n"
+        "pathlib.Path(os.environ['TEST_LAUNCH_MARKER']).touch()\n"
+        "if os.environ['TEST_HEALTH_MODE'] == 'timeout':\n"
+        "    time.sleep(2)\n",
+        encoding="utf-8",
+    )
+    fake_vllm.chmod(0o755)
+    fake_curl = binary_dir / "curl"
+    fake_curl.write_text(
+        "#!/bin/sh\n"
+        "test -f \"$TEST_LAUNCH_MARKER\" || exit 22\n"
+        "case \"$TEST_HEALTH_MODE\" in\n"
+        "  ready) case \"$*\" in *v1/chat/completions*) exit 22 ;; *) exit 0 ;; esac ;;\n"
+        "  death) /bin/sleep 0.1; exit 22 ;;\n"
+        "  timeout) exit 22 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    fake_sleep = binary_dir / "sleep"
+    fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o755)
+    paths = {name: tmp_path / name for name in ("cail", "cmdl", "qwen35", "qwen38")}
+    for path in paths.values():
+        path.mkdir()
+    for name in ("qwen35", "qwen38"):
+        (paths[name] / "config.json").write_text("{}", encoding="utf-8")
+    environment = {
+        **os.environ,
+        "PATH": f"{binary_dir}:{os.environ['PATH']}",
+        "CONDA_PREFIX": str(binary_dir.parent),
+        "MODE": "smoke",
+        "P2P_POLICY": "disable",
+        "PROGRESS": progress,
+        "TEST_HEALTH_MODE": health_mode,
+        "TEST_LAUNCH_MARKER": str(launch_marker),
+        "INFER_TIMEOUT": "0" if health_mode == "timeout" else "30",
+        "CAIL_ROOT": str(paths["cail"]),
+        "CMDL_ROOT": str(paths["cmdl"]),
+        "QWEN35_PATH": str(paths["qwen35"]),
+        "QWEN38_PATH": str(paths["qwen38"]),
+        "OUTPUT_ROOT": str(tmp_path / "outputs"),
+    }
+    if columns is not None:
+        environment["COLUMNS"] = str(columns)
+    if no_color:
+        environment["NO_COLOR"] = "1"
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT)], cwd=ROOT, env=environment,
+        capture_output=True, check=False, timeout=15,
+    )
+    return result.stderr.decode("utf-8"), result.returncode
+
+
+@pytest.mark.parametrize(
+    "health_mode,diagnostic",
+    [
+        ("timeout", "Timed out waiting for vLLM"),
+        ("death", "vLLM exited before becoming healthy"),
+    ],
+)
+def test_dynamic_wait_clears_before_failure_diagnostic(
+    tmp_path, health_mode, diagnostic
+) -> None:
+    stderr, returncode = _run_fake_vllm_wait(
+        tmp_path, health_mode=health_mode, progress="always"
+    )
+    assert returncode == 1
+    assert "\r\x1b[2K" in stderr
+    assert re.search(rf"vLLM wait failed after \d+s\n{diagnostic}", stderr)
+    assert stderr.count("vLLM wait failed after") == 1
+
+
+@pytest.mark.parametrize("columns", [18, 8, 4])
+def test_narrow_wait_keeps_each_status_within_terminal_width(tmp_path, columns) -> None:
+    stderr, returncode = _run_fake_vllm_wait(
+        tmp_path, health_mode="ready", progress="always", columns=columns
+    )
+    assert returncode == 1
+    assert "vLLM real generation probe failed" in stderr
+    wait_section = stderr.split("[phase 5/9] start vLLM\n", 1)[1].split(
+        "vLLM real generation probe failed", 1
+    )[0]
+    wait_lines = [
+        line.replace("\x1b[2K", "")
+        for line in re.split(r"[\r\n]", wait_section)
+        if line.strip("\x1b[2K")
+    ]
+    assert wait_lines
+    assert all(len(line) < columns for line in wait_lines)
+    if columns <= 8:
+        assert "\x1b[2K" not in stderr
+
+
+def test_auto_with_redirected_stderr_stays_plain(tmp_path) -> None:
+    stderr, returncode = _run_fake_vllm_wait(
+        tmp_path, health_mode="ready", progress="auto"
+    )
+    assert returncode == 1
+    assert "Waiting for vLLM (0s/30s)\n" in stderr
+    assert "\x1b[" not in stderr
+
+
+def test_no_color_preserves_forced_wait_progress(tmp_path) -> None:
+    stderr, returncode = _run_fake_vllm_wait(
+        tmp_path, health_mode="ready", progress="always", no_color=True
+    )
+    assert returncode == 1
+    assert "\r\x1b[2K" in stderr
+    assert "Waiting for vLLM" in stderr
+    assert re.search(r"\x1b\[[0-9;]*m", stderr) is None
 
 
 @pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
