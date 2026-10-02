@@ -36,6 +36,7 @@ Common overrides:
   INFER_GPU_MEMORY=0.90           vLLM --gpu-memory-utilization
   VLLM_ENFORCE_EAGER=1           Opt out of CUDA graphs (default 0)
   P2P_POLICY=auto|enable|disable  Auto enables P2P only after a positive GPU probe
+  PROGRESS=auto|always|never      Terminal progress display (default auto)
   DATA_LIMIT=N CF_LIMIT=N EVAL_LIMIT=N MAX_STEPS=N
   BOOTSTRAP_ITERATIONS=2000       Group-clustered bootstrap resamples
   CHECKPOINT_EVERY=100             Save resumable training state every N updates
@@ -87,6 +88,29 @@ MOCK_GENERATOR="${MOCK_GENERATOR:-0}"
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
 INSTALL_FLA="${INSTALL_FLA:-0}"
 BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-}"
+PROGRESS="${PROGRESS:-auto}"
+case "$PROGRESS" in
+  auto|always|never) ;;
+  *)
+    printf 'PROGRESS must be auto, always, or never; got %s.\n' "$PROGRESS" >&2
+    exit 2
+    ;;
+esac
+PHASE_TOTAL=9
+PHASE_INDEX=0
+PHASE_NAME=""
+PHASE_STARTED_AT=0
+PIPELINE_STARTED_SECONDS=$SECONDS
+WAIT_ACTIVE=0
+PROGRESS_DYNAMIC=0
+if [[ "$DRY_RUN" != "1" ]] && { [[ "$PROGRESS" == "always" ]] || { [[ "$PROGRESS" == "auto" ]] && [[ -t 2 ]]; }; }; then
+  PROGRESS_DYNAMIC=1
+fi
+PROGRESS_UNICODE=0
+progress_locale="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+case "$progress_locale" in
+  *UTF-8*|*utf-8*|*UTF8*|*utf8*) PROGRESS_UNICODE=1 ;;
+esac
 
 case "$GENERATOR_MODEL" in
   qwen38)
@@ -189,8 +213,69 @@ done
 
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
+phase_log() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "$1" >&2
+  fi
+}
+
+finish_phase() {
+  local status=$1
+  [[ -n "$PHASE_NAME" ]] || return 0
+  phase_log "[phase $PHASE_INDEX/$PHASE_TOTAL] $PHASE_NAME $status in $((SECONDS - PHASE_STARTED_AT))s"
+  PHASE_NAME=""
+}
+
 phase() {
-  printf '\n[phase] %s\n' "$1"
+  finish_phase "completed"
+  PHASE_INDEX=$((PHASE_INDEX + 1))
+  PHASE_NAME=$1
+  PHASE_STARTED_AT=$SECONDS
+  phase_log "[phase $PHASE_INDEX/$PHASE_TOTAL] $PHASE_NAME"
+}
+
+render_vllm_wait() {
+  local elapsed=$((SECONDS - WAIT_STARTED_AT))
+  local frames=('|' '/' '-' '\')
+  if [[ "$PROGRESS_UNICODE" == "1" ]]; then
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  fi
+  printf '\r\033[2K%s Waiting for vLLM (%ss/%ss)' \
+    "${frames[WAIT_FRAME_INDEX % ${#frames[@]}]}" "$elapsed" "$INFER_TIMEOUT" >&2
+  WAIT_FRAME_INDEX=$((WAIT_FRAME_INDEX + 1))
+}
+
+start_vllm_wait() {
+  WAIT_ACTIVE=1
+  WAIT_STARTED_AT=$SECONDS
+  WAIT_LAST_PLAIN_AT=$SECONDS
+  WAIT_FRAME_INDEX=0
+  if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
+    render_vllm_wait
+  else
+    printf 'Waiting for vLLM (0s/%ss)\n' "$INFER_TIMEOUT" >&2
+  fi
+}
+
+update_vllm_wait() {
+  if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
+    render_vllm_wait
+  elif (( SECONDS - WAIT_LAST_PLAIN_AT >= 30 )); then
+    printf 'Waiting for vLLM (%ss/%ss)\n' \
+      "$((SECONDS - WAIT_STARTED_AT))" "$INFER_TIMEOUT" >&2
+    WAIT_LAST_PLAIN_AT=$SECONDS
+  fi
+}
+
+finish_vllm_wait() {
+  [[ "$WAIT_ACTIVE" == "1" ]] || return 0
+  if [[ "$PROGRESS_DYNAMIC" == "1" ]]; then
+    printf '\r\033[2K' >&2
+  fi
+  printf 'vLLM wait %s after %ss\n' "$1" "$((SECONDS - WAIT_STARTED_AT))" >&2
+  WAIT_ACTIVE=0
 }
 
 print_command() {
@@ -253,6 +338,10 @@ stop_inference_server() {
 cleanup() {
   exit_status=$?
   trap - EXIT
+  if [[ "$exit_status" != "0" ]]; then
+    finish_vllm_wait "failed"
+    finish_phase "failed"
+  fi
   stop_inference_server
   if [[ "$exit_status" != "0" && "$SUMMARY_WRITTEN" == "0" ]]; then
     write_run_summary "failed" "$exit_status" || true
@@ -295,7 +384,7 @@ fi
 if [[ "$DRY_RUN" == "1" ]]; then
   print_command python -c "verify Python 3.12, torch==2.13.0 with CUDA 13.0, a CUDA kernel, and ${NUM_PROCESSES} GPUs"
 else
-  python -c 'import accelerate, bitsandbytes, httpx, numpy, peft, pynvml, safetensors, sentencepiece, tensorboard, transformers, vllm, yaml'
+  python -c 'import accelerate, bitsandbytes, httpx, numpy, peft, pynvml, rich, safetensors, sentencepiece, tensorboard, transformers, vllm, yaml'
   [[ -d "$CAIL_ROOT" ]] || { printf 'Missing CAIL_ROOT: %s\n' "$CAIL_ROOT" >&2; exit 1; }
   [[ -d "$CMDL_ROOT" ]] || { printf 'Missing CMDL_ROOT: %s\n' "$CMDL_ROOT" >&2; exit 1; }
   [[ -f "$QWEN35_PATH/config.json" ]] || { printf 'Missing Qwen3.5 config: %s/config.json\n' "$QWEN35_PATH" >&2; exit 1; }
@@ -473,7 +562,9 @@ else
   INFER_PID=$!
   INFER_PGID=$INFER_PID
   deadline=$((SECONDS + INFER_TIMEOUT))
+  start_vllm_wait
   until curl --silent --fail "http://${INFER_HOST}:${INFER_PORT}/health" >/dev/null; do
+    update_vllm_wait
     if ! kill -0 "$INFER_PID" 2>/dev/null; then
       printf 'vLLM exited before becoming healthy; see %s/logs/vllm.log\n' \
         "$OUTPUT_ROOT" >&2
@@ -485,6 +576,7 @@ else
     fi
     sleep 5
   done
+  finish_vllm_wait "ready"
   probe_vllm_service
 fi
 
@@ -654,5 +746,6 @@ for dataset in cail cmdl; do
   done
 done
 
+finish_phase "completed"
 write_run_summary "completed" 0
-printf '\n[done] Pipeline completed. Outputs: %s\n' "$OUTPUT_ROOT"
+phase_log "[done] Pipeline completed in $((SECONDS - PIPELINE_STARTED_SECONDS))s. Outputs: $OUTPUT_ROOT"

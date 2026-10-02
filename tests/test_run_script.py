@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -106,6 +107,48 @@ def test_run_script_has_valid_shell_syntax_and_help() -> None:
     assert "MODE=main|smoke|matrix" in help_result.stdout
 
 
+def test_dry_run_numbers_all_phases_without_terminal_control() -> None:
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "MODE": "smoke", "PROGRESS": "always"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    for index, name in enumerate(
+        (
+            "environment", "validate generator provenance", "audit data",
+            "build datasets", "start vLLM", "generate counterfactuals",
+            "stop vLLM", "train and export predictions", "evaluate",
+        ),
+        start=1,
+    ):
+        assert f"[phase {index}/9] {name}" in result.stdout
+        assert re.search(
+            rf"\[phase {index}/9\] {re.escape(name)} completed in \d+s",
+            result.stdout,
+        )
+    assert re.search(r"\[done\] Pipeline completed in \d+s\. Outputs: ", result.stdout)
+    assert "\x1b[" not in result.stdout + result.stderr
+    assert "\r" not in result.stdout + result.stderr
+
+
+def test_invalid_progress_mode_aborts_before_any_phase() -> None:
+    result = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "PROGRESS": "sometimes"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "PROGRESS must be auto, always, or never" in result.stderr
+    assert "[phase" not in result.stdout
+
+
 def test_run_script_dry_run_lists_gpu_phases_in_safe_order() -> None:
     result = subprocess.run(
         ["bash", str(RUN_SCRIPT), "--dry-run"],
@@ -118,13 +161,13 @@ def test_run_script_dry_run_lists_gpu_phases_in_safe_order() -> None:
     assert result.returncode == 0, result.stderr
     output = result.stdout
     phases = [
-        "[phase] environment",
-        "[phase] build datasets",
-        "[phase] start vLLM",
-        "[phase] generate counterfactuals",
-        "[phase] stop vLLM",
-        "[phase] train and export predictions",
-        "[phase] evaluate",
+        "[phase 1/9] environment",
+        "[phase 4/9] build datasets",
+        "[phase 5/9] start vLLM",
+        "[phase 6/9] generate counterfactuals",
+        "[phase 7/9] stop vLLM",
+        "[phase 8/9] train and export predictions",
+        "[phase 9/9] evaluate",
     ]
     positions = [output.index(item) for item in phases]
     assert positions == sorted(positions)
@@ -430,6 +473,7 @@ def test_failed_real_vllm_probe_aborts_before_generation(tmp_path) -> None:
     assert "[phase] generate counterfactuals" not in result.stdout
 
 
+@pytest.mark.parametrize("progress", ["never", "always"])
 @pytest.mark.parametrize(
     "policy,probe_json,disabled",
     [
@@ -446,7 +490,7 @@ def test_failed_real_vllm_probe_aborts_before_generation(tmp_path) -> None:
     ],
 )
 def test_real_server_p2p_flags_follow_policy_and_boolean_probe(
-    tmp_path, policy, probe_json, disabled
+    tmp_path, policy, probe_json, disabled, progress
 ) -> None:
     """Keep orchestration real while replacing GPU/server boundary commands."""
     conda_prefix = tmp_path / "conda"
@@ -514,6 +558,7 @@ def test_real_server_p2p_flags_follow_policy_and_boolean_probe(
             "CONDA_PREFIX": str(conda_prefix),
             "MODE": "smoke",
             "P2P_POLICY": policy,
+            "PROGRESS": progress,
             "NCCL_P2P_DISABLE": "1",
             "TEST_PROBE_JSON": probe_json,
             "TEST_LAUNCH_ARGS": str(launch_args),
@@ -530,6 +575,13 @@ def test_real_server_p2p_flags_follow_policy_and_boolean_probe(
     )
     assert result.returncode != 0
     assert "vLLM real generation probe failed" in result.stderr
+    if progress == "never":
+        assert re.search(r"(?:^|\n)Waiting for vLLM \(0s/\d+s\)\n", result.stderr)
+        assert "\r" not in result.stderr
+    else:
+        assert "Waiting for vLLM" in result.stderr
+        assert "\x1b[2K" in result.stderr
+    assert len(re.findall(r"\[phase 5/9\] start vLLM failed in \d+s", result.stderr)) == 1
     assert "[phase] generate counterfactuals" not in result.stdout
     launch = json.loads(launch_args.read_text(encoding="utf-8"))
     arguments = launch["arguments"]
