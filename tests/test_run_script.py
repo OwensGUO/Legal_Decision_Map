@@ -68,6 +68,44 @@ def test_readme_documents_progress_controls() -> None:
         assert statement in readme
 
 
+def test_repeated_smoke_training_archives_actual_previous_artifacts(tmp_path):
+    run_root = tmp_path / "cail/M/seed-42"
+    predictions = run_root / "predictions/static.jsonl"
+    predictions.parent.mkdir(parents=True)
+    predictions.write_bytes(b"previous predictions\n")
+    script = RUN_SCRIPT.read_text()
+    function = script.split("run_training() {", 1)[1].split(
+        'phase "train and export predictions"', 1
+    )[0]
+    helpers = """
+set -euo pipefail
+run_cmd() {
+  if [[ "$1" == "mv" ]]; then
+    "$@"
+  else
+    printf '%s\\n' "$@"
+  fi
+}
+model_path_for_experiment() { printf fake; }
+max_length_for_experiment() { printf 512; }
+"""
+    result = subprocess.run(
+        ["bash", "-c", helpers + "run_training() {" + function
+         + "\nrun_training cail processed view.jsonl M 42"],
+        env={**os.environ, "MODE": "smoke", "TRAINING_RUNS_ROOT": str(tmp_path),
+             "ROOT_DIR": str(ROOT), "DATA_LIMIT": "16", "MAX_STEPS": "1",
+             "GPU_IDS": "0,1,2,3", "NUM_PROCESSES": "4"},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    archives = list(run_root.parent.glob("seed-42.previous-*"))
+    assert len(archives) == 1
+    assert (archives[0] / "predictions/static.jsonl").read_bytes() == b"previous predictions\n"
+    assert not run_root.exists()
+    assert "--resume-from-checkpoint" not in result.stdout
+    assert str(run_root / "training") in result.stdout
+
+
 def test_readme_documents_smoke_training_length() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -179,6 +217,33 @@ def test_smoke_training_length_can_be_overridden() -> None:
     result = _run_dry_run(MODE="smoke", SMOKE_MAX_LENGTH="768")
 
     assert _training_lengths(result) == {"cail": "768", "cmdl": "768"}
+
+
+def test_pipeline_trains_on_current_request_views_and_limits_parent_scope(tmp_path):
+    result = _run_dry_run(MODE="smoke", OUTPUT_ROOT=str(tmp_path), SMOKE_MAX_LENGTH="512")
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line[2:]) for line in result.stdout.splitlines()
+                if line.startswith("$ ")]
+    generation = [c for c in commands if str(ROOT / "scripts/generate_counterfactuals.py") in c]
+    training = [c for c in commands if str(ROOT / "scripts/train_model.py") in c]
+    for generate, train in zip(generation, training, strict=True):
+        view = generate[generate.index("--view-output") + 1]
+        assert train[train.index("--counterfactual-data") + 1] == view
+        assert generate[generate.index("--parent-limit") + 1] == "16"
+        assert "/views/smoke/" in view
+        assert "/smoke/length-512/" in train[train.index("--output-dir") + 1]
+
+
+def test_smoke_ignores_existing_final_checkpoints(tmp_path):
+    for prefix in (tmp_path / "runs/qwen38", tmp_path / "runs/qwen38/smoke/length-512"):
+        for dataset in ("cail", "cmdl"):
+            checkpoint = prefix / dataset / "M/seed-42/training/checkpoint-final"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "training_progress.json").write_text("{}")
+    result = _run_dry_run(MODE="smoke", OUTPUT_ROOT=str(tmp_path), SMOKE_MAX_LENGTH="512")
+    assert result.returncode == 0, result.stderr
+    assert "--resume-from-checkpoint" not in result.stdout
+    assert "[info] Archived previous smoke results" in result.stdout
 
 
 def test_main_keeps_production_training_lengths() -> None:
@@ -904,7 +969,8 @@ def test_dry_run_selects_latest_available_training_checkpoint(generator) -> None
             cwd=ROOT,
             env={
                 **os.environ,
-                "MODE": "smoke",
+                "MODE": "main",
+                "EXPERIMENTS": "M",
                 "GENERATOR_MODEL": generator,
                 "OUTPUT_ROOT": str(output),
             },
@@ -929,7 +995,8 @@ def test_switching_generator_ignores_other_generator_and_legacy_checkpoints(tmp_
             cwd=ROOT,
             env={
                 **os.environ,
-                "MODE": "smoke",
+                "MODE": "main",
+                "EXPERIMENTS": "M",
                 "GENERATOR_MODEL": generator,
                 "OUTPUT_ROOT": str(tmp_path),
             },

@@ -141,12 +141,37 @@ Qwen3.8-27B BF16 vLLM 服务、断点续生成三类反事实、停止 vLLM 释�
 `B3/seed-42` 和 `M/seed-42` 模型、导出预测，并执行聚类 bootstrap 及 M 对 B3 的
 配对评测。输出统一写入 `OUTPUT_ROOT`（默认 `outputs/`）：处理数据共享
 `processed/{cail_small,cmdl_small}/`；反事实隔离为
-`counterfactuals/{qwen38,qwen36}/{cail,cmdl}.jsonl`，训练、检查点、预测和评测隔离为
+`counterfactuals/{qwen38,qwen36}/{cail,cmdl}.jsonl`（保留历史请求的主缓存）。生成完成或续用
+缓存后，脚本会原子发布 `counterfactuals/<generator>/views/<mode>/{cail,cmdl}.jsonl`，
+仅包含本次请求；训练只读取该视图，不读取整个主缓存。视图报告中的 `rows/valid/excluded`
+分别表示本次记录数、验证通过数、未选入的历史记录数。生成与训练使用相同的处理后父案件
+行数限制，避免 CMDL 多被告展开或长文本跳过造成范围不一致。重复请求记录、损坏 JSON、
+生成器/干预不一致或缺失请求会在发布前报错，不会静默筛除，也不会覆盖旧视图。
+训练、检查点、预测和评测隔离为
 `runs/{qwen38,qwen36}/{cail,cmdl}/{experiment}/seed-{seed}/`，避免跨生成器恢复或混用。
 反事实生成始终带 `--resume`。训练默认每 100 个优化器更新保存一次
-`checkpoint-step-*`；若发生中断，再次执行会从时间最新的周期或最终检查点恢复。可用
+`checkpoint-step-*`；main/matrix 若发生中断，再次执行会从时间最新的周期或最终检查点恢复。可用
 `CHECKPOINT_EVERY` 调整间隔。最终状态写入 `${OUTPUT_ROOT}/run-summary.json`，记录所选
 生成器；该根目录文件及诊断日志代表最近一次运行，按生成器隔离的结果保存在上述目录。
+
+smoke 结果单独写入 `runs/<generator>/smoke/length-<SMOKE_MAX_LENGTH>/`，每次从头训练，
+不恢复检查点。已有同一实验/种子的结果会移到带 `.previous-<时间>-<PID>` 后缀的相邻目录，
+可恢复，不删除。M 等类型化训练若过滤后没有可用反事实对，会在加载模型前明确中止。
+本次修改前的 main/matrix 检查点以主缓存文件为输入，不能直接恢复到新的视图输入；首次
+升级正式实验请使用新的 `OUTPUT_ROOT`，保留旧结果。新的检查点仍严格校验输入身份。
+
+服务器上传代码后，可在 **Bash** 中运行并保存完整日志（无需服务器安装 Git）：
+
+```bash
+set -o pipefail
+SMOKE_MAX_LENGTH=512 MODE=smoke PROGRESS=never bash run.sh \
+  2>&1 | tee smoke-view-512.log
+run_status=${PIPESTATUS[0]}
+printf 'exit_status=%s\n' "$run_status"
+```
+
+`PIPESTATUS` 必须紧接管道读取。旧主缓存无需删除；若生成器身份不一致，仍应遵循下面的
+来源保护要求使用新输出目录，不能绕过校验。
 
 持久生成器身份保存在 `counterfactuals/{qwen38,qwen36}/generator-provenance.json`，
 包含 schema 版本、生成器选择、实际 HTTP 模型名、解析后的本地 checkpoint 路径、配置版本、

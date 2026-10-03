@@ -22,6 +22,7 @@ from legal_landscape.counterfactual.provenance import (
     ensure_manifest,
     generator_identity,
 )
+from legal_landscape.counterfactual.view import publish_request_view
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 from legal_landscape.progress import create_progress_reporter
 
@@ -32,6 +33,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--input", type=Path)
     result.add_argument("--output", type=Path, default=Path("outputs/counterfactuals.jsonl"))
     result.add_argument("--limit", type=int, default=10)
+    result.add_argument(
+        "--parent-limit", type=int, help="Limit processed parent rows before filtering"
+    )
+    result.add_argument(
+        "--view-output", type=Path, help="Publish only current requests for training"
+    )
     result.add_argument("--dry-run", action="store_true")
     result.add_argument(
         "--execute", action="store_true", help="Allow calls to the configured vLLM service"
@@ -56,12 +63,15 @@ def _requests(
     boundaries: tuple[tuple[str, ...], ...],
     *,
     max_source_chars: int | None = None,
+    parent_limit: int | None = None,
 ) -> tuple[list[GenerationRequest], int]:
     """Build at most ``limit`` requests; cases longer than ``max_source_chars`` are skipped."""
     requests: list[GenerationRequest] = []
     skipped_long = 0
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+        for number, line in enumerate(handle, start=1):
+            if parent_limit is not None and number > parent_limit:
+                break
             row = json.loads(line)
             if "spec" in row:
                 requests.append(
@@ -90,6 +100,10 @@ def _requests(
 
 def main() -> int:
     args = parser().parse_args()
+    if args.limit <= 0 or (args.parent_limit is not None and args.parent_limit <= 0):
+        raise SystemExit("--limit and --parent-limit must be positive")
+    if args.view_output is not None and args.view_output.resolve() == args.output.resolve():
+        raise SystemExit("--view-output must differ from the generation cache --output")
     loaded = load_config(args.config, overrides=parse_overrides(args.set))
     config = loaded["generator"]
     boundaries = tuple(tuple(group) for group in loaded.get("charge_boundaries", ()))
@@ -132,6 +146,7 @@ def main() -> int:
         args.limit,
         boundaries,
         max_source_chars=int(max_source_chars) if max_source_chars is not None else None,
+        parent_limit=args.parent_limit,
     )
     try:
         with create_progress_reporter() as progress:
@@ -164,6 +179,15 @@ def main() -> int:
         "valid": valid,
         "transport_failures": len(result.failed),
     }
+    if args.view_output is not None and not result.failed:
+        try:
+            report["view"] = publish_request_view(
+                requests, args.output, args.view_output,
+                generator_identity=identity, prompt_version=PROMPT_VERSION,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        report["view_output"] = str(args.view_output)
     print(json.dumps(report, ensure_ascii=False))
     if result.failed:
         print(

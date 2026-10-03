@@ -74,6 +74,83 @@ def _env() -> dict[str, str]:
     return env
 
 
+def test_generation_cli_resumes_cache_but_publishes_only_current_requests(tmp_path):
+    spec = InterventionSpec(
+        "c1", "某甲", "sentence_rank", LegalFactors(restitution=False),
+        LegalFactors(restitution=True), None, -1, ("restitution",), "refund",
+    ).to_dict()
+    source = tmp_path / "input.jsonl"
+    cache = tmp_path / "cache/generated.jsonl"
+    view = tmp_path / "view/current.jsonl"
+    source.write_text("".join(json.dumps({
+        "parent_text": "某甲取得他人财物，案发后未退赃。",
+        "spec": {**spec, "parent_case_id": f"c{i}"},
+    }, ensure_ascii=False) + "\n" for i in range(13)))
+    command = [
+        sys.executable, str(ROOT / "scripts/generate_counterfactuals.py"),
+        "--input", str(source), "--output", str(cache), "--mock", "--execute", "--resume",
+    ]
+    first = subprocess.run(
+        [*command, "--limit", "13"], env=_env(), capture_output=True, text=True,
+    )
+    assert first.returncode == 0, first.stderr
+    before = cache.read_bytes()
+    second = subprocess.run(
+        [*command, "--limit", "12", "--view-output", str(view)],
+        env=_env(), capture_output=True, text=True,
+    )
+    assert second.returncode == 0, second.stderr
+    report = json.loads(second.stdout)
+    assert report["generated"] == 0
+    assert report["skipped_completed"] == 12
+    assert report["view"] == {"rows": 12, "valid": 12, "excluded": 1}
+    assert len(view.read_text().splitlines()) == 12
+    assert cache.read_bytes() == before
+
+
+def test_generation_parent_limit_counts_processed_rows_before_long_case_skips(tmp_path):
+    module = runpy.run_path(str(ROOT / "scripts/generate_counterfactuals.py"))
+    source = tmp_path / "input.jsonl"
+    source.write_text("".join(json.dumps({
+        "case_id": f"c{i}", "target_defendant": "某甲", "charges": ["盗窃"],
+        "fact_conservative": "很长的事实" * 100 if i == 0 else "某甲未退赃。",
+        "factors": LegalFactors(restitution=False).to_dict(),
+    }, ensure_ascii=False) + "\n" for i in range(3)))
+    requests, skipped = module["_requests"](
+        source, 12, (), max_source_chars=100, parent_limit=2,
+    )
+    assert skipped == 1
+    assert requests
+    assert {r.spec.parent_case_id for r in requests} == {"c1"}
+
+
+def test_generation_transport_failure_preserves_previous_request_view(tmp_path, monkeypatch):
+    from legal_landscape.counterfactual.generate import GenerationTransportError
+
+    module = runpy.run_path(str(ROOT / "scripts/generate_counterfactuals.py"))
+    source = tmp_path / "input.jsonl"
+    cache = tmp_path / "cache/generated.jsonl"
+    view = tmp_path / "current.jsonl"
+    view.write_text("previous view\n")
+    spec = InterventionSpec(
+        "c1", "某甲", "sentence_rank", LegalFactors(restitution=False),
+        LegalFactors(restitution=True), None, -1, ("restitution",), "refund",
+    )
+    source.write_text(json.dumps({"parent_text": "某甲未退赃。", "spec": spec.to_dict()}) + "\n")
+
+    def fail_generate(*args, **kwargs):
+        raise GenerationTransportError("service unavailable")
+
+    monkeypatch.setattr(module["MockGenerator"], "generate", fail_generate)
+    monkeypatch.setattr(sys, "argv", [
+        "generate_counterfactuals.py", "--mock", "--execute", "--resume",
+        "--input", str(source), "--output", str(cache), "--view-output", str(view),
+    ])
+    assert module["main"]() == 1
+    assert view.read_text() == "previous view\n"
+    assert cache.read_bytes() == b""
+
+
 def test_all_cli_help_paths() -> None:
     for name in SCRIPTS:
         result = subprocess.run(

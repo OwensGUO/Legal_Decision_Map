@@ -531,6 +531,12 @@ CMDL_PROCESSED="$OUTPUT_ROOT/processed/cmdl_small"
 CAIL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cail.jsonl"
 CMDL_CF="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/cmdl.jsonl"
 RUNS_ROOT="$OUTPUT_ROOT/runs/$GENERATOR_MODEL"
+TRAINING_RUNS_ROOT="$RUNS_ROOT"
+if [[ "$MODE" == "smoke" ]]; then
+  TRAINING_RUNS_ROOT="$RUNS_ROOT/smoke/length-$SMOKE_MAX_LENGTH"
+fi
+CAIL_CF_VIEW="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/views/$MODE/cail.jsonl"
+CMDL_CF_VIEW="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/views/$MODE/cmdl.jsonl"
 PROVENANCE_MANIFEST="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/generator-provenance.json"
 generator_overrides=(
   --set "generator.selector=$GENERATOR_MODEL"
@@ -680,11 +686,13 @@ phase "generate counterfactuals"
 generate_counterfactuals() {
   local input_path=$1
   local output_path=$2
+  local view_path=$3
   local command=(
     python "$ROOT_DIR/scripts/generate_counterfactuals.py"
     --config "$GENERATOR_CONFIG"
     --input "$input_path" --output "$output_path"
     --limit "$CF_LIMIT" --resume --execute
+    --parent-limit "$DATA_LIMIT" --view-output "$view_path"
     --provenance-manifest "$PROVENANCE_MANIFEST" --artifact-root "$RUNS_ROOT"
     "${generator_overrides[@]}"
     --set "generator.endpoint=http://${INFER_HOST}:${INFER_PORT}/v1/chat/completions"
@@ -694,8 +702,8 @@ generate_counterfactuals() {
   fi
   run_cmd "${command[@]}"
 }
-generate_counterfactuals "$CAIL_PROCESSED/train.jsonl" "$CAIL_CF"
-generate_counterfactuals "$CMDL_PROCESSED/train.jsonl" "$CMDL_CF"
+generate_counterfactuals "$CAIL_PROCESSED/train.jsonl" "$CAIL_CF" "$CAIL_CF_VIEW"
+generate_counterfactuals "$CMDL_PROCESSED/train.jsonl" "$CMDL_CF" "$CMDL_CF_VIEW"
 
 phase "stop vLLM"
 stop_inference_server
@@ -733,7 +741,12 @@ run_training() {
   local counterfactual=$3
   local experiment=$4
   local seed=$5
-  local run_root="$RUNS_ROOT/$dataset/$experiment/seed-$seed"
+  local run_root="$TRAINING_RUNS_ROOT/$dataset/$experiment/seed-$seed"
+  if [[ "$MODE" == "smoke" && -e "$run_root" ]]; then
+    local previous_run="${run_root}.previous-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    run_cmd mv "$run_root" "$previous_run"
+    printf '[info] Archived previous smoke results: %s\n' "$previous_run"
+  fi
   local training_root="$run_root/training"
   local prediction_root="$run_root/predictions"
   local selected_model
@@ -763,6 +776,7 @@ run_training() {
   )
   local checkpoint_candidate
   for checkpoint_candidate in "${checkpoint_candidates[@]}"; do
+    [[ "$MODE" != "smoke" ]] || break
     if [[ -f "$checkpoint_candidate/training_progress.json" ]] \
       && { [[ -z "$resume_checkpoint" ]] || [[ "$checkpoint_candidate" -nt "$resume_checkpoint" ]]; }; then
       resume_checkpoint="$checkpoint_candidate"
@@ -784,10 +798,10 @@ run_cmd "${provenance_command[@]}"
 for dataset in cail cmdl; do
   if [[ "$dataset" == "cail" ]]; then
     processed=$CAIL_PROCESSED
-    counterfactual=$CAIL_CF
+    counterfactual=$CAIL_CF_VIEW
   else
     processed=$CMDL_PROCESSED
-    counterfactual=$CMDL_CF
+    counterfactual=$CMDL_CF_VIEW
   fi
   for experiment in "${experiment_list[@]}"; do
     for seed in "${seed_list[@]}"; do
@@ -800,13 +814,13 @@ phase "evaluate"
 for dataset in cail cmdl; do
   for experiment in "${experiment_list[@]}"; do
     for seed in "${seed_list[@]}"; do
-      run_root="$RUNS_ROOT/$dataset/$experiment/seed-$seed"
+      run_root="$TRAINING_RUNS_ROOT/$dataset/$experiment/seed-$seed"
       static_predictions="$run_root/predictions/static.jsonl"
       counterfactual_predictions="$run_root/predictions/counterfactual.jsonl"
       static_reference=""
       counterfactual_reference=""
       if [[ "$experiment" != "B3" && "$has_b3" == "1" ]]; then
-        b3_root="$RUNS_ROOT/$dataset/B3/seed-$seed/predictions"
+        b3_root="$TRAINING_RUNS_ROOT/$dataset/B3/seed-$seed/predictions"
         if [[ "$DRY_RUN" == "1" || -s "$b3_root/static.jsonl" ]]; then
           static_reference="$b3_root/static.jsonl"
         fi

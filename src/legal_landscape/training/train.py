@@ -927,6 +927,12 @@ def run_real_training(
         if experiment.use_rank:
             allowed_pair_types.add("sentence_rank")
     pairs = [pair for pair in pairs if pair["intervention_type"] in allowed_pair_types]
+    if experiment.typed_counterfactuals and not pairs:
+        raise ValueError(
+            f"{experiment.name} requires at least one eligible counterfactual pair; "
+            "check the current request view, validation results, target charges, "
+            f"and allowed intervention types {sorted(allowed_pair_types)}"
+        )
 
     model_config = dict(config["model"])
     model_config["gradient_checkpointing"] = config.get("training", {}).get(

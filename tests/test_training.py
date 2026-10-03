@@ -826,7 +826,9 @@ def training_progress_runtime(monkeypatch, tmp_path):
         "torch.utils.tensorboard": SimpleNamespace(SummaryWriter=Writer),
         "transformers": SimpleNamespace(
             AutoTokenizer=SimpleNamespace(
-                from_pretrained=lambda *args, **kwargs: SimpleNamespace(pad_token_id=0)
+                from_pretrained=lambda *args, **kwargs: (
+                    events.append("tokenizer") or SimpleNamespace(pad_token_id=0)
+                )
             )
         ),
         "legal_landscape.models.losses": SimpleNamespace(compute_typed_losses=compute_losses),
@@ -844,6 +846,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
         experiment_name="B3",
         gradient_accumulation_steps=2,
         pair_type="invariant",
+        pair_valid=True,
         remote_parent_requirements=(0, 0),
     ):
         class Accelerator:
@@ -926,7 +929,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
                     "target_charge": "盗窃" if pair_type == "charge_flip" else None,
                     "rank_direction": 1 if pair_type == "sentence_rank" else None,
                     "validation": {
-                        "valid": True,
+                        "valid": pair_valid,
                         "parsed": {"counterfactual_text": "改写事实"},
                     },
                 }
@@ -972,6 +975,19 @@ def training_progress_runtime(monkeypatch, tmp_path):
         return result, reporter, enabled_values
 
     return run, events, tmp_path
+
+
+@pytest.mark.parametrize("options", [
+    {"pair_valid": False},
+    {"experiment_name": "A1", "pair_type": "invariant"},
+])
+def test_typed_training_rejects_zero_eligible_pairs(training_progress_runtime, options):
+    run, events, _root = training_progress_runtime
+    with pytest.raises(ValueError, match="requires at least one eligible counterfactual pair"):
+        run(**{"experiment_name": "M", **options})
+    assert "train" not in events
+    assert "tokenizer" not in events
+    assert not any(isinstance(event, tuple) and event[0] == "predictor" for event in events)
 
 
 def test_training_progress_factory_tracks_real_loop_optimizer_steps(training_progress_runtime):
