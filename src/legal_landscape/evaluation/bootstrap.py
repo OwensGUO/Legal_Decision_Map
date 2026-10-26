@@ -163,6 +163,104 @@ def paired_cluster_test(
     }
 
 
+def _group_count_replicates(groups: int, iterations: int, seed: int):
+    """Per-group multiplicities; draws match ``generator.choice(keys, ...)`` over the same keys."""
+    generator = np.random.default_rng(seed)
+    for _ in range(iterations):
+        selected = generator.choice(groups, size=groups, replace=True)
+        yield np.bincount(selected, minlength=groups).astype(float)
+
+
+def fast_bootstrap_metric_set(
+    prepared: Any,
+    names: tuple[str, ...],
+    *,
+    iterations: int = 2000,
+    seed: int = 42,
+    progress: ProgressReporter | None = None,
+) -> dict[str, dict[str, float | int]]:
+    """``bootstrap_metric_set`` over a prepared metric object, resampling by group weights."""
+    if iterations <= 0:
+        raise ValueError("iterations must be positive")
+    if not names:
+        raise ValueError("at least one metric name is required")
+    estimates = prepared.metrics(None)
+    missing = [name for name in names if name not in estimates]
+    if missing:
+        raise KeyError(f"metric function did not return: {', '.join(missing)}")
+    groups = len(prepared.group_keys)
+    samples = {name: np.empty(iterations, dtype=float) for name in names}
+    reporter = progress or NullProgressReporter()
+    with reporter.task("Bootstrap confidence intervals", total=iterations, groups=groups) as task:
+        for index, counts in enumerate(_group_count_replicates(groups, iterations, seed)):
+            values = prepared.metrics(counts)
+            for name in names:
+                samples[name][index] = float(values[name])
+            task.advance()
+    result: dict[str, dict[str, float | int]] = {}
+    for name in names:
+        lower, upper = _interval(samples[name])
+        result[name] = {
+            "estimate": float(estimates[name]),
+            "lower": lower,
+            "upper": upper,
+            "iterations": iterations,
+            "groups": groups,
+        }
+    return result
+
+
+def fast_paired_test(
+    candidate: Any,
+    reference: Any,
+    names: tuple[str, ...],
+    *,
+    iterations: int = 2000,
+    seed: int = 42,
+    progress: ProgressReporter | None = None,
+    description: str = "Paired bootstrap",
+) -> dict[str, dict[str, float | int]]:
+    """``paired_cluster_test`` for several endpoints from one shared resampling sequence."""
+    if iterations <= 0:
+        raise ValueError("iterations must be positive")
+    if set(candidate.group_keys) != set(reference.group_keys):
+        raise ValueError("paired comparison requires identical group IDs")
+    keys = tuple(sorted(candidate.group_keys))
+    position = {key: index for index, key in enumerate(keys)}
+    candidate_order = np.asarray([position[key] for key in candidate.group_keys])
+    reference_order = np.asarray([position[key] for key in reference.group_keys])
+    differences = {name: np.empty(iterations, dtype=float) for name in names}
+    reporter = progress or NullProgressReporter()
+    with reporter.task(description, total=iterations, groups=len(keys)) as task:
+        for index, counts in enumerate(_group_count_replicates(len(keys), iterations, seed)):
+            first = candidate.metrics(counts[candidate_order])
+            second = reference.metrics(counts[reference_order])
+            for name in names:
+                differences[name][index] = float(first[name]) - float(second[name])
+            task.advance()
+    full_candidate, full_reference = candidate.metrics(None), reference.metrics(None)
+    result: dict[str, dict[str, float | int]] = {}
+    for name in names:
+        values = differences[name]
+        finite = values[np.isfinite(values)]
+        if not finite.size:
+            p_value = float("nan")
+        else:
+            lower_tail = (float(np.count_nonzero(finite <= 0.0)) + 1.0) / (len(finite) + 1.0)
+            upper_tail = (float(np.count_nonzero(finite >= 0.0)) + 1.0) / (len(finite) + 1.0)
+            p_value = min(1.0, 2.0 * min(lower_tail, upper_tail))
+        lower, upper = _interval(values)
+        result[name] = {
+            "difference": float(full_candidate[name]) - float(full_reference[name]),
+            "lower": lower,
+            "upper": upper,
+            "p_value": p_value,
+            "iterations": iterations,
+            "groups": len(keys),
+        }
+    return result
+
+
 def holm_adjust(p_values: dict[str, float]) -> dict[str, float]:
     """Return Holm step-down adjusted p-values keyed like the input."""
     ordered = sorted(p_values.items(), key=lambda item: item[1])

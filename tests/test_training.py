@@ -15,8 +15,10 @@ except ImportError:
 from legal_landscape.training.train import (
     DeterministicEpochSampler,
     build_experiment,
+    extract_text_backbone,
     format_model_input,
     inspect_model_config,
+    load_backbone,
     load_counterfactual_pairs,
     make_counterfactual_prediction_rows,
     make_static_prediction_rows,
@@ -698,7 +700,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
 
     class Optimizer:
         def __init__(self, *args, **kwargs):
-            pass
+            self.param_groups = [{"lr": kwargs.get("lr")}]
 
         def step(self):
             events.append("optimizer")
@@ -720,6 +722,10 @@ def training_progress_runtime(monkeypatch, tmp_path):
         {
             "case_id": f"c{i}",
             "group_id": f"g{i}",
+            "dataset": "cail",
+            "target_defendant": "某甲",
+            "fact_strict": "案件事实",
+            "factors": {},
             "charges": ["盗窃"],
             "conviction_articles": ["criminal_law:264"],
             "penalty_type": "fixed_term",
@@ -727,23 +733,34 @@ def training_progress_runtime(monkeypatch, tmp_path):
         }
         for i in range(4)
     ]
+    evaluation_records = [
+        {**row, "case_id": f"e{i}", "group_id": f"eg{i}"} for i, row in enumerate(records[:2])
+    ]
     train_path = tmp_path / "train.jsonl"
     train_path.write_text("".join(json.dumps(row) + "\n" for row in records))
     evaluation_path = tmp_path / "evaluation.jsonl"
-    evaluation_path.write_text("".join(json.dumps(row) + "\n" for row in records[:2]))
+    evaluation_path.write_text("".join(json.dumps(row) + "\n" for row in evaluation_records))
+    validation_path = tmp_path / "validation.jsonl"
+    validation_path.write_text("".join(
+        json.dumps({**row, "case_id": f"v{i}", "group_id": f"vg{i}"}) + "\n"
+        for i, row in enumerate(records[:2])
+    ))
     pairs_path = tmp_path / "pairs.jsonl"
-    pairs_path.write_text(
-        "".join(
-            json.dumps(
-                {
-                    "parent_case_id": row["case_id"],
-                    "intervention_type": "invariant",
-                    "validation": {"valid": True, "parsed": {"counterfactual_text": "改写事实"}},
-                }
-            )
-            + "\n"
-            for row in records[:2]
-        )
+    heldout_pairs_path = tmp_path / "heldout_pairs.jsonl"
+
+    def pair_row(parent_id, pair_type="invariant", valid=True):
+        return {
+            "parent_case_id": parent_id,
+            "intervention_type": pair_type,
+            "target_charge": "盗窃" if pair_type == "charge_flip" else None,
+            "rank_direction": 1 if pair_type == "sentence_rank" else None,
+            "target_factors": {},
+            "validation": {"valid": valid, "errors": []},
+            "counterfactual_strict": "改写事实",
+        }
+
+    heldout_pairs_path.write_text(
+        "".join(json.dumps(pair_row(row["case_id"])) + "\n" for row in evaluation_records)
     )
     (tmp_path / "metadata.json").write_text(
         json.dumps(
@@ -848,11 +865,16 @@ def training_progress_runtime(monkeypatch, tmp_path):
         pair_type="invariant",
         pair_valid=True,
         remote_parent_requirements=(0, 0),
+        heldout=True,
+        evaluation_override=None,
+        validation=False,
+        training_overrides=None,
     ):
         class Accelerator:
             def __init__(self, **kwargs):
                 self.is_main_process = is_main
-                self.num_processes = 2
+                self.num_processes = 1
+                self.process_index = 0
                 self.sync_gradients = False
                 self.microbatches = 0
                 self.gradient_accumulation_steps = kwargs["gradient_accumulation_steps"]
@@ -912,7 +934,20 @@ def training_progress_runtime(monkeypatch, tmp_path):
                 values[-1].absorbed = True
                 return values
 
+        def gather_object(values):
+            events.append("gather")
+            if fail_gather:
+                raise RuntimeError("gather failed")
+            return list(values)
+
         monkeypatch.setitem(sys.modules, "accelerate", SimpleNamespace(Accelerator=Accelerator))
+        monkeypatch.setitem(
+            sys.modules,
+            "accelerate.utils",
+            SimpleNamespace(
+                gather_object=gather_object, broadcast_object_list=lambda values: values
+            ),
+        )
         reporter = RecordingProgress(events)
         enabled_values = []
 
@@ -920,21 +955,12 @@ def training_progress_runtime(monkeypatch, tmp_path):
             enabled_values.append(enabled)
             return reporter if enabled else NullProgressReporter()
 
-        pair_rows = []
-        for row in records[:2]:
-            pair_rows.append(
-                {
-                    "parent_case_id": row["case_id"],
-                    "intervention_type": pair_type,
-                    "target_charge": "盗窃" if pair_type == "charge_flip" else None,
-                    "rank_direction": 1 if pair_type == "sentence_rank" else None,
-                    "validation": {
-                        "valid": pair_valid,
-                        "parsed": {"counterfactual_text": "改写事实"},
-                    },
-                }
+        pairs_path.write_text(
+            "".join(
+                json.dumps(pair_row(row["case_id"], pair_type, pair_valid)) + "\n"
+                for row in records[:2]
             )
-        pairs_path.write_text("".join(json.dumps(row) + "\n" for row in pair_rows))
+        )
         resume = None
         if restored_step:
             resume = tmp_path / "resume"
@@ -949,7 +975,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
                             "train": train._file_identity(train_path),
                             "counterfactual": train._file_identity(pairs_path),
                         },
-                        "case_sampler": {"epoch": 0, "start_index": 0, "seed": 42},
+                        "case_sampler": {"epoch": 0, "start_batch": 0, "seed": 42},
                         "pair_sampler": None,
                     }
                 )
@@ -962,13 +988,16 @@ def training_progress_runtime(monkeypatch, tmp_path):
                     "epochs": 1,
                     "gradient_accumulation_steps": gradient_accumulation_steps,
                     "checkpoint_every": 1,
+                    **(training_overrides or {}),
                 },
             },
             train_data=train_path,
             output_dir=tmp_path / "output",
             experiment_name=experiment_name,
             counterfactual_data=pairs_path,
-            evaluation_data=evaluation_path,
+            evaluation_data=evaluation_override or evaluation_path,
+            evaluation_counterfactual_data=heldout_pairs_path if heldout else None,
+            validation_data=validation_path if validation else None,
             resume_from_checkpoint=resume,
             progress_factory=factory,
         )
@@ -1047,6 +1076,7 @@ def test_m_staged_backward_uses_two_backwards_and_one_optimizer_call(
         "response": 0.0,
         "factor": 0.125,
         "total": 0.75,
+        "learning_rate": 0.0002,
     }
 
 
@@ -1194,7 +1224,7 @@ def test_prediction_progress_batches_have_independent_kind_and_counts():
     ]
 
 
-def test_prediction_progress_advances_after_gather_and_absorption(training_progress_runtime):
+def test_prediction_advances_per_batch_and_gathers_once_per_kind(training_progress_runtime):
     run, events, root = training_progress_runtime
     result, reporter, _enabled = run()
     predictions = [task for task in reporter.tasks if "kind" in task]
@@ -1204,9 +1234,9 @@ def test_prediction_progress_advances_after_gather_and_absorption(training_progr
     transitions = [
         "advance" if isinstance(event, tuple) else event
         for event in events
-        if event in ("gather", "absorb") or (isinstance(event, tuple) and event[0] == "advance")
+        if event == "gather" or (isinstance(event, tuple) and event[0] == "advance")
     ]
-    assert transitions == ["gather", "absorb", "advance"] * 4
+    assert transitions == ["advance", "advance", "gather"] * 2
     static_rows = [
         json.loads(row)
         for row in (root / "output/predictions/static.jsonl").read_text().splitlines()
@@ -1215,8 +1245,8 @@ def test_prediction_progress_advances_after_gather_and_absorption(training_progr
         json.loads(row)
         for row in (root / "output/predictions/counterfactual.jsonl").read_text().splitlines()
     ]
-    assert [row["case_id"] for row in static_rows] == ["c0", "c1"]
-    assert [row["case_id"] for row in pair_rows] == ["c0", "c1"]
+    assert [row["case_id"] for row in static_rows] == ["e0", "e1"]
+    assert [row["case_id"] for row in pair_rows] == ["e0", "e1"]
     assert "static_predictions" in result and "counterfactual_predictions" in result
     assert events.index("task:exit:Predict static") < events.index(
         "task:enter:Predict counterfactual"
@@ -1224,13 +1254,214 @@ def test_prediction_progress_advances_after_gather_and_absorption(training_progr
     assert events[-1] == "reporter:exit"
 
 
-def test_prediction_progress_failed_gather_does_not_advance_and_closes(training_progress_runtime):
+def test_pair_every_runs_counterfactual_steps_on_a_fixed_microbatch_schedule(
+    training_progress_runtime,
+):
     run, events, _root = training_progress_runtime
+    run(experiment_name="M", max_steps=2, gradient_accumulation_steps=2,
+        training_overrides={"pair_every": 2})
+    assert sum(event == ("backward", 0.25) for event in events) == 2
+    assert sum(event == ("backward", 0.5) for event in events) == 4
+
+
+def test_learning_rate_warmup_and_cosine_decay_are_logged(training_progress_runtime):
+    run, _events, root = training_progress_runtime
+    run(max_steps=4, gradient_accumulation_steps=1,
+        training_overrides={"warmup_ratio": 0.5, "min_learning_rate_ratio": 0.1})
+    logs = [json.loads(line) for line in (root / "output/train.jsonl").read_text().splitlines()]
+    rates = [round(item["learning_rate"], 8) for item in logs if "learning_rate" in item]
+    assert rates == [0.0001, 0.0002, 0.0002, 0.00011]
+
+
+def test_validation_selects_best_checkpoint_tunes_thresholds_and_prunes(
+    training_progress_runtime,
+):
+    run, events, root = training_progress_runtime
+    result, _reporter, _enabled = run(max_steps=2, validation=True)
+    output = root / "output"
+    scored = sorted(output.glob("checkpoint-*/training_progress.json"))
+    assert scored
+    assert all("validation_score" in json.loads(path.read_text()) for path in scored)
+    # The fake model scores every checkpoint equally, so the final checkpoint wins the tie and
+    # the superseded periodic checkpoint is pruned.
+    assert list(output.glob("checkpoint-step-*")) == []
+    thresholds = json.loads((output / "predictions/thresholds.json").read_text())
+    assert set(thresholds) >= {"charge", "article", "selected_checkpoint"}
+    assert result["thresholds"]["charge"] == thresholds["charge"]
+    assert result["selected_checkpoint"].endswith("checkpoint-final")
+    assert "restore" not in events
+    logs = (output / "train.jsonl").read_text()
+    assert "validation_score" in logs
+
+
+def test_counterfactual_metrics_never_use_training_pairs(training_progress_runtime):
+    run, _events, root = training_progress_runtime
+    result, _reporter, _enabled = run(experiment_name="M", heldout=False)
+    assert result["counterfactual_pairs"] == 2
+    assert result["evaluation_counterfactual_pairs"] == 0
+    assert "counterfactual_predictions" not in result
+    assert not (root / "output/predictions/counterfactual.jsonl").exists()
+
+
+def test_training_rejects_groups_shared_with_evaluation_data(training_progress_runtime):
+    run, events, root = training_progress_runtime
+    overlapping = root / "overlapping.jsonl"
+    overlapping.write_text(
+        json.dumps({
+            "case_id": "e9", "group_id": "g0", "charges": ["盗窃"],
+            "conviction_articles": [], "penalty_type": "fixed_term", "imprisonment_months": 6,
+        }) + "\n"
+    )
+    with pytest.raises(ValueError, match="share group_id"):
+        run(evaluation_override=overlapping)
+    assert "tokenizer" not in events
+
+
+def test_failed_prediction_gather_writes_nothing_and_closes(training_progress_runtime):
+    run, events, root = training_progress_runtime
     with pytest.raises(RuntimeError, match="gather failed"):
         run(fail_gather=True)
-    assert not any(isinstance(event, tuple) and event[0] == "advance" for event in events)
     assert "task:exit:Predict static" in events
+    assert not (root / "output/predictions/static.jsonl").exists()
     assert events[-1] == "reporter:exit"
+
+
+@pytest.mark.parametrize("architecture", ["multimodal", "causal", "base"])
+def test_text_backbone_keeps_quantization_identity(tmp_path, architecture):
+    text_model = SimpleNamespace()
+    if architecture == "multimodal":
+        config = {
+            "architectures": ["Qwen3_5ForConditionalGeneration"], "vision_config": {},
+        }
+        outer = SimpleNamespace(model=SimpleNamespace(language_model=text_model))
+    elif architecture == "causal":
+        config = {"architectures": ["QwenForCausalLM"]}
+        outer = SimpleNamespace(model=text_model)
+    else:
+        config = {"architectures": ["BertModel"]}
+        outer = text_model
+    outer.is_loaded_in_4bit = True
+    outer.is_loaded_in_8bit = False
+    outer.is_quantized = True
+    outer.quantization_method = "bitsandbytes"
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    result = extract_text_backbone(outer, inspect_model_config(tmp_path))
+
+    assert result is text_model
+    assert result.is_loaded_in_4bit is True
+    assert result.is_loaded_in_8bit is False
+    assert result.is_quantized is True
+    assert result.quantization_method == "bitsandbytes"
+
+
+@pytest.mark.parametrize(("checkpointing", "ignore_checkpointing"), [
+    (True, False), (False, False), (True, True),
+])
+def test_qlora_preparation_receives_quantized_text_model(
+    tmp_path, monkeypatch, checkpointing, ignore_checkpointing,
+):
+    import sys
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "architectures": ["Qwen3_5ForConditionalGeneration"], "vision_config": {},
+    }))
+    text_model = SimpleNamespace()
+    outer = SimpleNamespace(
+        model=SimpleNamespace(language_model=text_model), config=SimpleNamespace(use_cache=True),
+        is_loaded_in_4bit=True, is_loaded_in_8bit=False,
+        named_parameters=lambda: [],
+    )
+    prepared = []
+
+    def prepare(model, **kwargs):
+        prepared.append((getattr(model, "is_loaded_in_4bit", False), kwargs))
+        # PEFT only enables checkpointing on models carrying a quantization flag.
+        model.is_gradient_checkpointing = bool(
+            getattr(model, "is_loaded_in_4bit", False)
+            and kwargs["use_gradient_checkpointing"] and not ignore_checkpointing
+        )
+        return model
+
+    loader = SimpleNamespace(from_pretrained=lambda *args, **kwargs: outer)
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoModel=loader, AutoModelForCausalLM=loader, AutoModelForImageTextToText=loader,
+        BitsAndBytesConfig=lambda **kwargs: kwargs,
+    ))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        bfloat16="bfloat16", cuda=SimpleNamespace(is_available=lambda: False),
+    ))
+    monkeypatch.setitem(sys.modules, "peft", SimpleNamespace(
+        LoraConfig=lambda **kwargs: kwargs, prepare_model_for_kbit_training=prepare,
+        get_peft_model=lambda model, config: model,
+    ))
+
+    config = {
+        "path": str(tmp_path), "quantization": "nf4", "gradient_checkpointing": checkpointing,
+    }
+    if ignore_checkpointing:
+        with pytest.raises(RuntimeError, match="gradient checkpointing.*not enabled"):
+            load_backbone(config)
+        return
+    model, _inspected = load_backbone(config)
+
+    assert prepared == [(True, {
+        "use_gradient_checkpointing": checkpointing,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+    })]
+    assert model is text_model
+    assert model.is_gradient_checkpointing is checkpointing
+    assert outer.config.use_cache is False
+
+
+def test_resume_mismatch_reports_changed_input_and_recovery():
+    progress = {
+        "seed": 42,
+        "input_identity": {
+            "train": {"path": "/data/train.jsonl", "bytes": 10, "sha256": "same"},
+            "counterfactual": {"path": "/data/cache.jsonl", "bytes": 20, "sha256": "old"},
+        },
+    }
+    expected = {
+        "train": dict(progress["input_identity"]["train"]),
+        "counterfactual": {"path": "/data/views/main.jsonl", "bytes": 12, "sha256": "new"},
+    }
+    with pytest.raises(ValueError) as error:
+        validate_resume_metadata(progress, expected_seed=42, expected_input_identity=expected)
+    message = str(error.value)
+    assert "counterfactual" in message
+    assert "/data/cache.jsonl" in message and "/data/views/main.jsonl" in message
+    assert "old" in message and "new" in message
+    assert "RESUME_TRAINING=0" in message
+
+
+def test_resume_mismatch_fails_before_loading_training_dependencies(tmp_path, monkeypatch):
+    import builtins
+
+    from legal_landscape.training.train import run_real_training
+
+    train_path = tmp_path / "train.jsonl"
+    train_path.write_text("changed training input\n")
+    checkpoint = tmp_path / "checkpoint-final"
+    checkpoint.mkdir()
+    (checkpoint / "training_progress.json").write_text(json.dumps({
+        "seed": 42,
+        "input_identity": {"train": {"path": str(train_path), "bytes": 1, "sha256": "old"}},
+    }))
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name in {"torch", "accelerate", "transformers"}:
+            raise AssertionError("loaded training dependencies before resume validation")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(ValueError, match="checkpoint input identity"):
+        run_real_training(
+            {}, train_data=train_path, output_dir=tmp_path / "output",
+            experiment_name="B3", resume_from_checkpoint=checkpoint,
+        )
+    assert not (tmp_path / "output").exists()
 
 
 class TrainingPlanTests(unittest.TestCase):
@@ -1365,24 +1596,95 @@ class TrainingPlanTests(unittest.TestCase):
         valid = {
             "parent_case_id": "c1",
             "intervention_type": "invariant",
-            "validation": {"valid": True, "parsed": {"counterfactual_text": "反事实"}},
+            "validation": {
+                "valid": True, "errors": [], "parsed": {"counterfactual_text": "原始反事实"}
+            },
+            "counterfactual_strict": "反事实",
+            "target_factors": {"amount": 1010.0},
             "target_charge": None,
             "rank_direction": None,
         }
         invalid = {
             **valid,
-            "validation": {"valid": False, "parsed": {"counterfactual_text": "坏样本"}},
+            "validation": {"valid": False, "errors": ["excessive_rewrite"]},
+            "counterfactual_strict": "坏样本",
+        }
+        leaked = {
+            **valid,
+            "validation": {"valid": False, "errors": ["label_leakage"]},
+            "leakage": True,
+            "counterfactual_strict": "泄露样本",
         }
         with TemporaryDirectory() as directory:
             path = Path(directory) / "cf.jsonl"
             path.write_text(
-                "\n".join(json.dumps(x, ensure_ascii=False) for x in (valid, invalid)),
+                "\n".join(json.dumps(x, ensure_ascii=False) for x in (valid, invalid, leaked)),
                 encoding="utf-8",
             )
             pairs = load_counterfactual_pairs(path, {"c1": parent}, filter_valid=True)
+            unfiltered = load_counterfactual_pairs(path, {"c1": parent}, filter_valid=False)
+            with self.assertRaisesRegex(ValueError, "not among the supplied parent records"):
+                load_counterfactual_pairs(path, {}, filter_valid=True)
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0]["parent_text"], "父事实")
         self.assertEqual(pairs[0]["counterfactual_text"], "反事实")
+        self.assertEqual(pairs[0]["counterfactual_factors"], {"amount": 1010.0})
+        self.assertEqual(
+            [pair["counterfactual_text"] for pair in unfiltered], ["反事实", "坏样本"]
+        )
+
+    def test_augmentation_records_use_counterfactual_text_factors_and_mask_penalty(self) -> None:
+        from legal_landscape.training.train import augmentation_records
+
+        parent = {
+            "case_id": "c1", "fact_strict": "父事实", "factors": {"conduct": "秘密窃取"},
+            "charges": ["盗窃"], "conviction_articles": ["criminal_law:264"],
+            "penalty_type": "fixed_term", "imprisonment_months": 12,
+        }
+        flip, rank = augmentation_records([
+            {
+                "parent_record": parent, "counterfactual_text": "反事实一",
+                "counterfactual_factors": {"conduct": "虚构事实使被害人自愿交付"},
+                "intervention_type": "charge_flip", "target_charge": "诈骗",
+            },
+            {
+                "parent_record": parent, "counterfactual_text": "反事实二",
+                "counterfactual_factors": {"restitution": True},
+                "intervention_type": "sentence_rank", "target_charge": None,
+            },
+        ])
+        self.assertEqual(flip["fact_strict"], "反事实一")
+        self.assertEqual(flip["charges"], ["诈骗"])
+        self.assertEqual(flip["conviction_articles"], [])
+        self.assertEqual(flip["factors"], {"conduct": "虚构事实使被害人自愿交付"})
+        self.assertTrue(flip["mask_penalty"])
+        self.assertIsNone(flip["imprisonment_months"])
+        self.assertEqual(rank["charges"], ["盗窃"])
+        self.assertTrue(rank["mask_penalty"])
+        self.assertEqual(parent["fact_strict"], "父事实")
+
+    def test_static_prediction_rows_report_labels_unseen_in_training(self) -> None:
+        record = {
+            "case_id": "c1", "group_id": "g1", "charges": ["盗窃", "非法经营"],
+            "conviction_articles": ["criminal_law:225"], "penalty_type": "fixed_term",
+            "imprisonment_months": 12,
+        }
+        [row] = make_static_prediction_rows(
+            [record],
+            charge_probabilities=[[0.8]],
+            article_probabilities=[[0.8]],
+            penalty_indices=[0],
+            sentence_months=[12.0],
+            charge_vocabulary=["盗窃"],
+            article_vocabulary=["criminal_law:264"],
+            penalty_vocabulary=["fixed_term"],
+        )
+        self.assertEqual(row["true_charges"], [1])
+        self.assertEqual(row["unseen_true_charge_labels"], ["非法经营"])
+        self.assertEqual(row["true_articles"], [0])
+        self.assertEqual(row["unseen_true_article_labels"], ["criminal_law:225"])
+        self.assertFalse(row["correct"])
+        self.assertFalse(row["article_correct"])
 
     def test_static_prediction_rows_preserve_labels_and_group_ids(self) -> None:
         records = [

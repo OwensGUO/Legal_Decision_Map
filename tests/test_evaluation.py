@@ -79,13 +79,18 @@ def test_counterfactual_metrics_are_type_specific() -> None:
         {
             "intervention_type": "charge_flip",
             "target_charge": 1,
+            "parent_charge_indices": [0],
             "parent_charge_probabilities": [0.9, 0.1],
             "counterfactual_charge_probabilities": [0.2, 0.8],
+            "parent_sentence": 12.0,
+            "counterfactual_sentence": 12.0,
         },
         {
             "intervention_type": "invariant",
             "parent_charge_probabilities": [0.8, 0.2],
             "counterfactual_charge_probabilities": [0.7, 0.3],
+            "parent_sentence": 12.0,
+            "counterfactual_sentence": 12.0,
         },
         {
             "intervention_type": "sentence_rank",
@@ -99,7 +104,7 @@ def test_counterfactual_metrics_are_type_specific() -> None:
     assert result["invariant_violation_rate"] == 0.0
     assert result["sentence_pairwise_accuracy"] == 1.0
     assert result["monotonicity_violation_rate"] == 0.0
-    assert abs(result["non_target_prediction_drift"] - 0.1) < 1e-12
+    assert abs(result["invariant_charge_drift"] - 0.1) < 1e-12
 
 
 def test_cmdl_reports_defendant_case_and_count_strata() -> None:
@@ -258,3 +263,36 @@ def test_sentence_metrics_can_match_single_charge_training_eligibility() -> None
     )
     assert result["eligible_count"] == 1
     assert result["mae"] == 2.0
+
+
+def _static_row(true, predicted, unseen=(), *, months=12.0):
+    return {
+        "group_id": "g",
+        "true_charges": true,
+        "predicted_charges": predicted,
+        "unseen_true_charge_labels": list(unseen),
+        "true_articles": true,
+        "predicted_articles": predicted,
+        "unseen_true_article_labels": [],
+        "penalty_type": "fixed_term",
+        "predicted_penalty_type": "fixed_term",
+        "true_months": months,
+        "predicted_months": months,
+    }
+
+
+def test_static_metrics_count_labels_unseen_in_training_as_errors() -> None:
+    import runpy
+    from pathlib import Path
+
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/evaluate_model.py"))
+    rows = [_static_row([1, 0], [1, 0], ["非法经营"]), _static_row([0, 1], [0, 1])]
+    metrics = module["calculate_metrics"]("static", rows)
+    assert metrics["charge_accuracy"] == 0.5
+    assert metrics["article_accuracy"] == 1.0
+    assert metrics["sentence_eligible_count"] == 1
+    clean = module["calculate_metrics"]("static", [_static_row([1, 0], [1, 0])])
+    assert clean["charge_macro_f1_all_labels"] == charge_metrics(
+        np.array([[1, 0]]), np.array([[1, 0]])
+    )["macro_f1"]
+    assert clean["charge_macro_f1"] == 1.0

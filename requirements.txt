@@ -1,6 +1,6 @@
 # One activated Conda environment (Python 3.12) for data, vLLM generation,
 # training, and evaluation.
-# Target server: Ubuntu 24.04, NVIDIA driver 580.173.02, CUDA 13.0.
+# Target server: Ubuntu 20.04, NVIDIA driver 580.178.04, CUDA 13.0.
 #
 # Install the cu130 PyPI wheel stack below in Python 3.12 Conda.
 #

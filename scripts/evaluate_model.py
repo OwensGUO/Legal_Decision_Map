@@ -4,26 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from legal_landscape.evaluation.bootstrap import (
-    bootstrap_metric_set,
+    fast_bootstrap_metric_set,
+    fast_paired_test,
     holm_adjust,
-    paired_cluster_test,
 )
-from legal_landscape.evaluation.cmdl_case_metrics import cmdl_metrics
-from legal_landscape.evaluation.counterfactual_metrics import counterfactual_metrics
-from legal_landscape.evaluation.static_metrics import (
-    charge_metrics,
-    multiclass_metrics,
-    multilabel_metrics,
-    sentence_class,
-    sentence_metrics,
+from legal_landscape.evaluation.prepared import (
+    METRIC_VERSION,
+    prepare_cmdl,
+    prepare_counterfactual,
+    prepare_static,
 )
 from legal_landscape.progress import create_progress_reporter
 
@@ -39,8 +35,7 @@ DEFAULT_PRIMARY_ENDPOINTS = {
         "flip_accuracy",
         "invariant_violation_rate",
         "sentence_pairwise_accuracy",
-        "monotonicity_violation_rate",
-        "non_target_prediction_drift",
+        "invariant_charge_drift",
     ),
     "cmdl": ("defendant_accuracy", "case_exact_accuracy"),
 }
@@ -60,6 +55,13 @@ def parser() -> argparse.ArgumentParser:
         "--primary-endpoints",
         help="Comma-separated scalar metric names; defaults to the declared endpoints",
     )
+    result.add_argument(
+        "--parent-records",
+        type=Path,
+        help="Processed parent records (.jsonl or .jsonl.gz) to backfill parent charges in "
+        "counterfactual rows written before parent_charge_indices existed",
+    )
+    result.add_argument("--metadata", type=Path, help="metadata.json with charge_vocabulary")
     result.add_argument("--dry-run", action="store_true")
     return result
 
@@ -69,59 +71,50 @@ def read_rows(path: Path, limit: int) -> list[dict[str, Any]]:
         return [json.loads(line) for _, line in zip(range(limit), handle, strict=False)]
 
 
-def calculate_metrics(kind: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    if not rows:
-        raise ValueError("evaluation input contains no rows")
+def _open_text(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
+
+
+def backfill_parent_charges(
+    rows: list[dict[str, Any]], parent_records: Path, metadata: Path
+) -> None:
+    """Add parent_charge_indices to flip rows from processed parent records."""
+    needed = {
+        str(row["case_id"])
+        for row in rows
+        if row.get("intervention_type") == "charge_flip" and not row.get("parent_charge_indices")
+    }
+    if not needed:
+        return
+    vocabulary = json.loads(metadata.read_text(encoding="utf-8"))["charge_vocabulary"]
+    index = {label: position for position, label in enumerate(vocabulary)}
+    charges: dict[str, list[int]] = {}
+    with _open_text(parent_records) as handle:
+        for line in handle:
+            record = json.loads(line)
+            if str(record.get("case_id")) in needed:
+                charges[str(record["case_id"])] = [
+                    index[label] for label in record.get("charges") or () if label in index
+                ]
+    for row in rows:
+        if row.get("intervention_type") == "charge_flip" and not row.get("parent_charge_indices"):
+            row["parent_charge_indices"] = charges.get(str(row["case_id"]), [])
+
+
+def prepare(kind: str, rows: list[dict[str, Any]]) -> Any:
     if kind == "static":
-        charge = charge_metrics(
-            np.asarray([row["true_charges"] for row in rows]),
-            np.asarray([row["predicted_charges"] for row in rows]),
-        )
-        sentence = sentence_metrics(
-            np.asarray([row["predicted_months"] for row in rows]),
-            np.asarray([row.get("true_months") for row in rows], dtype=float),
-            [row["penalty_type"] for row in rows],
-            charge_counts=np.asarray([sum(row["true_charges"]) for row in rows]),
-        )
-        true_sentence_classes = [
-            sentence_class(row["penalty_type"], row.get("true_months")) for row in rows
-        ]
-        predicted_sentence_classes = [
-            sentence_class(
-                row.get("predicted_penalty_type", row["penalty_type"]),
-                row.get("predicted_months"),
-            )
-            for row in rows
-        ]
-        sentence_classification = multiclass_metrics(
-            true_sentence_classes,
-            predicted_sentence_classes,
-        )
-        metrics: dict[str, Any] = {
-            **{f"charge_{name}": value for name, value in charge.items()},
-            **{
-                f"sentence_{name}": value
-                for name, value in sentence_classification.items()
-            },
-            **{f"sentence_{name}": value for name, value in sentence.items()},
-            # Legacy aliases retained for existing result consumers.
-            "macro_f1": charge["macro_f1"],
-            "micro_f1": charge["micro_f1"],
-            "exact_match": charge["exact_match"],
-            **sentence,
-        }
-        if all("true_articles" in row and "predicted_articles" in row for row in rows):
-            article = multilabel_metrics(
-                np.asarray([row["true_articles"] for row in rows]),
-                np.asarray([row["predicted_articles"] for row in rows]),
-            )
-            metrics.update({f"article_{name}": value for name, value in article.items()})
-        return metrics
+        return prepare_static(rows)
     if kind == "counterfactual":
-        return counterfactual_metrics(rows)
+        return prepare_counterfactual(rows)
     if kind == "cmdl":
-        return cmdl_metrics(rows)
+        return prepare_cmdl(rows)
     raise ValueError(f"unknown evaluation kind: {kind}")
+
+
+def calculate_metrics(kind: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return prepare(kind, rows).metrics(None)
 
 
 def bootstrap_names(kind: str) -> tuple[str, ...]:
@@ -146,6 +139,18 @@ def bootstrap_names(kind: str) -> tuple[str, ...]:
     return DEFAULT_PRIMARY_ENDPOINTS[kind]
 
 
+def _load(path: Path, args: argparse.Namespace) -> Any:
+    rows = read_rows(path, args.limit)
+    if args.kind == "counterfactual" and args.parent_records is not None:
+        if args.metadata is None:
+            raise SystemExit("--parent-records requires --metadata")
+        backfill_parent_charges(rows, args.parent_records, args.metadata)
+    try:
+        return prepare(args.kind, rows)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def main() -> int:
     args = parser().parse_args()
     if args.dry_run or args.input is None:
@@ -162,8 +167,8 @@ def main() -> int:
             )
         )
         return 0
-    rows = read_rows(args.input, args.limit)
-    metrics = calculate_metrics(args.kind, rows)
+    prepared = _load(args.input, args)
+    metrics = prepared.metrics(None)
     available_bootstrap_names = tuple(
         name for name in bootstrap_names(args.kind) if name in metrics
     )
@@ -171,9 +176,8 @@ def main() -> int:
         create_progress_reporter() as progress,
         progress.task(f"Evaluating {args.kind} predictions", total=None),
     ):
-        confidence_intervals = bootstrap_metric_set(
-            rows,
-            lambda sample: calculate_metrics(args.kind, sample),
+        confidence_intervals = fast_bootstrap_metric_set(
+            prepared,
             available_bootstrap_names,
             iterations=args.bootstrap_iterations,
             seed=args.bootstrap_seed,
@@ -181,6 +185,7 @@ def main() -> int:
         )
         payload: dict[str, Any] = {
             **metrics,
+            "metric_version": METRIC_VERSION,
             "confidence_intervals": confidence_intervals,
             "bootstrap": {
                 "iterations": args.bootstrap_iterations,
@@ -189,7 +194,7 @@ def main() -> int:
             },
         }
         if args.reference_input is not None:
-            reference = read_rows(args.reference_input, args.limit)
+            reference = _load(args.reference_input, args)
             endpoint_names = (
                 tuple(item.strip() for item in args.primary_endpoints.split(",") if item.strip())
                 if args.primary_endpoints
@@ -202,22 +207,16 @@ def main() -> int:
             unknown = [name for name in endpoint_names if name not in metrics]
             if unknown:
                 raise ValueError(f"unknown primary endpoints: {', '.join(unknown)}")
-            comparisons: dict[str, dict[str, float | int]] = {}
-            raw_p_values: dict[str, float] = {}
-            for name in endpoint_names:
-                comparison = paired_cluster_test(
-                    rows,
-                    reference,
-                    lambda sample, metric_name=name: float(
-                        calculate_metrics(args.kind, sample)[metric_name]
-                    ),
-                    iterations=args.bootstrap_iterations,
-                    seed=args.bootstrap_seed,
-                    progress=progress,
-                    description=f"Paired bootstrap · {name}",
-                )
-                comparisons[name] = comparison
-                raw_p_values[name] = float(comparison["p_value"])
+            comparisons = fast_paired_test(
+                prepared,
+                reference,
+                endpoint_names,
+                iterations=args.bootstrap_iterations,
+                seed=args.bootstrap_seed,
+                progress=progress,
+                description="Paired bootstrap",
+            )
+            raw_p_values = {name: float(value["p_value"]) for name, value in comparisons.items()}
             finite_p_values = {
                 name: value for name, value in raw_p_values.items() if math.isfinite(value)
             }

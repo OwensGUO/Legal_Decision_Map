@@ -34,6 +34,12 @@ def _masked_mean(values: Tensor, mask: Tensor, zero: Tensor) -> Tensor:
     return values[mask].mean() if bool(mask.any()) else zero
 
 
+def _per_item(values: Tensor, reduction: str) -> Tensor:
+    """Reduce per-label losses. Summing keeps a positive label's gradient undiluted by the
+    hundreds of negative labels in the charge and article vocabularies."""
+    return values.sum(-1) if reduction == "sum" else values.mean(-1)
+
+
 def compute_typed_losses(
     *,
     charge_logits: Tensor | None = None,
@@ -60,8 +66,11 @@ def compute_typed_losses(
     rank_direction: Tensor | None = None,
     rank_margin: float = 0.0,
     weights: dict[str, float] | None = None,
+    multilabel_reduction: str = "sum",
 ) -> LossBreakdown:
     """Compute the supervised and counterfactual objective with empty-mask safeguards."""
+    if multilabel_reduction not in {"sum", "mean"}:
+        raise ValueError(f"unknown multilabel_reduction: {multilabel_reduction!r}")
     zero = _anchor(
         (
             charge_logits,
@@ -93,9 +102,10 @@ def compute_typed_losses(
             if charge_mask is None
             else charge_mask.bool()
         )
-        per_item = F.binary_cross_entropy_with_logits(
-            charge_logits, charge_targets, reduction="none"
-        ).mean(-1)
+        per_item = _per_item(
+            F.binary_cross_entropy_with_logits(charge_logits, charge_targets, reduction="none"),
+            multilabel_reduction,
+        )
         charge = _masked_mean(per_item, mask, zero)
         counts["charge"] = int(mask.sum().item())
 
@@ -106,9 +116,10 @@ def compute_typed_losses(
             if article_mask is None
             else article_mask.bool()
         )
-        per_item = F.binary_cross_entropy_with_logits(
-            article_logits, article_targets, reduction="none"
-        ).mean(-1)
+        per_item = _per_item(
+            F.binary_cross_entropy_with_logits(article_logits, article_targets, reduction="none"),
+            multilabel_reduction,
+        )
         article = _masked_mean(per_item, mask, zero)
         counts["article"] = int(mask.sum().item())
 
@@ -171,7 +182,9 @@ def compute_typed_losses(
                 raise ValueError("invariant pairs require both charge-logit tensors")
             parent_prob = torch.sigmoid(parent_charge_logits[invariant_mask])
             counterfactual_prob = torch.sigmoid(counterfactual_charge_logits[invariant_mask])
-            invariant = F.mse_loss(parent_prob, counterfactual_prob)
+            invariant = _per_item(
+                (parent_prob - counterfactual_prob) ** 2, multilabel_reduction
+            ).mean()
         if bool(flip_mask.any()):
             if counterfactual_charge_logits is None or target_charge_indices is None:
                 raise ValueError("charge_flip pairs require logits and target indices")
@@ -180,7 +193,12 @@ def compute_typed_losses(
             flipped_targets = F.one_hot(
                 target_charge_indices[flip_mask], num_classes=flipped_logits.shape[-1]
             ).to(flipped_logits.dtype)
-            boundary = F.binary_cross_entropy_with_logits(flipped_logits, flipped_targets)
+            boundary = _per_item(
+                F.binary_cross_entropy_with_logits(
+                    flipped_logits, flipped_targets, reduction="none"
+                ),
+                multilabel_reduction,
+            ).mean()
         if bool(rank_mask.any()):
             if parent_sentence is None or counterfactual_sentence is None or rank_direction is None:
                 raise ValueError("sentence_rank pairs require both predictions and directions")

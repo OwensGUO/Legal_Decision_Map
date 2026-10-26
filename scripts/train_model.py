@@ -18,6 +18,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--train-data")
     result.add_argument("--counterfactual-data")
     result.add_argument("--evaluation-data")
+    result.add_argument(
+        "--evaluation-counterfactual-data",
+        help="Counterfactuals generated from --evaluation-data parents; never used for training",
+    )
+    result.add_argument(
+        "--validation-data",
+        help="Held-out validation records for checkpoint selection and decision thresholds",
+    )
     result.add_argument("--prediction-dir")
     result.add_argument("--output-dir", default="outputs/training")
     result.add_argument("--limit", type=int, default=8)
@@ -39,6 +47,8 @@ def main() -> int:
             "output_dir": args.output_dir,
             "prediction_dir": args.prediction_dir,
             "evaluation_data": args.evaluation_data,
+            "evaluation_counterfactual_data": args.evaluation_counterfactual_data,
+            "validation_data": args.validation_data,
             "resume": args.resume_from_checkpoint,
         }
     )
@@ -61,6 +71,8 @@ def main() -> int:
         train_data=args.train_data,
         counterfactual_data=args.counterfactual_data,
         evaluation_data=args.evaluation_data,
+        evaluation_counterfactual_data=args.evaluation_counterfactual_data,
+        validation_data=args.validation_data,
         prediction_dir=args.prediction_dir,
         output_dir=args.output_dir,
         experiment_name=args.experiment,

@@ -31,6 +31,7 @@ class CaseUnit:
     source_path: str
     conviction_articles: tuple[str, ...] = ()
     sentencing_articles: tuple[str, ...] = ()
+    co_defendants: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.dataset, self.split, self.case_id, self.group_id, self.source_path)):
@@ -59,6 +60,7 @@ class CaseUnit:
         value["charges"] = list(self.charges)
         value["conviction_articles"] = list(self.conviction_articles)
         value["sentencing_articles"] = list(self.sentencing_articles)
+        value["co_defendants"] = list(self.co_defendants)
         return value
 
     @classmethod
@@ -69,6 +71,7 @@ class CaseUnit:
                 "charges": tuple(value["charges"]),
                 "conviction_articles": tuple(value.get("conviction_articles") or ()),
                 "sentencing_articles": tuple(value.get("sentencing_articles") or ()),
+                "co_defendants": tuple(value.get("co_defendants") or ()),
             }
         )
 

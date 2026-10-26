@@ -6,18 +6,27 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from legal_landscape.counterfactual.prompts import build_messages
+from legal_landscape.counterfactual.prompts import PROMPT_VERSION, build_messages
 from legal_landscape.counterfactual.provenance import MANIFEST_NAME, ensure_manifest
-from legal_landscape.counterfactual.validators import ValidationResult, validate_generation
+from legal_landscape.counterfactual.validators import (
+    ValidationResult,
+    has_leakage,
+    validate_generation,
+)
+from legal_landscape.data.sanitize import SANITIZER_VERSION
+from legal_landscape.factors.extract import CONDUCT_CUES
 from legal_landscape.factors.schema import InterventionSpec
 from legal_landscape.progress import NullProgressReporter, ProgressReporter
+
+_RESTITUTION_MENTION = re.compile(r"(?:未能|拒不|没有|未|已)?(?:退赃|退赔|返还赃款)")
 
 
 class CounterfactualGenerator(Protocol):
@@ -32,6 +41,10 @@ class GenerationRejectedError(RuntimeError):
     """The service refused the request (HTTP 4xx); retrying cannot succeed."""
 
 
+def text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class GenerationRequest:
     parent_text: str
@@ -39,7 +52,17 @@ class GenerationRequest:
 
     @property
     def generation_id(self) -> str:
-        material = f"{self.spec.parent_case_id}\0{self.spec.target_defendant}\0{self.spec.rule_id}"
+        # A changed parent text, prompt, or sanitizer must never reuse a cached generation.
+        material = "\0".join(
+            (
+                self.spec.parent_case_id,
+                self.spec.target_defendant,
+                self.spec.rule_id,
+                text_sha256(self.parent_text),
+                PROMPT_VERSION,
+                SANITIZER_VERSION,
+            )
+        )
         return hashlib.sha256(material.encode()).hexdigest()[:24]
 
 
@@ -54,30 +77,31 @@ class GenerationResult:
 class MockGenerator:
     """Deterministic CPU generator that obeys the production JSON contract.
 
-    Like a faithful rewrite, it keeps the parent text and appends the realized change.
+    Like a faithful rewrite, it keeps the parent text, removes the replaced facts, and
+    appends the realized change.
     """
 
     model_revision = "mock-v1"
 
     def generate(self, parent_text: str, spec: InterventionSpec, *, seed: int) -> str:
         del seed
+        text = parent_text
         fragments = [spec.target_defendant]
+        cues = dict(CONDUCT_CUES)
         for changed in spec.changed_fields:
             value = getattr(spec.target_factors, changed)
             if changed == "restitution":
+                text = _RESTITUTION_MENTION.sub("", text)
                 fragments.append("已完成全部退赃" if value else "未退赃")
             elif changed == "conduct":
-                fragments.append(str(value))
+                for cue in sorted(cues.get(spec.source_factors.conduct, ()), key=len, reverse=True):
+                    text = text.replace(cue, "")
+                fragments.append(cues.get(value, (str(value),))[0])
             elif changed == "amount":
                 fragments.append(f"涉案金额调整为{value:.2f}元")
             else:
                 fragments.append(f"{changed}调整为{value}")
-        payload = {
-            "counterfactual_text": parent_text + "，".join(fragments) + "。",
-            "target_defendant": spec.target_defendant,
-            "changed_fields": list(spec.changed_fields),
-            "realized_factors": spec.target_factors.to_dict(),
-        }
+        payload = {"counterfactual_text": text + "，".join(fragments) + "。"}
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -191,6 +215,7 @@ def _realize(
     seed: int,
     retries: int,
     min_similarity: float,
+    charge_lexicon: tuple[str, ...],
 ) -> dict[str, Any]:
     """Generate one request, retrying outputs that fail validation."""
     raw = ""
@@ -204,7 +229,11 @@ def _realize(
             result = ValidationResult(False, (f"request_rejected: {exc}",), None, None)
             break
         result = validate_generation(
-            request.parent_text, request.spec, raw, min_similarity=min_similarity
+            request.parent_text,
+            request.spec,
+            raw,
+            min_similarity=min_similarity,
+            charge_lexicon=charge_lexicon,
         )
         if result.valid:
             break
@@ -224,11 +253,15 @@ def _realize(
         "model_revision": generator_identity["checkpoint_fingerprint"],
         "generator_identity": dict(generator_identity),
         "prompt_version": prompt_version,
+        "sanitizer_version": SANITIZER_VERSION,
+        "parent_text_sha256": text_sha256(request.parent_text),
         "sampling": sampling,
         "seed": seed,
         "raw_response": raw,
         "retry_count": retry_count,
         "validation": result.to_dict(),
+        "leakage": has_leakage(result.errors),
+        "counterfactual_strict": result.sanitized_text,
     }
 
 
@@ -247,6 +280,7 @@ def generate_records(
     concurrency: int = 1,
     provenance_manifest: str | Path | None = None,
     progress: ProgressReporter | None = None,
+    charge_lexicon: Iterable[str] = (),
 ) -> GenerationResult:
     """Generate validated records concurrently and durably append each completed request.
 
@@ -267,6 +301,7 @@ def generate_records(
     outcome = GenerationResult()
     pending: list[GenerationRequest] = []
     seen: set[str] = set()
+    lexicon = tuple(charge_lexicon)
     for request in requests:
         if request.generation_id in completed:
             outcome.skipped_completed += 1
@@ -286,6 +321,7 @@ def generate_records(
             seed=seed,
             retries=retries,
             min_similarity=min_similarity,
+            charge_lexicon=lexicon,
         )
 
     reporter = progress if progress is not None else NullProgressReporter()

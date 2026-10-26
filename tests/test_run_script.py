@@ -91,7 +91,7 @@ max_length_for_experiment() { printf 512; }
 """
     result = subprocess.run(
         ["bash", "-c", helpers + "run_training() {" + function
-         + "\nrun_training cail processed view.jsonl M 42"],
+         + "\nrun_training cail processed view.jsonl heldout.jsonl M 42"],
         env={**os.environ, "MODE": "smoke", "TRAINING_RUNS_ROOT": str(tmp_path),
              "ROOT_DIR": str(ROOT), "DATA_LIMIT": "16", "MAX_STEPS": "1",
              "GPU_IDS": "0,1,2,3", "NUM_PROCESSES": "4"},
@@ -112,6 +112,61 @@ def test_readme_documents_smoke_training_length() -> None:
     assert "`MODE=smoke` 默认将 CAIL 和 CMDL 的训练最大长度限制为 1024" in readme
     assert "SMOKE_MAX_LENGTH=768 MODE=smoke bash run.sh" in readme
     assert "`MODE=main` 和 `MODE=matrix` 仍使用正式长度：CAIL 4096、CMDL 8192" in readme
+
+
+def test_restart_training_archives_old_run_and_preserves_counterfactual_cache(tmp_path):
+    run_root = tmp_path / "runs/qwen38/cail/M/seed-42"
+    checkpoint = run_root / "training/checkpoint-final/training_progress.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text('{"old": true}')
+    predictions = run_root / "predictions/static.jsonl"
+    predictions.parent.mkdir()
+    predictions.write_text("previous predictions\n")
+    cache = tmp_path / "counterfactuals/qwen38/cail.jsonl"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("cached generation\n")
+    function = RUN_SCRIPT.read_text().split("run_training() {", 1)[1].split(
+        'phase "train and export predictions"', 1
+    )[0]
+    helpers = """
+set -euo pipefail
+run_cmd() {
+  if [[ "$1" == "mv" ]]; then
+    "$@"
+  else
+    printf '%s\\n' "$@"
+  fi
+}
+model_path_for_experiment() { printf fake; }
+max_length_for_experiment() { printf 4096; }
+"""
+    result = subprocess.run(
+        ["bash", "-c", helpers + "run_training() {" + function
+         + "\nrun_training cail processed view.jsonl heldout.jsonl M 42"],
+        env={**os.environ, "MODE": "main", "RESUME_TRAINING": "0",
+             "TRAINING_RUNS_ROOT": str(tmp_path / "runs/qwen38"),
+             "ROOT_DIR": str(ROOT), "DATA_LIMIT": "16", "MAX_STEPS": "1",
+             "GPU_IDS": "0,1,2,3", "NUM_PROCESSES": "4"},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    archives = list(run_root.parent.glob("seed-42.previous-*"))
+    assert len(archives) == 1
+    assert (archives[0] / "training/checkpoint-final/training_progress.json").read_text() == (
+        '{"old": true}'
+    )
+    assert (archives[0] / "predictions/static.jsonl").read_text() == "previous predictions\n"
+    assert not run_root.exists()
+    assert cache.read_text() == "cached generation\n"
+    assert "--resume-from-checkpoint" not in result.stdout
+    assert str(run_root / "training") in result.stdout
+
+
+def test_invalid_resume_training_setting_fails_before_pipeline():
+    result = _run_dry_run(RESUME_TRAINING="invalid")
+    assert result.returncode == 2
+    assert "RESUME_TRAINING" in result.stderr
+    assert "[phase" not in result.stdout
 
 
 @pytest.mark.parametrize("generator", ["qwen38", "qwen36"])
@@ -226,12 +281,58 @@ def test_pipeline_trains_on_current_request_views_and_limits_parent_scope(tmp_pa
                 if line.startswith("$ ")]
     generation = [c for c in commands if str(ROOT / "scripts/generate_counterfactuals.py") in c]
     training = [c for c in commands if str(ROOT / "scripts/train_model.py") in c]
-    for generate, train in zip(generation, training, strict=True):
+    training_generation = [
+        c for c in generation if c[c.index("--input") + 1].endswith("train.jsonl")
+    ]
+    for generate, train in zip(training_generation, training, strict=True):
         view = generate[generate.index("--view-output") + 1]
         assert train[train.index("--counterfactual-data") + 1] == view
         assert generate[generate.index("--parent-limit") + 1] == "16"
         assert "/views/smoke/" in view
+        assert "/heldout/" not in view
         assert "/smoke/length-512/" in train[train.index("--output-dir") + 1]
+
+
+@pytest.mark.parametrize(("mode", "max_steps"), [("smoke", "1"), ("main", "0"), ("matrix", "0")])
+def test_training_uses_validation_split_and_full_epochs_outside_smoke(tmp_path, mode, max_steps):
+    result = _run_dry_run(MODE=mode, OUTPUT_ROOT=str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line[2:]) for line in result.stdout.splitlines()
+                if line.startswith("$ ")]
+    training = [c for c in commands if str(ROOT / "scripts/train_model.py") in c]
+    assert training
+    for train in training:
+        validation = train[train.index("--validation-data") + 1]
+        assert validation == train[train.index("--evaluation-data") + 1].replace(
+            "test.jsonl", "valid.jsonl"
+        )
+        assert f"training.max_steps={max_steps}" in train
+        assert "training.checkpoint_every=200" in train
+
+
+def test_pipeline_evaluates_counterfactuals_only_on_held_out_test_parents(tmp_path):
+    result = _run_dry_run(MODE="smoke", OUTPUT_ROOT=str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line[2:]) for line in result.stdout.splitlines()
+                if line.startswith("$ ")]
+    generation = [c for c in commands if str(ROOT / "scripts/generate_counterfactuals.py") in c]
+    heldout = {
+        c[c.index("--input") + 1]: c[c.index("--view-output") + 1]
+        for c in generation
+        if c[c.index("--input") + 1].endswith("test.jsonl")
+    }
+    assert set(heldout) == {
+        str(tmp_path / "processed/cail_small/test.jsonl"),
+        str(tmp_path / "processed/cmdl_small/test.jsonl"),
+    }
+    assert all("/counterfactuals/qwen38/heldout/views/smoke/" in view for view in heldout.values())
+    training = [c for c in commands if str(ROOT / "scripts/train_model.py") in c]
+    assert training
+    for train in training:
+        evaluation = train[train.index("--evaluation-data") + 1]
+        assert evaluation.endswith("test.jsonl")
+        assert train[train.index("--evaluation-counterfactual-data") + 1] == heldout[evaluation]
+        assert train[train.index("--counterfactual-data") + 1] != heldout[evaluation]
 
 
 def test_smoke_ignores_existing_final_checkpoints(tmp_path):

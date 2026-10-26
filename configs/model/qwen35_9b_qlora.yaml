@@ -12,15 +12,31 @@ model:
     dropout: 0.05
 training:
   gradient_checkpointing: true
-  gradient_accumulation_steps: 8
-  per_device_batch_size: 1
+  # Length-bucketed batches: up to per_device_batch_size cases whose padded length
+  # (batch size x longest case) stays within max_tokens_per_batch. 8192 tokens per
+  # forward matches the single-case peak already run for CMDL at max_length 8192.
+  per_device_batch_size: 16
+  max_tokens_per_batch: 8192
+  gradient_accumulation_steps: 2
+  inference_batch_size: 32
+  inference_max_tokens_per_batch: 16384
   learning_rate: 0.0002
+  warmup_ratio: 0.03
+  min_learning_rate_ratio: 0.1
   epochs: 1
-  max_steps: 1000
+  # 0 trains the full number of epochs; a positive value caps optimizer updates.
+  max_steps: 0
+  checkpoint_every: 200
+  # Counterfactual pairs train on every pair_every-th microbatch.
+  pair_every: 4
   rank_margin: 1.0
+  validation_limit: 2000
+  select_best_checkpoint: true
+  keep_best_and_latest_checkpoints: true
   mixed_precision: bf16
   seed: 42
 loss:
+  multilabel_reduction: sum
   article: 1.0
   sentence: 1.0
   invariant: 1.0

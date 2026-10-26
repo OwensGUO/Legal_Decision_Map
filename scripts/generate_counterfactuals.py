@@ -23,6 +23,7 @@ from legal_landscape.counterfactual.provenance import (
     generator_identity,
 )
 from legal_landscape.counterfactual.view import publish_request_view
+from legal_landscape.data.sanitize import SANITIZER_VERSION
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 from legal_landscape.progress import create_progress_reporter
 
@@ -78,7 +79,9 @@ def _requests(
                     GenerationRequest(row["parent_text"], InterventionSpec.from_dict(row["spec"]))
                 )
             else:
-                parent_text = row.get("fact_conservative") or row["fact_raw"]
+                # The generator only sees label-agnostic strict text, the same text the
+                # predictor reads for the parent case.
+                parent_text = row["fact_strict"]
                 if max_source_chars is not None and len(parent_text) > max_source_chars:
                     skipped_long += 1
                     continue
@@ -86,7 +89,7 @@ def _requests(
                 for spec in propose_interventions(
                     parent_case_id=row["case_id"],
                     defendant=row["target_defendant"],
-                    charge=row["charges"][0],
+                    charges=tuple(row["charges"]),
                     factors=factors,
                     charge_boundaries=boundaries,
                 ):
@@ -96,6 +99,24 @@ def _requests(
             if len(requests) >= limit:
                 break
     return requests, skipped_long
+
+
+def _charge_lexicon(path: Path) -> tuple[str, ...]:
+    """The processed dataset's label-agnostic lexicon, required for processed parent rows."""
+    with path.open("r", encoding="utf-8") as handle:
+        first = handle.readline()
+    if not first.strip() or "spec" in json.loads(first):
+        return ()
+    metadata_path = path.parent / "metadata.json"
+    if not metadata_path.is_file():
+        raise SystemExit(f"processed input requires {metadata_path}; rebuild the dataset")
+    sanitizer = json.loads(metadata_path.read_text(encoding="utf-8")).get("sanitizer") or {}
+    if sanitizer.get("version") != SANITIZER_VERSION:
+        raise SystemExit(
+            f"{metadata_path} uses sanitizer {sanitizer.get('version')!r}, expected "
+            f"{SANITIZER_VERSION!r}; rebuild the processed dataset under a new OUTPUT_ROOT"
+        )
+    return tuple(sanitizer.get("charge_lexicon") or ())
 
 
 def main() -> int:
@@ -125,6 +146,7 @@ def main() -> int:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    lexicon = _charge_lexicon(args.input)
     sampling = {key: config[key] for key in ("temperature", "top_p", "max_tokens") if key in config}
     concurrency = int(config.get("concurrency", 1))
     generator = (
@@ -164,6 +186,7 @@ def main() -> int:
                 min_similarity=float(config.get("min_similarity", 0.5)),
                 concurrency=concurrency,
                 progress=progress,
+                charge_lexicon=lexicon,
             )
     finally:
         if isinstance(generator, VLLMHTTPGenerator):
