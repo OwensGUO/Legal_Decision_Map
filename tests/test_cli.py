@@ -27,6 +27,7 @@ SCRIPTS = (
     "check_requirements.py",
     "probe_gpu_stack.py",
     "check_generator_provenance.py",
+    "export_analysis_bundle.py",
 )
 
 
@@ -113,7 +114,7 @@ def test_generation_parent_limit_counts_processed_rows_before_long_case_skips(tm
     source = tmp_path / "input.jsonl"
     source.write_text("".join(json.dumps({
         "case_id": f"c{i}", "target_defendant": "某甲", "charges": ["盗窃"],
-        "fact_conservative": "很长的事实" * 100 if i == 0 else "某甲未退赃。",
+        "fact_strict": "很长的事实" * 100 if i == 0 else "某甲未退赃。",
         "factors": LegalFactors(restitution=False).to_dict(),
     }, ensure_ascii=False) + "\n" for i in range(3)))
     requests, skipped = module["_requests"](
@@ -122,6 +123,42 @@ def test_generation_parent_limit_counts_processed_rows_before_long_case_skips(tm
     assert skipped == 1
     assert requests
     assert {r.spec.parent_case_id for r in requests} == {"c1"}
+
+
+def test_generation_uses_strict_parent_text_and_all_parent_charges(tmp_path):
+    module = runpy.run_path(str(ROOT / "scripts/generate_counterfactuals.py"))
+    source = tmp_path / "input.jsonl"
+    source.write_text(json.dumps({
+        "case_id": "c1", "target_defendant": "某甲", "charges": ["盗窃", "故意伤害"],
+        "fact_conservative": "某甲犯盗窃罪。", "fact_strict": "某甲犯[已屏蔽]，盗走手机。",
+        "factors": LegalFactors(restitution=False, conduct="秘密窃取").to_dict(),
+    }, ensure_ascii=False) + "\n")
+    requests, _ = module["_requests"](source, 12, (("盗窃", "诈骗"),))
+    assert {r.parent_text for r in requests} == {"某甲犯[已屏蔽]，盗走手机。"}
+    assert "charge_flip" not in {r.spec.intervention_type for r in requests}
+
+
+def test_generation_rejects_processed_rows_without_current_sanitizer_metadata(tmp_path):
+    source = tmp_path / "processed" / "train.jsonl"
+    source.parent.mkdir()
+    source.write_text(json.dumps({
+        "case_id": "c1", "target_defendant": "某甲", "charges": ["盗窃"],
+        "fact_strict": "某甲盗走手机，未退赃。",
+        "factors": LegalFactors(restitution=False).to_dict(),
+    }, ensure_ascii=False) + "\n")
+    command = [
+        sys.executable, str(ROOT / "scripts/generate_counterfactuals.py"), "--mock", "--execute",
+        "--input", str(source), "--output", str(tmp_path / "cf" / "cail.jsonl"),
+    ]
+    missing = subprocess.run(command, env=_env(), capture_output=True, text=True)
+    assert missing.returncode != 0
+    assert "metadata.json" in missing.stderr
+    (source.parent / "metadata.json").write_text(
+        json.dumps({"sanitizer": {"version": "v1", "charge_lexicon": ["盗窃"]}})
+    )
+    stale = subprocess.run(command, env=_env(), capture_output=True, text=True)
+    assert stale.returncode != 0
+    assert "rebuild" in stale.stderr
 
 
 def test_generation_transport_failure_preserves_previous_request_view(tmp_path, monkeypatch):
@@ -318,7 +355,8 @@ def test_build_dataset_progress_writes_traceable_processed_records(tmp_path) -> 
     summary = build_dataset(config_path, output, limit=1)
     processed = json.loads((output / "train.jsonl").read_text(encoding="utf-8"))
     assert summary["split_units"] == {"train": 1, "valid": 1, "test": 1}
-    assert processed["case_id"] == processed["group_id"]
+    assert processed["group_id"].startswith("cail-g")
+    assert processed["source_group_id"] == processed["case_id"]
     assert processed["source_path"].endswith("data_train.json:1")
     assert processed["fact_raw"] == f"{row['fact']}data_train.json"
     assert processed["conviction_articles"] == ["criminal_law:264"]
@@ -422,6 +460,9 @@ def test_build_dataset_progress_counts_dropped_and_short_splits(tmp_path) -> Non
     assert summary["split_units"] == {"train": 0, "valid": 1, "test": 1}
     assert summary["split_integrity"] == {
         "assignment_policy": "prefer_test_then_valid_then_train",
+        "grouping": "normalized_fact_and_minhash",
+        "near_duplicate_threshold": 0.9,
+        "near_duplicate_pairs": 0,
         "cross_split_groups": 1,
         "dropped_units": {"train": 1, "valid": 0, "test": 0},
     }
@@ -647,7 +688,7 @@ def test_evaluation_cli_bootstrap_progress_and_five_holm_results(tmp_path) -> No
     assert json.loads(result.stdout) == json.loads(output_path.read_text(encoding="utf-8"))
     assert "Evaluating static predictions" in result.stderr
     assert "Bootstrap confidence intervals: 20/20 completed" in result.stderr
-    assert "Paired bootstrap · charge_macro_f1: 20/20 completed" in result.stderr
+    assert "Paired bootstrap: 20/20 completed" in result.stderr
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     required = {
         f"{task}_{metric}"

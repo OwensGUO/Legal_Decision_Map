@@ -8,7 +8,9 @@ import json
 import math
 import os
 import random
-from collections.abc import Callable, Sized
+import re
+import shutil
+from collections.abc import Callable, Iterable, Sized
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -85,6 +87,207 @@ class DeterministicEpochSampler:
         self.start_index = start_index
 
 
+class TokenBudgetBatchSampler:
+    """Deterministic, resumable length-bucketed batches under a padded-token budget.
+
+    Each epoch shuffles indices, sorts windows of ``max_batch * 50`` indices by length, packs
+    them greedily so that ``batch size * longest length <= max_tokens``, and shuffles the batch
+    order. Position is tracked in batches so a resumed run yields the same remaining batches.
+    """
+
+    def __init__(self, lengths: list[int], max_tokens: int, max_batch: int, *, seed: int) -> None:
+        if max_tokens < 1 or max_batch < 1:
+            raise ValueError("max_tokens and max_batch must be positive")
+        self.lengths = [max(1, int(length)) for length in lengths]
+        self.max_tokens = max_tokens
+        self.max_batch = max_batch
+        self.seed = seed
+        self.epoch = 0
+        self.start_batch = 0
+        self._cache: tuple[int, list[list[int]]] | None = None
+
+    def _batches(self) -> list[list[int]]:
+        if self._cache is not None and self._cache[0] == self.epoch:
+            return self._cache[1]
+        generator = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.lengths)))
+        generator.shuffle(indices)
+        window = self.max_batch * 50
+        batches: list[list[int]] = []
+        for start in range(0, len(indices), window):
+            ordered = sorted(indices[start : start + window], key=self.lengths.__getitem__)
+            batches.extend(_pack(ordered, self.lengths, self.max_tokens, self.max_batch))
+        generator.shuffle(batches)
+        self._cache = (self.epoch, batches)
+        return batches
+
+    @property
+    def batches_per_epoch(self) -> int:
+        return len(self._batches())
+
+    def __iter__(self):
+        return iter(self._batches()[self.start_batch :])
+
+    def __len__(self) -> int:
+        return max(0, self.batches_per_epoch - self.start_batch)
+
+    def advance(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("sampler advance must be non-negative")
+        self.start_batch = min(self.batches_per_epoch, self.start_batch + count)
+
+    def next_epoch(self) -> None:
+        self.epoch += 1
+        self.start_batch = 0
+
+    def state_dict(self) -> dict[str, int]:
+        return {"epoch": self.epoch, "start_batch": self.start_batch, "seed": self.seed}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state["seed"]) != self.seed:
+            raise ValueError(
+                f"sampler seed mismatch: checkpoint={state['seed']}, current={self.seed}"
+            )
+        self.epoch = int(state["epoch"])
+        self._cache = None
+        start = int(state["start_batch"])
+        if self.epoch < 0 or not 0 <= start <= self.batches_per_epoch:
+            raise ValueError("invalid sampler checkpoint state")
+        self.start_batch = start
+
+
+def _pack(
+    ordered: list[int], lengths: list[int], max_tokens: int, max_batch: int
+) -> list[list[int]]:
+    batches: list[list[int]] = []
+    current: list[int] = []
+    longest = 0
+    for index in ordered:
+        candidate = max(longest, lengths[index])
+        if current and (len(current) >= max_batch or (len(current) + 1) * candidate > max_tokens):
+            batches.append(current)
+            current, candidate = [], lengths[index]
+        current.append(index)
+        longest = candidate
+    if current:
+        batches.append(current)
+    return batches
+
+
+def inference_batches(lengths: list[int], max_tokens: int, max_batch: int) -> list[list[int]]:
+    """Length-sorted batches for prediction; order is restored through prediction indices."""
+    ordered = sorted(range(len(lengths)), key=lambda index: lengths[index])
+    return _pack(ordered, [max(1, int(length)) for length in lengths], max_tokens, max_batch)
+
+
+def shard_batches(
+    batches: list[list[int]], num_processes: int, process_index: int
+) -> list[list[int]]:
+    """Round-robin batches for one process, padded so every process runs the same number of
+    forward passes (DDP forwards are collective); duplicated rows are deduplicated by index."""
+    if not batches:
+        return []
+    per_process = math.ceil(len(batches) / num_processes)
+    padded = batches + [batches[-1]] * (per_process * num_processes - len(batches))
+    return padded[process_index::num_processes]
+
+
+def learning_rate_factor(
+    step: int, total_steps: int, warmup_steps: int, min_ratio: float
+) -> float:
+    """Linear warmup to 1, then cosine decay to ``min_ratio`` at ``total_steps``."""
+    if total_steps <= 0:
+        return 1.0
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+_SENTENCE = re.compile(r"[^。；！？\n]*[。；！？\n]?")
+
+
+def focus_fact(text: str, target: str, co_defendants: Iterable[str], max_chars: int) -> str:
+    """Fit a long fact into ``max_chars`` by keeping sentences about the target defendant,
+    then sentences naming no defendant, in original order; sentences that mention only other
+    defendants are dropped first."""
+    if len(text) <= max_chars:
+        return text
+    others = [name for name in co_defendants if name and name != target]
+    sentences = [sentence for sentence in _SENTENCE.findall(text) if sentence]
+    tiers: list[tuple[int, int]] = []
+    for position, sentence in enumerate(sentences):
+        stripped = sentence
+        for name in others:
+            if target and target in name:
+                stripped = stripped.replace(name, "")
+        if target and target in stripped:
+            tiers.append((0, position))
+        elif not any(name in sentence for name in others):
+            tiers.append((1, position))
+    kept: set[int] = set()
+    used = 0
+    for _tier, position in sorted(tiers):
+        size = len(sentences[position])
+        if used + size <= max_chars:
+            kept.add(position)
+            used += size
+    focused = "".join(sentences[position] for position in sorted(kept))
+    return (focused or text)[:max_chars]
+
+
+def tune_threshold(
+    probabilities: list[list[float]],
+    truth: list[list[int]],
+    grid: Iterable[float] = tuple(round(0.05 * step, 2) for step in range(1, 20)),
+) -> float:
+    """Global decision threshold maximizing micro-F1; ties keep the lowest threshold."""
+    import numpy as np
+
+    scores = np.asarray(probabilities, dtype=float)
+    labels = np.asarray(truth, dtype=bool)
+    best_threshold, best_score = 0.5, -1.0
+    for threshold in grid:
+        predicted = scores >= threshold
+        empty = ~predicted.any(axis=1)
+        if empty.any():
+            predicted[empty, scores[empty].argmax(axis=1)] = True
+        tp = float((predicted & labels).sum())
+        denominator = float(predicted.sum() + labels.sum())
+        score = 2 * tp / denominator if denominator else 0.0
+        if score > best_score:
+            best_threshold, best_score = float(threshold), score
+    return best_threshold
+
+
+def select_best_checkpoint(destination: str | Path) -> Path | None:
+    """The checkpoint with the highest recorded validation score; ties prefer more steps."""
+    root = Path(destination)
+    best: tuple[float, int, Path] | None = None
+    for progress_path in sorted(root.glob("checkpoint-*/training_progress.json")):
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        score = progress.get("validation_score")
+        if score is None:
+            continue
+        candidate = (float(score), int(progress.get("steps", 0)), progress_path.parent)
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    return best[2] if best else None
+
+
+def prune_checkpoints(destination: str | Path, *, keep: set[Path]) -> list[Path]:
+    """Delete periodic checkpoints that are neither kept (best/latest) nor final."""
+    removed = []
+    for checkpoint in sorted(Path(destination).glob("checkpoint-step-*")):
+        if checkpoint not in keep and checkpoint.is_dir():
+            shutil.rmtree(checkpoint)
+            removed.append(checkpoint)
+    return removed
+
+
 def _file_identity(path: str | Path) -> dict[str, int | str]:
     source = Path(path)
     digest = hashlib.sha256()
@@ -119,8 +322,28 @@ def validate_resume_metadata(
         raise ValueError(
             f"checkpoint seed mismatch: checkpoint={progress.get('seed')}, current={expected_seed}"
         )
-    if progress.get("input_identity") != expected_input_identity:
-        raise ValueError("checkpoint input identity does not match the current training inputs")
+    saved_identity = progress.get("input_identity")
+    if saved_identity != expected_input_identity:
+        differences = []
+        if isinstance(saved_identity, dict):
+            for name in sorted(saved_identity.keys() | expected_input_identity.keys()):
+                saved = saved_identity.get(name)
+                current = expected_input_identity.get(name)
+                if saved != current:
+                    differences.append(f"{name}: checkpoint={saved!r}, current={current!r}")
+        else:
+            differences.append(
+                f"input_identity: checkpoint={saved_identity!r}, "
+                f"current={expected_input_identity!r}"
+            )
+        raise ValueError(
+            "checkpoint input identity does not match the current training inputs. "
+            + "; ".join(differences)
+            + ". Restore the original input files to resume, or restart with "
+            "RESUME_TRAINING=0 bash run.sh (archives selected runs and preserves "
+            "the counterfactual generation cache). For scripts/train_model.py, use "
+            "a new --output-dir without --resume-from-checkpoint."
+        )
 
 
 def build_experiment(name: str) -> Experiment:
@@ -209,6 +432,13 @@ def extract_text_backbone(model: Any, inspected: InspectedModelConfig) -> Any:
                 f"{inspected.architecture_kind} model has no expected text backbone {path!r}"
             )
         current = getattr(current, attribute)
+    # PEFT uses wrapper-level quantization flags for checkpointing and LoRA dispatch.
+    if current is not model:
+        for attribute in (
+            "is_loaded_in_4bit", "is_loaded_in_8bit", "is_quantized", "quantization_method",
+        ):
+            if hasattr(model, attribute):
+                setattr(current, attribute, getattr(model, attribute))
     return current
 
 
@@ -225,7 +455,9 @@ def training_plan(config: dict[str, Any], *, experiment: str) -> dict[str, Any]:
     }
 
 
-def format_model_input(record: dict[str, Any], *, use_factors: bool) -> str:
+def format_model_input(
+    record: dict[str, Any], *, use_factors: bool, max_fact_chars: int | None = None
+) -> str:
     """Render explicit input sections shared by all real-model experiments."""
     fact = (
         record.get("fact_strict")
@@ -233,6 +465,13 @@ def format_model_input(record: dict[str, Any], *, use_factors: bool) -> str:
         or record.get("fact_raw")
         or ""
     )
+    if max_fact_chars is not None:
+        fact = focus_fact(
+            fact,
+            str(record.get("target_defendant") or ""),
+            record.get("co_defendants") or (),
+            max_fact_chars,
+        )
     sections = [
         f"[DATASET]\n{record['dataset']}",
         f"[TARGET_DEFENDANT]\n{record['target_defendant']}",
@@ -278,7 +517,13 @@ def load_counterfactual_pairs(
     filter_valid: bool,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Join generated counterfactual records back to original cases by ID."""
+    """Join generated counterfactual records back to original cases by ID.
+
+    Only the sanitized ``counterfactual_strict`` text is used. Records with label or outcome
+    leakage are skipped even when ``filter_valid`` is false.
+    """
+    from legal_landscape.counterfactual.validators import has_leakage
+
     pairs: list[dict[str, Any]] = []
     with Path(path).open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -287,16 +532,16 @@ def load_counterfactual_pairs(
                 validation = row.get("validation") or {}
                 if filter_valid and not validation.get("valid", False):
                     continue
-                parent = parents[str(row["parent_case_id"])]
-                parsed = validation.get("parsed") or {}
-                counterfactual_text = parsed.get("counterfactual_text")
-                if not counterfactual_text and not filter_valid:
-                    try:
-                        counterfactual_text = json.loads(row.get("raw_response") or "{}").get(
-                            "counterfactual_text"
-                        )
-                    except json.JSONDecodeError:
-                        counterfactual_text = None
+                if row.get("leakage") or has_leakage(validation.get("errors") or ()):
+                    continue
+                parent_id = str(row["parent_case_id"])
+                if parent_id not in parents:
+                    raise ValueError(
+                        f"parent case {parent_id} is not among the supplied parent records; "
+                        "counterfactuals must come from the same split as their parents"
+                    )
+                parent = parents[parent_id]
+                counterfactual_text = row.get("counterfactual_strict")
                 if not isinstance(counterfactual_text, str) or not counterfactual_text:
                     continue
                 pairs.append(
@@ -307,6 +552,9 @@ def load_counterfactual_pairs(
                         or parent.get("fact_raw")
                         or "",
                         "counterfactual_text": counterfactual_text,
+                        "counterfactual_factors": row.get("target_factors")
+                        or parent.get("factors")
+                        or {},
                         "intervention_type": row["intervention_type"],
                         "target_charge": row.get("target_charge"),
                         "rank_direction": row.get("rank_direction"),
@@ -321,6 +569,31 @@ def load_counterfactual_pairs(
     return pairs
 
 
+def counterfactual_record(pair: dict[str, Any]) -> dict[str, Any]:
+    """The parent record with the sanitized counterfactual text and intervened factors."""
+    return {
+        **pair["parent_record"],
+        "fact_conservative": pair["counterfactual_text"],
+        "fact_strict": pair["counterfactual_text"],
+        "factors": pair.get("counterfactual_factors") or pair["parent_record"].get("factors"),
+    }
+
+
+def augmentation_records(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ordinary-augmentation records; their penalty and sentence are unknown, so masked."""
+    records = []
+    for pair in pairs:
+        record = counterfactual_record(pair)
+        if pair["intervention_type"] == "charge_flip" and pair.get("target_charge"):
+            record["charges"] = [pair["target_charge"]]
+            record["conviction_articles"] = []
+        record["penalty_type"] = "unknown"
+        record["imprisonment_months"] = None
+        record["mask_penalty"] = True
+        records.append(record)
+    return records
+
+
 def make_static_prediction_rows(
     records: list[dict[str, Any]],
     *,
@@ -332,8 +605,10 @@ def make_static_prediction_rows(
     article_vocabulary: list[str],
     penalty_vocabulary: list[str],
     threshold: float = 0.5,
+    article_threshold: float | None = None,
 ) -> list[dict[str, Any]]:
     """Build evaluation JSON rows while retaining original case/group IDs."""
+    article_cutoff = threshold if article_threshold is None else article_threshold
     if not (
         len(records)
         == len(charge_probabilities)
@@ -357,16 +632,23 @@ def make_static_prediction_rows(
             raise ValueError("charge probability width does not match vocabulary")
         if len(article_probs) != len(article_vocabulary):
             raise ValueError("article probability width does not match vocabulary")
+        # The vocabulary comes from the training split; held-out labels outside it can never
+        # be predicted, so they are reported and count against exact-match accuracy.
         true_charges = [0] * len(charge_vocabulary)
+        unseen_charges = [item for item in record["charges"] if item not in charge_to_index]
         for charge in record["charges"]:
-            true_charges[charge_to_index[charge]] = 1
+            if charge in charge_to_index:
+                true_charges[charge_to_index[charge]] = 1
         predicted_charges = [int(value >= threshold) for value in probabilities]
         if not any(predicted_charges):
             predicted_charges[max(range(len(probabilities)), key=probabilities.__getitem__)] = 1
         true_articles = [0] * len(article_vocabulary)
-        for article in record.get("conviction_articles") or ():
-            true_articles[article_to_index[article]] = 1
-        predicted_articles = [int(value >= threshold) for value in article_probs]
+        record_articles = record.get("conviction_articles") or ()
+        unseen_articles = [item for item in record_articles if item not in article_to_index]
+        for article in record_articles:
+            if article in article_to_index:
+                true_articles[article_to_index[article]] = 1
+        predicted_articles = [int(value >= article_cutoff) for value in article_probs]
         if article_probs and not any(predicted_articles):
             predicted_articles[max(range(len(article_probs)), key=article_probs.__getitem__)] = 1
         rows.append(
@@ -377,6 +659,7 @@ def make_static_prediction_rows(
                 "predicted_charges": predicted_charges,
                 "charge_probabilities": probabilities,
                 "true_charge_labels": list(record["charges"]),
+                "unseen_true_charge_labels": unseen_charges,
                 "predicted_charge_labels": [
                     label
                     for label, selected in zip(charge_vocabulary, predicted_charges, strict=True)
@@ -385,7 +668,8 @@ def make_static_prediction_rows(
                 "true_articles": true_articles,
                 "predicted_articles": predicted_articles,
                 "article_probabilities": article_probs,
-                "true_article_labels": list(record.get("conviction_articles") or ()),
+                "true_article_labels": list(record_articles),
+                "unseen_true_article_labels": unseen_articles,
                 "predicted_article_labels": [
                     label
                     for label, selected in zip(
@@ -397,8 +681,8 @@ def make_static_prediction_rows(
                 "predicted_penalty_type": penalty_vocabulary[penalty_index],
                 "true_months": record.get("imprisonment_months"),
                 "predicted_months": float(predicted_months),
-                "correct": predicted_charges == true_charges,
-                "article_correct": predicted_articles == true_articles,
+                "correct": predicted_charges == true_charges and not unseen_charges,
+                "article_correct": predicted_articles == true_articles and not unseen_articles,
             }
         )
     return rows
@@ -412,6 +696,7 @@ def make_counterfactual_prediction_rows(
     parent_sentences: list[float],
     counterfactual_sentences: list[float],
     charge_vocabulary: list[str],
+    charge_threshold: float = 0.5,
 ) -> list[dict[str, Any]]:
     """Build type-specific counterfactual evaluation JSON rows."""
     if not (
@@ -439,6 +724,12 @@ def make_counterfactual_prediction_rows(
                 "group_id": pair["parent_record"]["group_id"],
                 "intervention_type": pair["intervention_type"],
                 "target_charge": charge_to_index[target] if target is not None else None,
+                "parent_charge_indices": [
+                    charge_to_index[label]
+                    for label in pair["parent_record"].get("charges") or ()
+                    if label in charge_to_index
+                ],
+                "charge_threshold": charge_threshold,
                 "rank_direction": pair.get("rank_direction"),
                 "parent_charge_probabilities": parent_prob,
                 "counterfactual_charge_probabilities": counterfactual_prob,
@@ -516,9 +807,11 @@ def load_backbone(model_config: dict[str, Any]) -> tuple[Any, InspectedModelConf
         except ImportError as exc:
             raise RuntimeError("peft is required for QLoRA training") from exc
         lora = model_config.get("lora", {})
+        gradient_checkpointing = bool(model_config.get("gradient_checkpointing", True))
         model = prepare_model_for_kbit_training(
             model,
-            use_gradient_checkpointing=bool(model_config.get("gradient_checkpointing", True)),
+            use_gradient_checkpointing=gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
         )
         model = get_peft_model(
             model,
@@ -531,6 +824,11 @@ def load_backbone(model_config: dict[str, Any]) -> tuple[Any, InspectedModelConf
                 target_modules="all-linear",
             ),
         )
+        if gradient_checkpointing and not model.is_gradient_checkpointing:
+            raise RuntimeError(
+                "gradient checkpointing was requested but is not enabled on the QLoRA "
+                "text backbone; check quantization metadata and PEFT model preparation"
+            )
     return model, inspected
 
 
@@ -781,12 +1079,37 @@ def run_real_training(
     experiment_name: str,
     counterfactual_data: str | Path | None = None,
     evaluation_data: str | Path | None = None,
+    evaluation_counterfactual_data: str | Path | None = None,
+    validation_data: str | Path | None = None,
     prediction_dir: str | Path | None = None,
     limit: int | None = None,
     resume_from_checkpoint: str | Path | None = None,
     progress_factory: Callable[..., ProgressReporter] = create_progress_reporter,
 ) -> dict[str, Any]:
     """Run a local-only Accelerate loop for baseline, full, or ablation training."""
+    seed = int(config.get("training", {}).get("seed", 42))
+    input_identity: dict[str, Any] = {"train": _file_identity(train_data)}
+    if counterfactual_data is not None:
+        input_identity["counterfactual"] = _file_identity(counterfactual_data)
+    step = 0
+    completed_microbatches = 0
+    progress: dict[str, Any] = {}
+    if resume_from_checkpoint is not None:
+        progress_path = Path(resume_from_checkpoint) / "training_progress.json"
+        if not progress_path.is_file():
+            raise FileNotFoundError(f"checkpoint progress not found: {progress_path}")
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        try:
+            validate_resume_metadata(
+                progress,
+                expected_seed=seed,
+                expected_input_identity=input_identity,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{progress_path}: {exc}") from exc
+        step = int(progress.get("steps", 0))
+        completed_microbatches = int(progress.get("completed_microbatches", 0))
+
     try:
         import torch
         from accelerate import Accelerator
@@ -802,7 +1125,6 @@ def run_real_training(
     from legal_landscape.models.losses import compute_typed_losses
     from legal_landscape.models.predictor import LegalLandscapePredictor
 
-    seed = int(config.get("training", {}).get("seed", 42))
     set_deterministic_seed(seed)
     experiment = build_experiment(experiment_name)
     records = load_processed_records(train_data, limit=limit)
@@ -830,24 +1152,39 @@ def run_real_training(
     article_to_index = {label: index for index, label in enumerate(articles)}
     penalty_to_index = {label: index for index, label in enumerate(penalties)}
     parents = {str(record["case_id"]): record for record in records}
-    evaluation_pairs: list[dict[str, Any]] = []
+    evaluation_records = (
+        load_processed_records(evaluation_data, limit=limit) if evaluation_data is not None else []
+    )
+    validation_records: list[dict[str, Any]] = []
+    if validation_data is not None:
+        validation_records = load_processed_records(validation_data)
+        validation_limit = int(config.get("training", {}).get("validation_limit", 2000))
+        if 0 < validation_limit < len(validation_records):
+            validation_records = random.Random(seed).sample(validation_records, validation_limit)
+    training_groups = {str(record["group_id"]) for record in records}
+    for name, held_out in (("evaluation", evaluation_records), ("validation", validation_records)):
+        shared_groups = training_groups & {str(record["group_id"]) for record in held_out}
+        if shared_groups:
+            raise ValueError(
+                f"training and {name} records share group_id values, e.g. "
+                f"{sorted(shared_groups)[0]}; rebuild the processed dataset"
+            )
     pairs: list[dict[str, Any]] = []
     if counterfactual_data is not None:
-        evaluation_pairs = load_counterfactual_pairs(
+        pairs = load_counterfactual_pairs(
             counterfactual_data,
             parents,
-            filter_valid=True,
+            filter_valid=experiment.filter_counterfactuals,
             limit=limit,
         )
-        pairs = (
-            list(evaluation_pairs)
-            if experiment.filter_counterfactuals
-            else load_counterfactual_pairs(
-                counterfactual_data,
-                parents,
-                filter_valid=False,
-                limit=limit,
-            )
+    # Counterfactual metrics come only from held-out parents, never from training pairs.
+    evaluation_pairs: list[dict[str, Any]] = []
+    if evaluation_counterfactual_data is not None:
+        evaluation_pairs = load_counterfactual_pairs(
+            evaluation_counterfactual_data,
+            {str(record["case_id"]): record for record in evaluation_records},
+            filter_valid=True,
+            limit=limit,
         )
 
     def known_charge_pairs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -871,7 +1208,6 @@ def run_real_training(
         ]
         prediction_root = Path(prediction_dir or destination / "predictions")
         if evaluation_data is not None:
-            evaluation_records = load_processed_records(evaluation_data, limit=limit)
             static_path = prediction_root / "static.jsonl"
             _write_jsonl(
                 static_path,
@@ -907,16 +1243,7 @@ def run_real_training(
             result["counterfactual_predictions"] = str(counterfactual_path)
         return result
     if experiment.ordinary_augmentation:
-        for pair in pairs:
-            parent = dict(pair["parent_record"])
-            parent["fact_conservative"] = pair["counterfactual_text"]
-            parent["fact_strict"] = pair["counterfactual_text"]
-            if pair["intervention_type"] == "charge_flip" and pair["target_charge"]:
-                parent["charges"] = [pair["target_charge"]]
-                parent["conviction_articles"] = []
-            parent["penalty_type"] = "unknown"
-            parent["imprisonment_months"] = None
-            records.append(parent)
+        records.extend(augmentation_records(pairs))
         pairs = []
     allowed_pair_types: set[str] = set()
     if experiment.typed_counterfactuals:
@@ -980,6 +1307,16 @@ def run_real_training(
     )
     max_length = int(config.get("model", {}).get("max_length", config.get("max_length", 4096)))
 
+    def model_text(record: dict[str, Any]) -> str:
+        # Characters bound tokens from above for Chinese text, so focusing to max_length
+        # characters keeps the defendant's facts inside the tokenizer's truncation window.
+        return format_model_input(
+            record, use_factors=experiment.use_factors, max_fact_chars=max_length
+        )
+
+    def text_length(record: dict[str, Any]) -> int:
+        return min(len(model_text(record)), max_length)
+
     def tokenize_texts(texts: list[str]) -> dict[str, Any]:
         return tokenizer(
             texts,
@@ -991,23 +1328,31 @@ def run_real_training(
 
     def collate_cases(batch: list[dict[str, Any]]) -> dict[str, Any]:
         encoded = tokenize_texts(
-            [format_model_input(item, use_factors=experiment.use_factors) for item in batch]
+            [model_text(item) for item in batch]
         )
         charge_targets = torch.zeros((len(batch), len(charges)), dtype=torch.float32)
         article_targets = torch.zeros((len(batch), len(articles)), dtype=torch.float32)
         article_mask = torch.zeros(len(batch), dtype=torch.bool)
         penalty_targets = torch.zeros(len(batch), dtype=torch.long)
+        penalty_mask = torch.ones(len(batch), dtype=torch.bool)
         sentence_targets = torch.zeros(len(batch), dtype=torch.float32)
         sentence_mask = torch.zeros(len(batch), dtype=torch.bool)
         factor_targets = torch.zeros((len(batch), 5), dtype=torch.float32)
         for index, item in enumerate(batch):
+            # Evaluation labels outside the training vocabulary have no output unit.
             for charge in item["charges"]:
-                charge_targets[index, charge_to_index[charge]] = 1.0
-            item_articles = item.get("conviction_articles") or ()
+                if charge in charge_to_index:
+                    charge_targets[index, charge_to_index[charge]] = 1.0
+            item_articles = [
+                article
+                for article in item.get("conviction_articles") or ()
+                if article in article_to_index
+            ]
             for article in item_articles:
                 article_targets[index, article_to_index[article]] = 1.0
             article_mask[index] = bool(item_articles)
             penalty_targets[index] = penalty_to_index[item["penalty_type"]]
+            penalty_mask[index] = not item.get("mask_penalty", False)
             eligible = (
                 item["penalty_type"] == "fixed_term"
                 and item.get("imprisonment_months") is not None
@@ -1032,6 +1377,7 @@ def run_real_training(
             "article_targets": article_targets,
             "article_mask": article_mask,
             "penalty_targets": penalty_targets,
+            "penalty_mask": penalty_mask,
             "sentence_targets": sentence_targets,
             "sentence_mask": sentence_mask,
             "factor_targets": factor_targets,
@@ -1044,24 +1390,17 @@ def run_real_training(
 
     def collate_pairs(batch: list[dict[str, Any]]) -> dict[str, Any]:
         parent_records = [item["parent_record"] for item in batch]
-        cf_records = [
-            {
-                **item["parent_record"],
-                "fact_conservative": item["counterfactual_text"],
-                "fact_strict": item["counterfactual_text"],
-            }
-            for item in batch
-        ]
+        cf_records = [counterfactual_record(item) for item in batch]
         result = {
             "parent": tokenize_texts(
                 [
-                    format_model_input(item, use_factors=experiment.use_factors)
+                    model_text(item)
                     for item in parent_records
                 ]
             ),
             "counterfactual": tokenize_texts(
                 [
-                    format_model_input(item, use_factors=experiment.use_factors)
+                    model_text(item)
                     for item in cf_records
                 ]
             ),
@@ -1082,56 +1421,47 @@ def run_real_training(
 
     training = config.get("training", {})
     batch_size = int(training.get("per_device_batch_size", 1))
-    input_identity: dict[str, Any] = {"train": _file_identity(train_data)}
-    if counterfactual_data is not None:
-        input_identity["counterfactual"] = _file_identity(counterfactual_data)
-    step = 0
-    completed_microbatches = 0
-    progress: dict[str, Any] = {}
-    if resume_from_checkpoint is not None:
-        progress_path = Path(resume_from_checkpoint) / "training_progress.json"
-        if not progress_path.is_file():
-            raise FileNotFoundError(f"checkpoint progress not found: {progress_path}")
-        progress = json.loads(progress_path.read_text(encoding="utf-8"))
-        validate_resume_metadata(
-            progress,
-            expected_seed=seed,
-            expected_input_identity=input_identity,
+    max_tokens = int(training.get("max_tokens_per_batch", batch_size * max_length))
+    inference_batch_size = int(training.get("inference_batch_size", batch_size))
+    inference_max_tokens = int(training.get("inference_max_tokens_per_batch", max_tokens))
+    pair_every = max(1, int(training.get("pair_every", 1)))
+    case_sampler = TokenBudgetBatchSampler(
+        [text_length(record) for record in records], max_tokens, batch_size, seed=seed
+    )
+    pair_sampler = (
+        TokenBudgetBatchSampler(
+            [
+                max(text_length(pair["parent_record"]), text_length(counterfactual_record(pair)))
+                for pair in pairs
+            ],
+            max_tokens,
+            batch_size,
+            seed=seed + 1,
         )
-        step = int(progress.get("steps", 0))
-        completed_microbatches = int(progress.get("completed_microbatches", 0))
-
-    case_sampler = DeterministicEpochSampler(len(records), seed=seed)
-    pair_sampler = DeterministicEpochSampler(len(pairs), seed=seed + 1) if pairs else None
+        if pairs
+        else None
+    )
     if progress:
         case_sampler.load_state_dict(progress["case_sampler"])
         if pair_sampler is not None and progress.get("pair_sampler") is not None:
             pair_sampler.load_state_dict(progress["pair_sampler"])
 
-    loader = DataLoader(
-        records,
-        batch_size=batch_size,
-        sampler=case_sampler,
-        collate_fn=collate_cases,
-    )
+    loader = DataLoader(records, batch_sampler=case_sampler, collate_fn=collate_cases)
     pair_loader = (
-        DataLoader(
-            pairs,
-            batch_size=batch_size,
-            sampler=pair_sampler,
-            collate_fn=collate_pairs,
-        )
+        DataLoader(pairs, batch_sampler=pair_sampler, collate_fn=collate_pairs)
         if pair_sampler is not None
         else None
     )
     mixed_precision = str(training.get("mixed_precision", "bf16"))
+    gradient_accumulation_steps = int(training.get("gradient_accumulation_steps", 8))
     accelerator = Accelerator(
         mixed_precision=mixed_precision,
-        gradient_accumulation_steps=int(training.get("gradient_accumulation_steps", 8)),
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
+    base_learning_rate = float(training.get("learning_rate", 2e-4))
     optimizer = torch.optim.AdamW(
         (parameter for parameter in predictor.parameters() if parameter.requires_grad),
-        lr=float(training.get("learning_rate", 2e-4)),
+        lr=base_learning_rate,
     )
     predictor, optimizer, loader = accelerator.prepare(predictor, optimizer, loader)
     if pair_loader is not None:
@@ -1141,11 +1471,21 @@ def run_real_training(
     destination.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(destination / "tensorboard") if accelerator.is_main_process else None
     log_path = destination / "train.jsonl"
-    max_steps = int(training.get("max_steps", 1000))
-    checkpoint_every = int(training.get("checkpoint_every", 100))
     epochs = int(training.get("epochs", 1))
+    steps_per_epoch = math.ceil(
+        case_sampler.batches_per_epoch / accelerator.num_processes / gradient_accumulation_steps
+    )
+    max_steps = epochs * steps_per_epoch
+    configured_max_steps = int(training.get("max_steps", 1000))
+    if configured_max_steps > 0:
+        max_steps = min(max_steps, configured_max_steps)
+    warmup_steps = round(float(training.get("warmup_ratio", 0.0)) * max_steps)
+    min_learning_rate_ratio = float(training.get("min_learning_rate_ratio", 1.0))
+    checkpoint_every = int(training.get("checkpoint_every", 100))
     pair_iterator = iter(pair_loader) if pair_loader is not None else None
-    weights = config.get("loss", {})
+    loss_config = dict(config.get("loss", {}))
+    multilabel_reduction = str(loss_config.pop("multilabel_reduction", "sum"))
+    weights = {name: float(value) for name, value in loss_config.items()}
 
     def save_checkpoint(path: Path) -> None:
         accelerator.wait_for_everyone()
@@ -1174,6 +1514,148 @@ def run_real_training(
             os.utime(path)
         accelerator.wait_for_everyone()
 
+    def device_batch(value: Any) -> Any:
+        device = getattr(accelerator, "device", None)
+        if isinstance(value, dict):
+            return {name: device_batch(item) for name, item in value.items()}
+        if device is not None and hasattr(value, "to"):
+            return value.to(device)
+        return value
+
+    def forward_static(batch: dict[str, Any]) -> list[tuple[int, tuple[Any, ...]]]:
+        output = predictor(batch["input_ids"], batch.get("attention_mask"))
+        return list(zip(
+            batch["record_indices"].tolist(),
+            zip(
+                torch.sigmoid(output["charge_logits"]).float().cpu().tolist(),
+                torch.sigmoid(output["article_logits"]).float().cpu().tolist(),
+                output["penalty_type_logits"].argmax(dim=-1).cpu().tolist(),
+                output["sentence_months"].float().cpu().tolist(),
+                strict=True,
+            ),
+            strict=True,
+        ))
+
+    def forward_pairs(batch: dict[str, Any]) -> list[tuple[int, tuple[Any, ...]]]:
+        parent = predictor(batch["parent"]["input_ids"], batch["parent"].get("attention_mask"))
+        counterfactual = predictor(
+            batch["counterfactual"]["input_ids"], batch["counterfactual"].get("attention_mask")
+        )
+        return list(zip(
+            batch["pair_indices"].tolist(),
+            zip(
+                torch.sigmoid(parent["charge_logits"]).float().cpu().tolist(),
+                torch.sigmoid(counterfactual["charge_logits"]).float().cpu().tolist(),
+                parent["sentence_months"].float().cpu().tolist(),
+                counterfactual["sentence_months"].float().cpu().tolist(),
+                strict=True,
+            ),
+            strict=True,
+        ))
+
+    def predict(
+        items: list[dict[str, Any]],
+        *,
+        kind: str,
+        collate: Callable[[list[dict[str, Any]]], dict[str, Any]],
+        lengths: list[int],
+        forward: Callable[[dict[str, Any]], list[tuple[int, tuple[Any, ...]]]],
+        progress_reporter: ProgressReporter,
+    ) -> dict[int, tuple[Any, ...]] | None:
+        """Length-bucketed prediction; every process runs the same number of batches and the
+        main process receives all outputs keyed by item position."""
+        from accelerate.utils import gather_object
+
+        indexed = [{**item, "_prediction_index": index} for index, item in enumerate(items)]
+        batches = shard_batches(
+            inference_batches(lengths, inference_max_tokens, inference_batch_size),
+            accelerator.num_processes,
+            accelerator.process_index,
+        )
+        local_loader = DataLoader(indexed, batch_sampler=batches, collate_fn=collate)
+        results: list[tuple[int, tuple[Any, ...]]] = []
+        with (
+            progress_reporter.task(
+                f"Predict {kind}",
+                total=_prediction_progress_total(local_loader),
+                kind=kind,
+                batches=0,
+            ) as prediction_progress,
+            torch.no_grad(),
+        ):
+            for batches_done, batch in enumerate(local_loader, start=1):
+                results.extend(forward(device_batch(batch)))
+                _report_prediction_batch(prediction_progress, kind, batches_done)
+        gathered = gather_object(results)
+        if not accelerator.is_main_process:
+            return None
+        return {int(index): payload for index, payload in gathered}
+
+    def label_matrix(
+        items: list[dict[str, Any]], key: str, vocabulary: dict[str, int]
+    ) -> list[list[int]]:
+        matrix = []
+        for item in items:
+            row = [0] * len(vocabulary)
+            for label in item.get(key) or ():
+                if label in vocabulary:
+                    row[vocabulary[label]] = 1
+            matrix.append(row)
+        return matrix
+
+    def micro_f1(probabilities: list[list[float]], truth: list[list[int]]) -> float:
+        import numpy as np
+
+        predicted = np.asarray(probabilities) >= 0.5
+        labels = np.asarray(truth, dtype=bool)
+        denominator = float(predicted.sum() + labels.sum())
+        return 2 * float((predicted & labels).sum()) / denominator if denominator else 0.0
+
+    def validation_outputs(progress_reporter: ProgressReporter) -> list[tuple[Any, ...]] | None:
+        predictor.eval()
+        try:
+            outputs = predict(
+                validation_records,
+                kind="validation",
+                collate=collate_cases,
+                lengths=[text_length(record) for record in validation_records],
+                forward=forward_static,
+                progress_reporter=progress_reporter,
+            )
+        finally:
+            predictor.train()
+        if outputs is None:
+            return None
+        return [outputs[index] for index in range(len(validation_records))]
+
+    def score_checkpoint(path: Path, progress_reporter: ProgressReporter) -> None:
+        """Record the mean charge/article micro-F1 on the validation subset and keep only the
+        best and latest periodic checkpoints."""
+        if not validation_records:
+            return
+        outputs = validation_outputs(progress_reporter)
+        if accelerator.is_main_process and outputs is not None:
+            score = (
+                micro_f1(
+                    [item[0] for item in outputs],
+                    label_matrix(validation_records, "charges", charge_to_index),
+                )
+                + micro_f1(
+                    [item[1] for item in outputs],
+                    label_matrix(validation_records, "conviction_articles", article_to_index),
+                )
+            ) / 2
+            progress_path = path / "training_progress.json"
+            saved = json.loads(progress_path.read_text(encoding="utf-8"))
+            saved["validation_score"] = score
+            progress_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), "utf-8")
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"step": step, "validation_score": score}) + "\n")
+            if bool(training.get("keep_best_and_latest_checkpoints", True)):
+                best = select_best_checkpoint(destination)
+                prune_checkpoints(destination, keep={path, *([best] if best else [])})
+        accelerator.wait_for_everyone()
+
     reporter = progress_factory(
         enabled=_progress_enabled_for_process(is_main_process=accelerator.is_main_process)
     )
@@ -1200,6 +1682,7 @@ def run_real_training(
                             article_mask=batch["article_mask"],
                             penalty_logits=output["penalty_type_logits"],
                             penalty_targets=batch["penalty_targets"],
+                            penalty_mask=batch.get("penalty_mask"),
                             sentence_predictions=output["sentence_months"],
                             sentence_targets=batch["sentence_targets"],
                             sentence_mask=batch["sentence_mask"],
@@ -1210,16 +1693,21 @@ def run_real_training(
                             if experiment.use_factors
                             else None,
                             weights=weights,
+                            multilabel_reduction=multilabel_reduction,
                         )
                         validate_loss_breakdown(
                             supervised_losses,
                             destination / "loss_diagnostic.json",
                             step=step,
                         )
-                        accelerator.backward(supervised_losses.total)
+                        # Inactive or fully masked heads still need DDP gradient hooks.
+                        supervised_backward = supervised_losses.total + _zero_output_anchor(output)
+                        accelerator.backward(supervised_backward)
                         loss_values = _detached_loss_values(supervised_losses)
-                        del output, supervised_losses
-                        if pair_iterator is not None:
+                        del output, supervised_backward, supervised_losses
+                        # Every process uses the same microbatch counter, so pair steps (and
+                        # their DDP backward passes) stay aligned across ranks.
+                        if pair_iterator is not None and completed_microbatches % pair_every == 0:
                             try:
                                 pair_batch = next(pair_iterator)
                             except StopIteration:
@@ -1279,6 +1767,7 @@ def run_real_training(
                                 rank_direction=pair_batch["rank_direction"],
                                 rank_margin=float(training.get("rank_margin", 1.0)),
                                 weights=weights,
+                                multilabel_reduction=multilabel_reduction,
                             )
                             validate_loss_breakdown(
                                 paired_losses,
@@ -1327,22 +1816,27 @@ def run_real_training(
                                     )
                                 del parent_output
                             del parent_charge_gradient, parent_sentence_gradient, parent_rng
-                            pair_count = len(pair_batch["pair_types"])
                             del pair_batch
                             if pair_sampler is not None:
-                                pair_sampler.advance(pair_count * accelerator.num_processes)
+                                pair_sampler.advance(accelerator.num_processes)
                         completed_optimizer_step = accelerator.sync_gradients
+                        learning_rate = base_learning_rate * learning_rate_factor(
+                            step, max_steps, warmup_steps, min_learning_rate_ratio
+                        )
+                        for group in optimizer.param_groups:
+                            group["lr"] = learning_rate
                         optimizer.step()
                         optimizer.zero_grad()
                     completed_microbatches += 1
-                    case_sampler.advance(batch["input_ids"].shape[0] * accelerator.num_processes)
+                    # Each process consumes one batch per microbatch.
+                    case_sampler.advance(accelerator.num_processes)
                     if completed_optimizer_step:
                         step += 1
                         _report_optimizer_step(
                             train_progress, step, max_steps, loss_values["total"]
                         )
                     if completed_optimizer_step and accelerator.is_main_process:
-                        log = {"step": step, **loss_values}
+                        log = {"step": step, **loss_values, "learning_rate": learning_rate}
                         with log_path.open("a", encoding="utf-8") as handle:
                             handle.write(json.dumps(log) + "\n")
                         if writer is not None:
@@ -1355,27 +1849,81 @@ def run_real_training(
                         and step % checkpoint_every == 0
                         and step < max_steps
                     ):
-                        save_checkpoint(destination / f"checkpoint-step-{step:08d}")
+                        periodic = destination / f"checkpoint-step-{step:08d}"
+                        save_checkpoint(periodic)
+                        score_checkpoint(periodic, active_progress)
                     if step >= max_steps:
                         break
                 if step >= max_steps:
                     break
                 case_sampler.next_epoch()
-            save_checkpoint(destination / "checkpoint-final")
+            final_checkpoint = destination / "checkpoint-final"
+            save_checkpoint(final_checkpoint)
+            score_checkpoint(final_checkpoint, active_progress)
             if writer is not None:
                 writer.close()
+        selected_checkpoint = final_checkpoint
+        if validation_records and bool(training.get("select_best_checkpoint", True)):
+            from accelerate.utils import broadcast_object_list
+
+            choice = [
+                str(select_best_checkpoint(destination) or final_checkpoint)
+                if accelerator.is_main_process
+                else None
+            ]
+            broadcast_object_list(choice)
+            if Path(str(choice[0])) != final_checkpoint:
+                accelerator.load_state(str(choice[0]))
+                selected_checkpoint = Path(str(choice[0]))
+        result: dict[str, Any] = {
+            "steps": step,
+            "output_dir": str(destination),
+            "counterfactual_pairs": len(pairs),
+            "evaluation_counterfactual_pairs": len(evaluation_pairs),
+            "selected_checkpoint": str(selected_checkpoint),
+        }
+        prediction_root = Path(prediction_dir or destination / "predictions")
+        charge_threshold = article_threshold = 0.5
+        if validation_records:
+            outputs = validation_outputs(active_progress)
+            if accelerator.is_main_process and outputs is not None:
+                charge_threshold = tune_threshold(
+                    [item[0] for item in outputs],
+                    label_matrix(validation_records, "charges", charge_to_index),
+                )
+                article_threshold = tune_threshold(
+                    [item[1] for item in outputs],
+                    label_matrix(validation_records, "conviction_articles", article_to_index),
+                )
+                prediction_root.mkdir(parents=True, exist_ok=True)
+                (prediction_root / "thresholds.json").write_text(
+                    json.dumps(
+                        {
+                            "charge": charge_threshold,
+                            "article": article_threshold,
+                            "validation_records": len(validation_records),
+                            "selected_checkpoint": str(selected_checkpoint),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+        result["thresholds"] = {"charge": charge_threshold, "article": article_threshold}
         if accelerator.is_main_process:
             (destination / "run_metadata.json").write_text(
                 json.dumps(
                     {
                         "experiment": asdict(experiment),
                         "steps": step,
+                        "max_steps": max_steps,
                         "completed_microbatches": completed_microbatches,
                         "charge_vocabulary": charges,
                         "article_vocabulary": articles,
                         "penalty_vocabulary": penalties,
                         "counterfactual_pairs": len(pairs),
                         "evaluation_counterfactual_pairs": len(evaluation_pairs),
+                        "selected_checkpoint": str(selected_checkpoint),
+                        "thresholds": result["thresholds"],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -1383,76 +1931,18 @@ def run_real_training(
                 encoding="utf-8",
             )
 
-        result: dict[str, Any] = {
-            "steps": step,
-            "output_dir": str(destination),
-            "counterfactual_pairs": len(pairs),
-            "evaluation_counterfactual_pairs": len(evaluation_pairs),
-        }
-        prediction_root = Path(prediction_dir or destination / "predictions")
         predictor.eval()
         if evaluation_data is not None:
-            evaluation_records = load_processed_records(evaluation_data, limit=limit)
-            indexed_records = [
-                {**record, "_prediction_index": index}
-                for index, record in enumerate(evaluation_records)
-            ]
-            evaluation_loader = accelerator.prepare(
-                DataLoader(
-                    indexed_records,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    collate_fn=collate_cases,
-                )
+            static_outputs = predict(
+                evaluation_records,
+                kind="static",
+                collate=collate_cases,
+                lengths=[text_length(record) for record in evaluation_records],
+                forward=forward_static,
+                progress_reporter=active_progress,
             )
-            gathered_static: dict[int, tuple[list[float], list[float], int, float]] = {}
-            with (
-                active_progress.task(
-                    "Predict static",
-                    total=_prediction_progress_total(evaluation_loader),
-                    kind="static",
-                    batches=0,
-                ) as prediction_progress,
-                torch.no_grad(),
-            ):
-                for batches, batch in enumerate(evaluation_loader, start=1):
-                    output = predictor(batch["input_ids"], batch.get("attention_mask"))
-                    gathered = accelerator.gather_for_metrics(
-                        (
-                            batch["record_indices"],
-                            torch.sigmoid(output["charge_logits"]),
-                            torch.sigmoid(output["article_logits"]),
-                            output["penalty_type_logits"].argmax(dim=-1),
-                            output["sentence_months"],
-                        )
-                    )
-                    (
-                        indices,
-                        probabilities,
-                        article_probabilities,
-                        penalty_indices,
-                        sentence_months,
-                    ) = gathered
-                    if accelerator.is_main_process:
-                        for index, probability, article_probability, penalty, months in zip(
-                            indices.cpu().tolist(),
-                            probabilities.float().cpu().tolist(),
-                            article_probabilities.float().cpu().tolist(),
-                            penalty_indices.cpu().tolist(),
-                            sentence_months.float().cpu().tolist(),
-                            strict=True,
-                        ):
-                            gathered_static[int(index)] = (
-                                probability,
-                                article_probability,
-                                int(penalty),
-                                float(months),
-                            )
-                    _report_prediction_batch(prediction_progress, "static", batches)
-            if accelerator.is_main_process:
-                ordered_static = [
-                    gathered_static[index] for index in range(len(evaluation_records))
-                ]
+            if accelerator.is_main_process and static_outputs is not None:
+                ordered_static = [static_outputs[index] for index in range(len(evaluation_records))]
                 static_path = prediction_root / "static.jsonl"
                 _write_jsonl(
                     static_path,
@@ -1461,72 +1951,33 @@ def run_real_training(
                         charge_probabilities=[item[0] for item in ordered_static],
                         article_probabilities=[item[1] for item in ordered_static],
                         penalty_indices=[item[2] for item in ordered_static],
-                        sentence_months=[item[3] for item in ordered_static],
+                        sentence_months=[float(item[3]) for item in ordered_static],
                         charge_vocabulary=charges,
                         article_vocabulary=articles,
                         penalty_vocabulary=penalties,
+                        threshold=charge_threshold,
+                        article_threshold=article_threshold,
                     ),
                 )
                 result["static_predictions"] = str(static_path)
 
         if evaluation_pairs:
-            indexed_pairs = [
-                {**pair, "_prediction_index": index} for index, pair in enumerate(evaluation_pairs)
-            ]
-            prediction_pair_loader = accelerator.prepare(
-                DataLoader(
-                    indexed_pairs,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    collate_fn=collate_pairs,
-                )
+            pair_outputs = predict(
+                evaluation_pairs,
+                kind="counterfactual",
+                collate=collate_pairs,
+                lengths=[
+                    max(
+                        text_length(pair["parent_record"]),
+                        text_length(counterfactual_record(pair)),
+                    )
+                    for pair in evaluation_pairs
+                ],
+                forward=forward_pairs,
+                progress_reporter=active_progress,
             )
-            gathered_pairs: dict[int, tuple[list[float], list[float], float, float]] = {}
-            with (
-                active_progress.task(
-                    "Predict counterfactual",
-                    total=_prediction_progress_total(prediction_pair_loader),
-                    kind="counterfactual",
-                    batches=0,
-                ) as prediction_progress,
-                torch.no_grad(),
-            ):
-                for batches, batch in enumerate(prediction_pair_loader, start=1):
-                    parent_output = predictor(
-                        batch["parent"]["input_ids"], batch["parent"].get("attention_mask")
-                    )
-                    counterfactual_output = predictor(
-                        batch["counterfactual"]["input_ids"],
-                        batch["counterfactual"].get("attention_mask"),
-                    )
-                    gathered = accelerator.gather_for_metrics(
-                        (
-                            batch["pair_indices"],
-                            torch.sigmoid(parent_output["charge_logits"]),
-                            torch.sigmoid(counterfactual_output["charge_logits"]),
-                            parent_output["sentence_months"],
-                            counterfactual_output["sentence_months"],
-                        )
-                    )
-                    indices, parent_prob, counterfactual_prob, parent_months, cf_months = gathered
-                    if accelerator.is_main_process:
-                        for index, first_prob, second_prob, first_months, second_months in zip(
-                            indices.cpu().tolist(),
-                            parent_prob.float().cpu().tolist(),
-                            counterfactual_prob.float().cpu().tolist(),
-                            parent_months.float().cpu().tolist(),
-                            cf_months.float().cpu().tolist(),
-                            strict=True,
-                        ):
-                            gathered_pairs[int(index)] = (
-                                first_prob,
-                                second_prob,
-                                float(first_months),
-                                float(second_months),
-                            )
-                    _report_prediction_batch(prediction_progress, "counterfactual", batches)
-            if accelerator.is_main_process:
-                ordered_pairs = [gathered_pairs[index] for index in range(len(evaluation_pairs))]
+            if accelerator.is_main_process and pair_outputs is not None:
+                ordered_pairs = [pair_outputs[index] for index in range(len(evaluation_pairs))]
                 counterfactual_path = prediction_root / "counterfactual.jsonl"
                 _write_jsonl(
                     counterfactual_path,
@@ -1534,9 +1985,10 @@ def run_real_training(
                         evaluation_pairs,
                         parent_probabilities=[item[0] for item in ordered_pairs],
                         counterfactual_probabilities=[item[1] for item in ordered_pairs],
-                        parent_sentences=[item[2] for item in ordered_pairs],
-                        counterfactual_sentences=[item[3] for item in ordered_pairs],
+                        parent_sentences=[float(item[2]) for item in ordered_pairs],
+                        counterfactual_sentences=[float(item[3]) for item in ordered_pairs],
                         charge_vocabulary=charges,
+                        charge_threshold=charge_threshold,
                     ),
                 )
                 result["counterfactual_predictions"] = str(counterfactual_path)

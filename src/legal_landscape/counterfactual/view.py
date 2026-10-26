@@ -8,7 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from legal_landscape.counterfactual.generate import GenerationRequest
+from legal_landscape.counterfactual.generate import GenerationRequest, text_sha256
+from legal_landscape.data.sanitize import SANITIZER_VERSION
 
 
 def publish_request_view(
@@ -53,6 +54,10 @@ def publish_request_view(
                     raise ValueError("checkpoint fingerprint mismatch")
                 if row.get("prompt_version") != prompt_version:
                     raise ValueError("prompt version mismatch; use a new cache output path")
+                if row.get("sanitizer_version") != SANITIZER_VERSION:
+                    raise ValueError("sanitizer version mismatch; use a new cache output path")
+                if row.get("parent_text_sha256") != text_sha256(wanted[generation_id].parent_text):
+                    raise ValueError("parent text mismatch; rebuild the counterfactual cache")
                 spec = wanted[generation_id].spec.to_dict()
                 for key, value in spec.items():
                     if row.get(key) != value:
@@ -66,10 +71,9 @@ def publish_request_view(
                 if parsed is not None and not isinstance(parsed, dict):
                     raise ValueError("invalid parsed validation schema")
                 if validation["valid"]:
-                    if not isinstance(parsed, dict) or not isinstance(
-                        parsed.get("counterfactual_text"), str
-                    ) or not parsed["counterfactual_text"]:
-                        raise ValueError("valid record has no counterfactual text")
+                    strict = row.get("counterfactual_strict")
+                    if not isinstance(strict, str) or not strict:
+                        raise ValueError("valid record has no sanitized counterfactual text")
                     valid += 1
                 selected[generation_id] = line.rstrip("\n") + "\n"
             except (ValueError, KeyError, TypeError) as exc:

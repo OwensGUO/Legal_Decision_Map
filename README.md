@@ -41,7 +41,7 @@ python -m pip check
 MODE=smoke bash run.sh
 ```
 
-目标服务器为 Ubuntu 24.04 x86-64、NVIDIA 驱动 580.173.02、CUDA 13.0，默认分配
+目标服务器为 Ubuntu 20.04 x86-64、NVIDIA 驱动 580.178.04、CUDA 13.0，默认分配
 四张 RTX 4090（物理编号 `4,5,6,7`）。请新建环境，不要原地升级旧环境。
 
 基础环境不安装可选的 `flash-linear-attention[cuda]==0.5.2`。基础 `MODE=smoke`
@@ -147,18 +147,41 @@ Qwen3.8-27B BF16 vLLM 服务、断点续生成三类反事实、停止 vLLM 释�
 分别表示本次记录数、验证通过数、未选入的历史记录数。生成与训练使用相同的处理后父案件
 行数限制，避免 CMDL 多被告展开或长文本跳过造成范围不一致。重复请求记录、损坏 JSON、
 生成器/干预不一致或缺失请求会在发布前报错，不会静默筛除，也不会覆盖旧视图。
+
+反事实评测只使用留出数据：脚本另外以 `processed/*/test.jsonl` 为父案件生成
+`counterfactuals/<generator>/heldout/{cail,cmdl}.jsonl`，并发布
+`heldout/views/<mode>/` 视图，通过 `--evaluation-counterfactual-data` 传给训练脚本，
+只用于导出 `predictions/counterfactual.jsonl`，从不参与训练。训练集反事实只用于训练。
+训练脚本还会在加载模型前检查训练集与评测集没有共享的 `group_id`。
+
+**升级提示（数据泄露修复）**：本次修改了脱敏器、因素抽取、干预规则、提示词（`v3`）和
+反事实缓存键，旧的处理数据、反事实缓存和检查点都不再兼容，修复前得到的 M 对 B3
+结果也不应再作为结论引用。请使用新的 `OUTPUT_ROOT` 从头运行，例如
+`OUTPUT_ROOT=/data/experiments/legal-landscape-v2 bash run.sh`。生成脚本会拒绝读取
+脱敏器版本不符的处理数据，视图发布会拒绝父文本哈希或脱敏器版本不一致的缓存记录。
+
 训练、检查点、预测和评测隔离为
 `runs/{qwen38,qwen36}/{cail,cmdl}/{experiment}/seed-{seed}/`，避免跨生成器恢复或混用。
-反事实生成始终带 `--resume`。训练默认每 100 个优化器更新保存一次
-`checkpoint-step-*`；main/matrix 若发生中断，再次执行会从时间最新的周期或最终检查点恢复。可用
-`CHECKPOINT_EVERY` 调整间隔。最终状态写入 `${OUTPUT_ROOT}/run-summary.json`，记录所选
+反事实生成始终带 `--resume`。训练默认每 200 个优化器更新保存一次
+`checkpoint-step-*`，并在验证集子集上打分；main/matrix 若发生中断，再次执行会从时间最新的周期
+或最终检查点恢复。可用 `CHECKPOINT_EVERY` 调整间隔。main/matrix 默认 `MAX_STEPS=0`，即按
+配置训练完整 epoch；smoke 仍只跑 1 步。最终状态写入 `${OUTPUT_ROOT}/run-summary.json`，记录所选
 生成器；该根目录文件及诊断日志代表最近一次运行，按生成器隔离的结果保存在上述目录。
 
 smoke 结果单独写入 `runs/<generator>/smoke/length-<SMOKE_MAX_LENGTH>/`，每次从头训练，
 不恢复检查点。已有同一实验/种子的结果会移到带 `.previous-<时间>-<PID>` 后缀的相邻目录，
 可恢复，不删除。M 等类型化训练若过滤后没有可用反事实对，会在加载模型前明确中止。
 本次修改前的 main/matrix 检查点以主缓存文件为输入，不能直接恢复到新的视图输入；首次
-升级正式实验请使用新的 `OUTPUT_ROOT`，保留旧结果。新的检查点仍严格校验输入身份。
+升级正式实验可使用 `RESUME_TRAINING=0 bash run.sh`：将本次选中的数据集/实验/种子目录
+移到带 `.previous-<时间>-<PID>` 后缀的相邻目录，然后从头训练；处理数据和反事实主缓存
+继续复用，生成仍带 `--resume`。也可使用新的 `OUTPUT_ROOT`，保留旧结果。
+`RESUME_TRAINING` 默认为 `1`；只需重训某个实验时可加 `EXPERIMENTS=M`。
+重训完成后的后续运行应恢复默认值，否则每次都会归档并重新训练。
+
+如果出现 `checkpoint input identity does not match the current training inputs`，说明旧检查点
+记录的输入路径、文件字节数或 SHA-256 与当前输入不同。训练会在加载模型前报出检查点路径
+及各项输入差异；应恢复原输入以续训，或按上面的方法保留旧结果后重训。不要修改检查点里的
+哈希绕过校验。`accelerate launch` 的默认参数警告与这个错误无关。
 
 服务器上传代码后，可在 **Bash** 中运行并保存完整日志（无需服务器安装 Git）：
 
@@ -296,12 +319,27 @@ strict 三种文本、屏蔽审计、因素、标签、原始路径、case/group
 
 CAIL 的定罪法条来自 `meta.relevant_articles`，CMDL 来自目标被告各项
 `outcomes[].judgment[].article`，统一规范为 `criminal_law:<条>[:<款>]`。CMDL 顶层
-`relevant_articles` 是案件级信息，不会复制为每个被告的监督标签。训练优先使用
+`relevant_articles` 是案件级信息，不会复制为每个被告的监督标签。训练使用
 `fact_strict`，避免原文中的罪名和法条引用泄漏到预测任务。
 
-源数据中存在少量相同案件跨官方 split 重复的情况。构建器会按 `test > valid > train`
-将整个 `group_id` 只保留在最严格的留出集，防止训练集泄漏；`metadata.json` 的
-`split_integrity` 会记录跨 split 组数和各 split 删除的单元数。该处理不修改源数据。
+脱敏与样本标签无关（`metadata.json` 的 `sanitizer` 记录版本与词典）：所有 split、所有被告
+使用同一份由训练集罪名展开得到的词典（含 CAIL `[走私、贩卖、运输、制造]毒品` 这类括号
+罪名的全部写法），再加上“犯/构成/涉嫌……罪”等提示词后的罪名。conservative 文本从
+“公诉机关认为”“其行为已构成”“建议……量刑”“依照《……》”等标记开始截掉该句的法律结论和
+量刑建议，保留其前面的事实；strict 文本再屏蔽罪名、起诉书罪名小标题及法条/款/项。
+“盗窃白酒”“骗取钱款”这类事实动词对所有样本一致保留。因素从 strict 文本抽取，行为方式
+只依据行为描述（如“盗走”“谎称”“趁人不备”），不使用罪名词；CMDL 多被告案件会忽略只
+涉及其他被告的句子。
+
+罪名和法条词表只来自训练集；评测集中训练未见的标签记录在 `metadata.json` 的
+`label_coverage` 和预测行的 `unseen_true_*_labels` 中，评测时作为一个无法预测的额外类别
+计为错误。
+
+构建器按规范化事实（去空白和标点）聚合案件，并用 MinHash（字符 5-gram，估计 Jaccard
+≥ 0.9）检测跨 split 的近重复，整个聚类只保留在最严格的留出集（`test > valid > train`）。
+同一事实的不同被告共享同一 `group_id`，原始 ID 保存在 `source_group_id`；
+`metadata.json` 的 `split_integrity` 记录近重复对数、跨 split 组数和各 split 删除的单元数。
+该处理不修改源数据。
 
 ## 7. 启动本地 Qwen3.8-27B BF16 vLLM 服务
 
@@ -341,6 +379,23 @@ curl --fail http://127.0.0.1:30000/health
 训练加载器读取顶层及嵌套 `text_config`：纯文本 checkpoint 使用 causal-LM loader；
 多模态 `ForConditionalGeneration` checkpoint 使用正确的 image-text loader，再提取语言
 骨干并释放/冻结视觉模块。分类前向只返回最后一层状态，不保存所有层隐藏状态。
+提取骨干时保留外层的量化标记，让 PEFT 正确识别 NF4 模型并选择 4-bit LoRA 层。
+QLoRA 使用非重入梯度检查点（`use_reentrant=False`），并在加载后检查其确实启用；
+若请求启用但实际未生效，会在训练前明确报错。仅在配置中写 `gradient_checkpointing: true`
+不足以证明它已经生效，PEFT 还依赖模型的量化标记。
+
+如果 main 模式在 `Train B3 0/1000` 的第一次前向就显存不足，先确认服务器已同步最新
+`src/legal_landscape/training/train.py`，不要反复删除缓存或检查点。当前四卡训练是数据并行，
+每卡各放一份模型，不会把四张卡的显存合成单卡容量。需要有界验证时可先运行
+`MODE=smoke SMOKE_MAX_LENGTH=1024 bash run.sh`；smoke 通过不代表正式的 4096/8192
+token 长度必然能容纳，正式运行的峰值显存仍需服务器实测。
+
+监督、反事实和父样本重计算的反向传播都会为全部预测头保留梯度连接。B3/A4 不使用因素
+损失，或某批次没有可用的法条/刑期标签时，未启用的头通过零梯度完成 DDP 归约，不增加
+损失项的数值。若旧代码报 `Expected to have finished reduction in the prior iteration`，
+请同步最新训练文件。可用 `python -m pytest -q tests/test_training_distributed.py` 在 CPU 上
+运行真实双进程回归测试：覆盖梯度累积、两次优化器更新、周期/最终检查点和预测汇总，
+不加载预训练权重；需要已安装项目的 PyTorch、Accelerate、Transformers 和 TensorBoard。
 
 ## 8. 反事实 dry-run、mock 与真实小批量
 
@@ -371,10 +426,26 @@ python scripts/generate_counterfactuals.py \
   --limit 12 --resume --execute
 ```
 
-输出保存原案件 ID、类型、前后因素、changed_fields、rule_id、模型/提示版本、采样参数、
-种子、原始响应、重试次数和逐项验证结果。每行的 `generator_identity` 保存完整生成器身份，
+生成器只看到父案件的 `fact_strict`，提示词（`v3`）只给出目标被告和需要改写的事实
+（金额、退赃情况或行为描述），不包含罪名、`rule_id`、干预类型或量刑方向，并要求原样保留
+`××` 与 `[已屏蔽]` 遮蔽标记。处理后数据须带当前版本的 `metadata.json`，脚本从中读取
+脱敏词典。干预规则只对单罪名父案件做罪名翻转；金额不变性干预在 ±1% 内选择不跨越
+常见数额档位（如 3000、3 万、50 万元）的方向，否则跳过。
+
+校验器按“生成文本比父文本多出”的数量判断泄露：新增罪名、法条、法律结论段、刑罚/量刑
+用语，或 `××`/`[已屏蔽]` 数量减少，分别记为 `label_leakage`、`article_leakage`、
+`conclusion_leakage`、`sentence_leakage`、`mask_restored`。行为改写须出现目标行为的
+描述且不再保留原行为描述；其余因素由重新抽取比对，变化记为 `non_target_changed:*`。
+校验结果附带相似度和新增 8-gram 比例，便于人工抽检生成器是否带入原文以外的内容。
+
+输出保存原案件 ID、类型、前后因素、changed_fields、rule_id、模型/提示/脱敏器版本、
+父文本 SHA-256、采样参数、种子、原始响应、重试次数、逐项验证结果、`leakage` 标记和
+再次脱敏后的 `counterfactual_strict`；训练和评测只读取 `counterfactual_strict`。
+存在泄露错误的记录在任何实验（包括不过滤的 A6）中都不会使用；B5 普通增强样本的
+刑罚类型与刑期损失被屏蔽。每行的 `generator_identity` 保存完整生成器身份，
 `model_revision` 保存非占位的 checkpoint 指纹；配置中的 `local` 只作为
-`configured_revision` 保留。`--resume` 在身份核验后按稳定 generation ID 跳过完成项。
+`configured_revision` 保留。generation ID 包含父文本哈希、提示词版本和脱敏器版本；
+`--resume` 在身份核验后按 generation ID 跳过完成项。
 真实生成命令的 `generator.model_path` 会成为 HTTP 请求的 `model` 字段，因此必须与
 第 7 节 `--served-model-name` 的别名一致；`generator.checkpoint_path` 独立记录本地目录，
 两者都必须与实际服务一致。切换到 Qwen3.6 时同时改用对应配置、checkpoint、服务别名和
@@ -458,6 +529,29 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --multi_gpu --num_processes 4 \
 静态预测文件同时保存罪名和法条的真实/预测多热向量、概率与可读标签，以及刑罚类型和
 连续月份预测。
 
+训练配置（`configs/model/qwen35_9b_qlora.yaml` 的 `training`/`loss`）：
+
+- **批次**：按长度分桶，每批最多 `per_device_batch_size` 条、补齐后 token 数（批大小 × 最长
+  样本）不超过 `max_tokens_per_batch`（默认 8192，与 CMDL 单条 8192 的已验证峰值相同）。
+  长度按字符数估计（中文字符数不少于 token 数），批次顺序确定且可按批次断点恢复。推理同样
+  按长度排序分批（`inference_batch_size`、`inference_max_tokens_per_batch`），并把批次均分给各
+  进程，输出按原顺序还原。显存不足时先调小 `max_tokens_per_batch` 或推理预算。
+- **步数**：`epochs` 个完整 epoch；`max_steps=0` 表示不封顶，正数则作为优化器更新上限。
+- **学习率**：前 `warmup_ratio` 比例的更新线性预热，之后余弦衰减到
+  `min_learning_rate_ratio × learning_rate`；每步学习率写入 `train.jsonl`。
+- **损失**：罪名、法条及反事实的多标签损失默认对类别求和（`loss.multilabel_reduction: sum`），
+  避免正类梯度被数百个负类稀释；`mean` 可恢复旧口径。
+- **反事实对**：M 等类型化实验每 `pair_every` 个微批次计算一次反事实损失（默认 4），降低每步
+  开销；各进程按同一计数器调度，保证 DDP 反向次数一致。
+- **验证集**：通过 `--validation-data`（run.sh 传入 `processed/*/valid.jsonl`）抽取
+  `validation_limit` 条（默认 2000），每个周期检查点和最终检查点按罪名与法条 micro-F1 的平均值
+  打分，记录在 `training_progress.json` 的 `validation_score`；只保留最佳和最新的周期检查点。
+  训练结束后加载得分最高的检查点（分数相同取步数更多者），再在验证集上为罪名和法条分别选择
+  使 micro-F1 最大的决策阈值，写入 `predictions/thresholds.json` 并用于测试集预测。验证集与训练
+  集共享 `group_id` 时会在加载模型前报错。
+- **多被告长文本**：事实超过 `max_length` 个字符时，按目标被告选句：优先保留提到目标被告的
+  句子，其次是不涉及任何被告的句子，只涉及其他被告的句子不进入输入，保持原文顺序。
+
 ## 11. 评测并生成 JSON
 
 评测入口消费模型推理得到的 JSONL 预测；三类格式分别对应 static、counterfactual、CMDL：
@@ -481,14 +575,36 @@ python scripts/evaluate_model.py --kind cmdl \
 
 每个评测结果都会按 `group_id` 整组重采样并输出点估计与 95% 置信区间。指定
 `--reference-input` 后，额外输出配对差异、原始 p 值，以及至多五个主要终点的 Holm
-校正 p 值；未指定参考模型时不会伪造比较检验。无期、死刑不会进入月份指标。
+校正 p 值；未指定参考模型时不会伪造比较检验。无期、死刑不会进入月份指标。结果包含
+`metric_version`（当前 `v2`）。评测先把预测一次性转成矩阵，每次重采样只按分组权重做加权
+汇总，抽样序列与逐行重采样完全一致；CAIL 测试集的静态评测加配对检验约 1 分钟。
 
 静态评测对罪名、定罪法条和最终刑期类别都强制输出 `accuracy`、
 `macro_precision`、`macro_recall`、`macro_f1`，字段分别使用 `charge_`、`article_`、
 `sentence_` 前缀。罪名和法条的 accuracy 是整组标签完全一致；刑期类别包括死刑、无期、
 拘役、管制、免刑、未知，以及有期徒刑 `0-6`、`7-12`、`13-24`、`25-36`、`37-60`、
 `61-120`、`121+` 月。评测还输出多标签 micro 指标、Hamming accuracy，以及单罪名有期
-徒刑样本的 MAE、log-MAE 和三个月容差准确率。
+徒刑样本的 MAE、log-MAE 和三个月容差准确率。宏平均只统计完整测试集真实标签中出现过的
+类别（该类别集合在重采样中固定）；按全部词表平均的旧口径以 `*_macro_*_all_labels` 输出。
+
+反事实评测（v2）：`flip_accuracy` 要求目标罪名概率不低于决策阈值且父案件原罪名概率低于阈值，
+另报 `flip_top1_accuracy`（最大概率是否为目标罪名）和 `flip_margin`（目标减原罪名概率）；
+不变性报告 `invariant_violation_rate`、`invariant_charge_drift`（罪名概率最大变化）和
+`invariant_sentence_drift`（刑期相对变化）；量刑方向 `sentence_pairwise_accuracy` 中变化为 0
+记 0.5 分，并报告 `sentence_rank_tie_rate` 与 `sentence_pairwise_accuracy_margin`（方向正确
+且变化超过 1 个月）。主要终点为翻转准确率、不变性违例率、量刑方向准确率和不变性罪名漂移；
+`monotonicity_violation_rate` 仍输出但不作为终点。CMDL 评测在罪名口径之外，再报告“罪名+法条”
+和“罪名+法条+刑期类别”两层的被告级、案件级准确率及按被告人数分层的结果。
+
+旧版反事实预测没有 `parent_charge_indices` 时，可用处理后的父案件记录回填：
+
+```bash
+python scripts/evaluate_model.py --kind counterfactual \
+  --input <旧 predictions/counterfactual.jsonl> \
+  --parent-records outputs/processed/cail_small/train.jsonl \
+  --metadata outputs/processed/cail_small/metadata.json \
+  --output <results>.json --limit 10000000
+```
 
 ## 12. 本地验收
 

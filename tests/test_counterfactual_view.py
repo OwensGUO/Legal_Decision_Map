@@ -54,7 +54,8 @@ def test_view_selects_current_twelve_requests_without_modifying_historical_cache
 
 
 @pytest.mark.parametrize(
-    "damage", ["duplicate", "missing", "identity", "spec", "json", "invalid_schema"]
+    "damage",
+    ["duplicate", "missing", "identity", "spec", "json", "invalid_schema", "parent", "sanitizer"],
 )
 def test_view_rejects_invalid_cache_and_preserves_previous_view(cache, damage):
     from legal_landscape.counterfactual.view import publish_request_view
@@ -72,6 +73,10 @@ def test_view_rejects_invalid_cache_and_preserves_previous_view(cache, damage):
         selected["target_factors"]["restitution"] = False
     elif damage == "invalid_schema":
         selected["validation"] = {"valid": False, "parsed": ["malformed"]}
+    elif damage == "parent":
+        selected["parent_text_sha256"] = "0" * 64
+    elif damage == "sanitizer":
+        selected["sanitizer_version"] = "v1"
     content = "".join(json.dumps(row) + "\n" for row in rows)
     if damage == "json":
         content += "broken JSON\n"

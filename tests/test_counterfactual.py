@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from io import StringIO
 
@@ -14,6 +15,7 @@ from legal_landscape.counterfactual.generate import (
 )
 from legal_landscape.counterfactual.provenance import generator_identity
 from legal_landscape.counterfactual.validators import validate_generation
+from legal_landscape.data.sanitize import SANITIZER_VERSION
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 from legal_landscape.progress import create_progress_reporter
 
@@ -54,8 +56,116 @@ def test_mock_generator_is_deterministic_valid_json() -> None:
     raw_b = generator.generate("某甲秘密取得财物。", _spec(), seed=42)
     assert raw_a == raw_b
     payload = json.loads(raw_a)
-    assert payload["target_defendant"] == "某甲"
-    assert payload["realized_factors"]["restitution"] is True
+    assert set(payload) == {"counterfactual_text"}
+    assert "退赃" in payload["counterfactual_text"]
+
+
+def test_prompt_hides_charge_labels_and_intervention_intent() -> None:
+    from legal_landscape.counterfactual.prompts import build_messages
+
+    spec = InterventionSpec.from_dict(
+        {**_spec("charge_flip").to_dict(), "rule_id": "boundary:盗窃->诈骗"}
+    )
+    system, user = build_messages("某甲取得被害人手机一部，价值××元。", spec)
+    content = user["content"]
+    for hidden in ("诈骗", "盗窃", "boundary", "charge_flip", "rule_id", "target_charge", "rank"):
+        assert hidden not in content
+    assert "某甲" in content
+    assert "价值××元" in content
+    assert "××" in system["content"] and "[已屏蔽]" in system["content"]
+
+
+def _restitution_spec() -> InterventionSpec:
+    return InterventionSpec(
+        "c1", "某甲", "sentence_rank", LegalFactors(restitution=False, confession=True),
+        LegalFactors(restitution=True, confession=True), None, -1, ("restitution",), "r6",
+    )
+
+
+def _text_payload(text: str) -> str:
+    return json.dumps({"counterfactual_text": text}, ensure_ascii=False)
+
+
+def test_validator_rejects_restored_dataset_masks() -> None:
+    result = validate_generation(
+        "某甲盗走手机一部，价值××元，如实供述，未退赃。",
+        _restitution_spec(),
+        _text_payload("某甲盗走手机一部，价值4450元，如实供述，已退赃。"),
+    )
+    assert "mask_restored" in result.errors
+
+
+def test_validator_rejects_any_new_charge_name_or_article() -> None:
+    result = validate_generation(
+        "某甲盗走手机一部，如实供述，未退赃。",
+        _restitution_spec(),
+        _text_payload("某甲盗走手机一部，如实供述，已退赃，违反刑法第二百六十四条，犯盗窃罪。"),
+        charge_lexicon=("盗窃",),
+    )
+    assert {"label_leakage", "article_leakage"} <= set(result.errors)
+
+
+def test_validator_flags_new_sentencing_terms_when_parent_already_has_some() -> None:
+    result = validate_generation(
+        "某甲曾被判处有期徒刑一年。某甲盗走手机，如实供述，未退赃。",
+        _restitution_spec(),
+        _text_payload("某甲曾被判处有期徒刑一年。某甲盗走手机，如实供述，已退赃，可以从轻处罚。"),
+    )
+    assert "sentence_leakage" in result.errors
+
+
+def test_charge_flip_requires_target_behaviour_and_removal_of_source_behaviour() -> None:
+    spec = _spec("charge_flip")
+    parent = "某甲盗走被害人手机一部，涉案1000元，如实供述，未退赃。"
+    kept_source = validate_generation(
+        parent,
+        spec,
+        _text_payload("某甲盗走被害人手机一部后谎称借用，涉案1000元，如实供述，未退赃。"),
+    )
+    assert "target_change_missing" in kept_source.errors
+    rewritten = validate_generation(
+        parent,
+        spec,
+        _text_payload("某甲谎称借用，骗取被害人手机一部，涉案1000元，如实供述，未退赃。"),
+    )
+    assert rewritten.valid, rewritten.errors
+
+
+def test_validator_detects_non_target_drift_by_reextracting_factors() -> None:
+    result = validate_generation(
+        "某甲盗走手机，如实供述，未退赃。",
+        _restitution_spec(),
+        _text_payload("某甲盗走手机，拒不认罪，已退赃。"),
+    )
+    assert "non_target_changed:confession" in result.errors
+
+
+def test_validator_returns_sanitized_text_and_audit_metrics() -> None:
+    from legal_landscape.data.sanitize import sanitize_text
+
+    text = "某甲盗走手机一部，如实供述，已退赃。"
+    result = validate_generation(
+        "某甲盗走手机一部，如实供述，未退赃。", _restitution_spec(), _text_payload(text),
+        charge_lexicon=("盗窃",),
+    )
+    assert result.valid, result.errors
+    assert result.sanitized_text == sanitize_text(text, charge_lexicon=("盗窃",)).strict
+    assert set(result.metrics) == {"similarity", "novel_ngram_ratio"}
+
+
+def test_leakage_errors_are_distinguished_from_quality_errors() -> None:
+    from legal_landscape.counterfactual.validators import has_leakage
+
+    assert has_leakage(("excessive_rewrite", "label_leakage"))
+    assert not has_leakage(("excessive_rewrite", "target_change_missing"))
+
+
+def test_generation_id_depends_on_parent_text() -> None:
+    spec = _spec()
+    assert (
+        GenerationRequest("某甲事实一。", spec).generation_id
+        != GenerationRequest("某甲事实二。", spec).generation_id
+    )
 
 
 def test_validator_accepts_target_change_and_preserved_non_targets() -> None:
@@ -125,6 +235,9 @@ def test_generate_records_persists_provenance_and_resumes(tmp_path) -> None:
     assert len(record["model_revision"]) == 64
     assert record["retry_count"] == 0
     assert record["validation"]["valid"] is True
+    assert record["parent_text_sha256"] == hashlib.sha256(request.parent_text.encode()).hexdigest()
+    assert record["sanitizer_version"] == SANITIZER_VERSION
+    assert "退赃" in record["counterfactual_strict"]
     assert len(output.read_text(encoding="utf-8").splitlines()) == 1
 
     stream = StringIO()

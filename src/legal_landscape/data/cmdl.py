@@ -66,20 +66,25 @@ def iter_cmdl(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                 )
                 digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
                 group_id = f"cmdl-{digest}"
+                names = [str(item) for item in row.get("defendants") or ()] or [
+                    str(outcome["name"]) for outcome in outcomes
+                ]
                 for defendant_index, outcome in enumerate(outcomes):
                     charges, articles, penalty_type, months = _normalize_outcome(outcome)
+                    name = str(outcome["name"])
                     yield CaseUnit(
                         dataset="cmdl",
                         split=split,
                         case_id=f"{group_id}-d{defendant_index:03d}",
                         group_id=group_id,
-                        target_defendant=str(outcome["name"]),
+                        target_defendant=name,
                         fact_raw=str(row["fact"]),
                         charges=charges,
                         penalty_type=penalty_type,
                         imprisonment_months=months,
                         source_path=f"{source}:{line_number}",
                         conviction_articles=articles,
+                        co_defendants=tuple(dict.fromkeys(item for item in names if item != name)),
                     )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid CMDL record at {source}:{line_number}: {exc}") from exc

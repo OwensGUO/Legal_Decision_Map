@@ -37,10 +37,11 @@ Common overrides:
   VLLM_ENFORCE_EAGER=1           Opt out of CUDA graphs (default 0)
   P2P_POLICY=auto|enable|disable  Auto enables P2P only after a positive GPU probe
   PROGRESS=auto|always|never      Terminal progress display (default auto)
-  DATA_LIMIT=N CF_LIMIT=N EVAL_LIMIT=N MAX_STEPS=N
+  DATA_LIMIT=N CF_LIMIT=N EVAL_LIMIT=N MAX_STEPS=N  (MAX_STEPS=0 trains full epochs)
   SMOKE_MAX_LENGTH=1024          Smoke training token limit
   BOOTSTRAP_ITERATIONS=2000       Group-clustered bootstrap resamples
-  CHECKPOINT_EVERY=100             Save resumable training state every N updates
+  CHECKPOINT_EVERY=200             Save and validate resumable state every N updates
+  RESUME_TRAINING=0              Archive selected runs and restart training (default 1)
   INSTALL_FLA=1                  Install and probe optional FLA/Triton kernels
 
 Examples:
@@ -86,6 +87,14 @@ INFER_GPU_MEMORY="${INFER_GPU_MEMORY:-0.90}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
 P2P_POLICY="${P2P_POLICY:-auto}"
 MOCK_GENERATOR="${MOCK_GENERATOR:-0}"
+RESUME_TRAINING="${RESUME_TRAINING:-1}"
+case "$RESUME_TRAINING" in
+  0|1) ;;
+  *)
+    printf 'RESUME_TRAINING must be 0 or 1; got %s.\n' "$RESUME_TRAINING" >&2
+    exit 2
+    ;;
+esac
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
 INSTALL_FLA="${INSTALL_FLA:-0}"
 BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-}"
@@ -156,7 +165,7 @@ case "$MODE" in
     DATA_LIMIT="${DATA_LIMIT:-1000000}"
     CF_LIMIT="${CF_LIMIT:-1000000}"
     EVAL_LIMIT="${EVAL_LIMIT:-1000000}"
-    MAX_STEPS="${MAX_STEPS:-1000}"
+    MAX_STEPS="${MAX_STEPS:-0}"
     BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-2000}"
     EXPERIMENTS="${EXPERIMENTS:-B3 M}"
     SEEDS="${SEEDS:-42}"
@@ -165,7 +174,7 @@ case "$MODE" in
     DATA_LIMIT="${DATA_LIMIT:-1000000}"
     CF_LIMIT="${CF_LIMIT:-1000000}"
     EVAL_LIMIT="${EVAL_LIMIT:-1000000}"
-    MAX_STEPS="${MAX_STEPS:-1000}"
+    MAX_STEPS="${MAX_STEPS:-0}"
     BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-2000}"
     EXPERIMENTS="${EXPERIMENTS:-B0 B1 B2 B3 B4 B5 M A1 A2 A3 A4 A5 A6}"
     SEEDS="${SEEDS:-42 2026 3407}"
@@ -537,6 +546,12 @@ if [[ "$MODE" == "smoke" ]]; then
 fi
 CAIL_CF_VIEW="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/views/$MODE/cail.jsonl"
 CMDL_CF_VIEW="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/views/$MODE/cmdl.jsonl"
+# Held-out counterfactuals come from test parents and are used only for evaluation.
+HELDOUT_CF_ROOT="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/heldout"
+CAIL_HELDOUT_CF="$HELDOUT_CF_ROOT/cail.jsonl"
+CMDL_HELDOUT_CF="$HELDOUT_CF_ROOT/cmdl.jsonl"
+CAIL_HELDOUT_CF_VIEW="$HELDOUT_CF_ROOT/views/$MODE/cail.jsonl"
+CMDL_HELDOUT_CF_VIEW="$HELDOUT_CF_ROOT/views/$MODE/cmdl.jsonl"
 PROVENANCE_MANIFEST="$OUTPUT_ROOT/counterfactuals/$GENERATOR_MODEL/generator-provenance.json"
 generator_overrides=(
   --set "generator.selector=$GENERATOR_MODEL"
@@ -704,6 +719,8 @@ generate_counterfactuals() {
 }
 generate_counterfactuals "$CAIL_PROCESSED/train.jsonl" "$CAIL_CF" "$CAIL_CF_VIEW"
 generate_counterfactuals "$CMDL_PROCESSED/train.jsonl" "$CMDL_CF" "$CMDL_CF_VIEW"
+generate_counterfactuals "$CAIL_PROCESSED/test.jsonl" "$CAIL_HELDOUT_CF" "$CAIL_HELDOUT_CF_VIEW"
+generate_counterfactuals "$CMDL_PROCESSED/test.jsonl" "$CMDL_HELDOUT_CF" "$CMDL_HELDOUT_CF_VIEW"
 
 phase "stop vLLM"
 stop_inference_server
@@ -739,13 +756,14 @@ run_training() {
   local dataset=$1
   local processed=$2
   local counterfactual=$3
-  local experiment=$4
-  local seed=$5
+  local heldout_counterfactual=$4
+  local experiment=$5
+  local seed=$6
   local run_root="$TRAINING_RUNS_ROOT/$dataset/$experiment/seed-$seed"
-  if [[ "$MODE" == "smoke" && -e "$run_root" ]]; then
+  if [[ -e "$run_root" ]] && [[ "$MODE" == "smoke" || "${RESUME_TRAINING:-1}" == "0" ]]; then
     local previous_run="${run_root}.previous-$(date -u +%Y%m%dT%H%M%SZ)-$$"
     run_cmd mv "$run_root" "$previous_run"
-    printf '[info] Archived previous smoke results: %s\n' "$previous_run"
+    printf '[info] Archived previous %s results: %s\n' "$MODE" "$previous_run"
   fi
   local training_root="$run_root/training"
   local prediction_root="$run_root/predictions"
@@ -760,6 +778,8 @@ run_training() {
     --train-data "$processed/train.jsonl"
     --counterfactual-data "$counterfactual"
     --evaluation-data "$processed/test.jsonl"
+    --validation-data "$processed/valid.jsonl"
+    --evaluation-counterfactual-data "$heldout_counterfactual"
     --prediction-dir "$prediction_root"
     --output-dir "$training_root"
     --limit "$DATA_LIMIT"
@@ -768,7 +788,7 @@ run_training() {
     --set "model.max_length=$selected_length"
     --set "training.seed=$seed"
     --set "training.max_steps=$MAX_STEPS"
-    --set "training.checkpoint_every=${CHECKPOINT_EVERY:-100}"
+    --set "training.checkpoint_every=${CHECKPOINT_EVERY:-200}"
   )
   local resume_checkpoint=""
   local checkpoint_candidates=(
@@ -777,6 +797,7 @@ run_training() {
   local checkpoint_candidate
   for checkpoint_candidate in "${checkpoint_candidates[@]}"; do
     [[ "$MODE" != "smoke" ]] || break
+    [[ "${RESUME_TRAINING:-1}" != "0" ]] || break
     if [[ -f "$checkpoint_candidate/training_progress.json" ]] \
       && { [[ -z "$resume_checkpoint" ]] || [[ "$checkpoint_candidate" -nt "$resume_checkpoint" ]]; }; then
       resume_checkpoint="$checkpoint_candidate"
@@ -799,13 +820,16 @@ for dataset in cail cmdl; do
   if [[ "$dataset" == "cail" ]]; then
     processed=$CAIL_PROCESSED
     counterfactual=$CAIL_CF_VIEW
+    heldout_counterfactual=$CAIL_HELDOUT_CF_VIEW
   else
     processed=$CMDL_PROCESSED
     counterfactual=$CMDL_CF_VIEW
+    heldout_counterfactual=$CMDL_HELDOUT_CF_VIEW
   fi
   for experiment in "${experiment_list[@]}"; do
     for seed in "${seed_list[@]}"; do
-      run_training "$dataset" "$processed" "$counterfactual" "$experiment" "$seed"
+      run_training "$dataset" "$processed" "$counterfactual" "$heldout_counterfactual" \
+        "$experiment" "$seed"
     done
   done
 done

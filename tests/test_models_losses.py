@@ -97,6 +97,50 @@ class ModelLossTests(unittest.TestCase):
         self.assertEqual(empty.article.item(), 0.0)
         self.assertEqual(empty.active_counts["article"], 0)
 
+    def test_multilabel_losses_sum_over_labels_by_default(self) -> None:
+        import math
+
+        from legal_landscape.models.losses import compute_typed_losses
+
+        targets = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        summed = compute_typed_losses(
+            charge_logits=torch.zeros((2, 4)), charge_targets=targets,
+            article_logits=torch.zeros((2, 4)), article_targets=targets,
+            pair_types=("charge_flip",),
+            counterfactual_charge_logits=torch.zeros((1, 3)),
+            target_charge_indices=torch.tensor([1]),
+        )
+        self.assertAlmostEqual(summed.charge.item(), 4 * math.log(2), places=5)
+        self.assertAlmostEqual(summed.article.item(), 4 * math.log(2), places=5)
+        self.assertAlmostEqual(summed.boundary.item(), 3 * math.log(2), places=5)
+        averaged = compute_typed_losses(
+            charge_logits=torch.zeros((2, 4)), charge_targets=targets,
+            multilabel_reduction="mean",
+        )
+        self.assertAlmostEqual(averaged.charge.item(), math.log(2), places=5)
+
+    def test_invariant_loss_sums_squared_probability_changes_over_labels(self) -> None:
+        from legal_landscape.models.losses import compute_typed_losses
+
+        parent = torch.tensor([[2.0, -1.0]])
+        counterfactual = torch.tensor([[1.0, 0.0]])
+        losses = compute_typed_losses(
+            pair_types=("invariant",),
+            parent_charge_logits=parent,
+            counterfactual_charge_logits=counterfactual,
+        )
+        expected = ((torch.sigmoid(parent) - torch.sigmoid(counterfactual)) ** 2).sum()
+        self.assertAlmostEqual(losses.invariant.item(), expected.item(), places=6)
+
+    def test_unknown_multilabel_reduction_is_rejected(self) -> None:
+        from legal_landscape.models.losses import compute_typed_losses
+
+        with self.assertRaises(ValueError):
+            compute_typed_losses(
+                charge_logits=torch.zeros((1, 2)), charge_targets=torch.zeros((1, 2)),
+                multilabel_reduction="median",
+            )
+
     def test_predictor_runs_with_dummy_backbone(self) -> None:
         from legal_landscape.models.predictor import DummyBackbone, LegalLandscapePredictor
 
