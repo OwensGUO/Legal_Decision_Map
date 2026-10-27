@@ -66,9 +66,29 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def read_rows(path: Path, limit: int) -> list[dict[str, Any]]:
+def read_rows(
+    path: Path, limit: int, *, complete_groups: bool = False
+) -> list[dict[str, Any]]:
+    """Read prediction rows.
+
+    ``limit`` is a row cap. For CMDL, pass ``complete_groups=True`` so ``limit``
+    counts cases and every defendant of a selected case is kept.
+    """
     with path.open("r", encoding="utf-8") as handle:
-        return [json.loads(line) for _, line in zip(range(limit), handle, strict=False)]
+        rows = [json.loads(line) for line in handle if line.strip()]
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    if not complete_groups:
+        return rows[:limit]
+    selected: list[str] = []
+    for row in rows:
+        group = str(row.get("group_id"))
+        if group not in selected:
+            if len(selected) >= limit:
+                break
+            selected.append(group)
+    chosen = set(selected)
+    return [row for row in rows if str(row.get("group_id")) in chosen]
 
 
 def _open_text(path: Path):
@@ -140,15 +160,32 @@ def bootstrap_names(kind: str) -> tuple[str, ...]:
 
 
 def _load(path: Path, args: argparse.Namespace) -> Any:
-    rows = read_rows(path, args.limit)
+    rows = read_rows(path, args.limit, complete_groups=args.kind == "cmdl")
+    missing_articles = [
+        row for row in rows if row.get("articles_available") is False
+    ]
+    if missing_articles:
+        raise SystemExit(
+            f"refusing to score {len(missing_articles)} records with missing article labels; "
+            "they are not all-negative article truth"
+        )
     if args.kind == "counterfactual" and args.parent_records is not None:
         if args.metadata is None:
             raise SystemExit("--parent-records requires --metadata")
         backfill_parent_charges(rows, args.parent_records, args.metadata)
+    if args.kind == "counterfactual":
+        from legal_landscape.counterfactual.interventions import filter_sentence_rank_rows
+
+        rows, exclusions = filter_sentence_rank_rows(rows)
+    else:
+        exclusions = {}
     try:
-        return prepare(args.kind, rows)
+        prepared = prepare(args.kind, rows)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    prepared.sentence_rank_exclusions = exclusions
+    prepared.source_rows = rows
+    return prepared
 
 
 def main() -> int:
@@ -186,6 +223,7 @@ def main() -> int:
         payload: dict[str, Any] = {
             **metrics,
             "metric_version": METRIC_VERSION,
+            "sentence_rank_exclusions": getattr(prepared, "sentence_rank_exclusions", {}),
             "confidence_intervals": confidence_intervals,
             "bootstrap": {
                 "iterations": args.bootstrap_iterations,

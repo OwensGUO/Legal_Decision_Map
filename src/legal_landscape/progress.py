@@ -13,10 +13,8 @@ from unicodedata import combining, normalize
 
 from rich.console import Console, ConsoleDimensions
 from rich.progress import (
-    BarColumn,
     Progress,
     ProgressColumn,
-    SpinnerColumn,
     Task,
     TaskProgressColumn,
     TimeElapsedColumn,
@@ -312,20 +310,28 @@ class _FieldsColumn(ProgressColumn):
         return Text(task.fields.get("details", ""))
 
 
-class _StatusSpinnerColumn(SpinnerColumn):
+class _StableBarColumn(ProgressColumn):
+    """A fixed-width bar that depends only on completed/total, never on time."""
+
+    def __init__(self, *, ascii_only: bool, width: int = 16) -> None:
+        super().__init__()
+        self.ascii_only = ascii_only
+        self.width = width
+
     def render(self, task: Task) -> Text:
-        status = task.fields.get("status", "running")
-        if status != "running":
-            return Text("ok" if status == "completed" else "!")
-        return super().render(task)
-
-
-class _FrozenBarColumn(BarColumn):
-    def render(self, task: Task):
-        bar = super().render(task)
-        if task.stop_time is not None:
-            bar.animation_time = task.stop_time
-        return bar
+        total = task.total
+        if total is None or total <= 0:
+            return Text("")
+        ratio = min(1.0, max(0.0, float(task.completed) / float(total)))
+        filled = int(ratio * self.width)
+        if task.completed > 0 and filled == 0:
+            filled = 1
+        if task.completed >= total:
+            filled = self.width
+        filled = min(self.width, max(0, filled))
+        if self.ascii_only:
+            return Text("[" + ("#" * filled) + ("-" * (self.width - filled)) + "]")
+        return Text(("█" * filled) + ("░" * (self.width - filled)))
 
 
 class _TimingColumn(ProgressColumn):
@@ -340,8 +346,7 @@ class _AdaptiveProgress(Progress):
     def __init__(self, *, ascii_only: bool, **kwargs) -> None:
         super().__init__(**kwargs)
         self.ascii_only = ascii_only
-        self.spinner = _StatusSpinnerColumn("line" if ascii_only else "dots")
-        self.bar = _FrozenBarColumn(bar_width=20)
+        self.bar = _StableBarColumn(ascii_only=ascii_only)
         self.percent = TaskProgressColumn()
         self.elapsed = TimeElapsedColumn()
         self.timing = _TimingColumn()
@@ -363,22 +368,22 @@ class _AdaptiveProgress(Progress):
         descriptions = [Text(task.description) for task in visible]
         description_width = max(text.cell_len for text in descriptions)
         optional = {
-            "spinner": [self.spinner(task) for task in visible],
             "elapsed": [self.elapsed(task) for task in visible],
             "details": [self.details(task) for task in visible],
         }
+        bars = [self.bar(task) for task in visible]
+        if any(item.cell_len for item in bars):
+            optional["bar"] = bars
         if width >= 72:
-            if not self.ascii_only:
-                optional["bar"] = [self.bar(task) for task in visible]
             optional["percent"] = [self.percent(task) for task in visible]
             optional["timing"] = [self.timing(task) for task in visible]
         sizes = {
-            name: 20 if name == "bar" else max(item.cell_len for item in items)
+            name: max(item.cell_len for item in items)
             for name, items in optional.items()
         }
         optional = {name: items for name, items in optional.items() if sizes[name]}
-        # Secondary fields go first; shorten descriptions only after dropping all extras.
-        for name in ("details", "bar", "percent", "timing", "elapsed", "spinner"):
+        # Keep the bar until the count itself would no longer fit.
+        for name in ("details", "timing", "percent", "elapsed", "bar"):
             needed = core_width + description_width + sum(
                 sizes[key] for key in optional
             ) + len(optional) + 1
@@ -389,7 +394,7 @@ class _AdaptiveProgress(Progress):
             description_width, width - core_width - sum(sizes[key] for key in optional)
             - len(optional) - 1,
         )
-        names = [name for name in ("spinner",) if name in optional]
+        names = []
         if description_width > 0:
             names.append("description")
         names += [name for name in ("bar",) if name in optional]

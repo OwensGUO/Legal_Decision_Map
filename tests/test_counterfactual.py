@@ -385,6 +385,14 @@ def test_amount_check_accepts_common_chinese_number_formats(amount: float, writt
     assert result.valid, result.errors
 
 
+def test_amount_check_rejects_target_amount_that_leaves_the_original_in_place() -> None:
+    spec = _amount_spec(10100.0)
+    parent = "某甲于2015年在某市秘密窃取他人财物，价值10000元，后被抓获。"
+    text = "某甲于2015年在某市秘密窃取他人财物，价值10000元，另有10100元，后被抓获。"
+    result = validate_generation(parent, spec, _payload(text, spec))
+    assert "target_change_missing" in result.errors
+
+
 def test_amount_check_rejects_unchanged_amount() -> None:
     spec = _amount_spec(10100.0)
     parent = "某甲于2015年在某市秘密窃取他人财物，价值10000元，后被抓获。"
@@ -396,7 +404,7 @@ def test_amount_check_rejects_unchanged_amount() -> None:
 def test_long_faithful_rewrite_is_not_rejected_as_duplicate() -> None:
     spec = _amount_spec(10100.0)
     parent = "某甲于2015年3月在某市某区秘密窃取他人财物，价值10000元。" * 20
-    text = parent.replace("价值10000元", "价值10100元", 1)
+    text = parent.replace("价值10000元", "价值10100元")
     result = validate_generation(parent, spec, _payload(text, spec))
     assert result.valid, result.errors
 
@@ -424,6 +432,75 @@ def test_gambling_flip_conduct_is_not_label_leakage() -> None:
         parent, spec, _payload(text + "其行为构成赌博罪。", spec), min_similarity=0.3
     )
     assert "target_label_leakage" in leaked.errors
+
+
+def test_untui_and_untuipei_validate_the_same_way() -> None:
+    parent = "某甲秘密窃取他人财物，案发后已退赃。"
+    source = LegalFactors(restitution=True)
+    target = LegalFactors(restitution=False)
+    spec = InterventionSpec(
+        "c1", "某甲", "sentence_rank", source, target, None, -1, ("restitution",), "r5"
+    )
+    results = [
+        validate_generation(parent, spec, _payload(f"某甲秘密窃取他人财物，案发后{phrase}。", spec))
+        for phrase in ("未退赃", "未退赔")
+    ]
+    assert all(result.valid for result in results), [result.errors for result in results]
+    blocked = InterventionSpec(
+        "c1", "某甲", "sentence_rank", target, source, None, -1, ("restitution",), "r5"
+    )
+    parent_negative = "某甲秘密窃取他人财物，案发后尚未退赃，随即被抓获。"
+    refusals = [
+        validate_generation(
+            parent_negative,
+            blocked,
+            _payload(f"某甲秘密窃取他人财物，案发后{phrase}，随即被抓获。", blocked),
+        )
+        for phrase in ("未退赃", "未退赔", "没有退赃", "未能退赔")
+    ]
+    assert len({result.errors for result in refusals}) == 1
+    assert "target_change_missing" in refusals[0].errors
+    assert "factor_mismatch:restitution" in refusals[0].errors
+
+
+def _rank_spec(defendant: str, co_defendants: tuple[str, ...] = ()) -> InterventionSpec:
+    return InterventionSpec(
+        "c1", defendant, "sentence_rank",
+        LegalFactors(restitution=False), LegalFactors(restitution=True),
+        None, -1, ("restitution",), "restitution", co_defendants,
+    )
+
+
+def test_counterfactual_change_is_bound_to_the_target_defendant() -> None:
+    parent = "张三未退赃。李四未退赃。"
+    spec = _rank_spec("张三", ("李四",))
+    wrong = validate_generation(
+        parent, spec, _payload("张三未退赃。李四已退赃。", spec), min_similarity=0.5,
+    )
+    assert not wrong.valid
+    assert "target_change_missing" in wrong.errors or any(
+        error.startswith("non_target_defendant_changed") for error in wrong.errors
+    )
+    correct = validate_generation(
+        parent, spec, _payload("张三已退赃。李四未退赃。", spec), min_similarity=0.5,
+    )
+    assert correct.valid, correct.errors
+
+
+@pytest.mark.parametrize("text", [
+    "张三与李四已退赃。",
+    "张三、李四共同取得财物。其已退赃。",
+    "张三丰已退赃。",
+])
+def test_ambiguous_defendant_attribution_is_rejected(text) -> None:
+    parent = "张三未退赃。李四未退赃。"
+    co = ("张三丰",) if "张三丰" in text else ("李四",)
+    if "张三丰" in text:
+        parent = "张三未退赃。张三丰未退赃。"
+    spec = _rank_spec("张三", co)
+    result = validate_generation(parent, spec, _payload(text, spec), min_similarity=0.2)
+    assert not result.valid
+    assert "attribution_ambiguous" in result.errors
 
 
 def test_restitution_check_ignores_negated_mentions() -> None:

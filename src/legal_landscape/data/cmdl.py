@@ -11,35 +11,71 @@ from typing import Any
 from legal_landscape.data.articles import normalize_criminal_articles
 from legal_landscape.data.schema import CaseUnit, PenaltyType
 
+_PENALTY_FIELDS = frozenset(
+    {"death_penalty", "life_imprisonment", "imprisonment", "detention", "surveillance"}
+)
+
+
+def _read_penalty(penalty: Any) -> tuple[str, int | None] | None:
+    """Parse one penalty object. ``None`` means the object is missing or not usable."""
+    if not isinstance(penalty, dict) or not (_PENALTY_FIELDS & set(penalty)):
+        return None
+    if bool(penalty.get("death_penalty")):
+        return PenaltyType.DEATH.value, None
+    if bool(penalty.get("life_imprisonment")):
+        return PenaltyType.LIFE.value, None
+    months = int(penalty.get("imprisonment") or 0)
+    if months < 0:
+        raise ValueError("imprisonment months must be non-negative")
+    if months > 0:
+        return PenaltyType.FIXED_TERM.value, months
+    detention = int(penalty.get("detention") or 0)
+    if detention < 0:
+        raise ValueError("detention months must be non-negative")
+    if detention > 0:
+        return PenaltyType.DETENTION.value, None
+    surveillance = int(penalty.get("surveillance") or 0)
+    if surveillance < 0:
+        raise ValueError("surveillance months must be non-negative")
+    if surveillance > 0:
+        return PenaltyType.CONTROL.value, None
+    return PenaltyType.EXEMPT.value, None
+
 
 def _normalize_outcome(
     outcome: dict[str, Any],
-) -> tuple[tuple[str, ...], tuple[str, ...], str, int | None]:
+) -> tuple[tuple[str, ...], tuple[str, ...], str, int | None, bool, str | None]:
+    """Charges and articles come from every judgment. The executed penalty does not.
+
+    A usable ``final_penalty`` is the executed sentence. One judgment without that
+    field can supply its own penalty. Several judgments without it are not summed:
+    the penalty label is unknown and must not be supervised.
+    """
     judgments = outcome.get("judgment") or []
     charges = tuple(
         str(item.get("standard_accusation") or item.get("accusation") or "").removesuffix("罪")
         for item in judgments
+        if isinstance(item, dict)
     )
     charges = tuple(item for item in charges if item)
     articles = normalize_criminal_articles(
         article
         for judgment in judgments
+        if isinstance(judgment, dict)
         for article in (judgment.get("article") or ())
     )
-    penalties = [item.get("penalty") or {} for item in judgments]
-    if any(bool(item.get("death_penalty")) for item in penalties):
-        return charges, articles, PenaltyType.DEATH.value, None
-    if any(bool(item.get("life_imprisonment")) for item in penalties):
-        return charges, articles, PenaltyType.LIFE.value, None
-    # Criminal Law art. 69: fixed-term imprisonment absorbs concurrent criminal detention.
-    months = sum(int(item.get("imprisonment") or 0) for item in penalties)
-    if months > 0:
-        return charges, articles, PenaltyType.FIXED_TERM.value, months
-    if any(int(item.get("detention") or 0) > 0 for item in penalties):
-        return charges, articles, PenaltyType.DETENTION.value, None
-    if any(int(item.get("surveillance") or 0) > 0 for item in penalties):
-        return charges, articles, PenaltyType.CONTROL.value, None
-    return charges, articles, PenaltyType.EXEMPT.value, None
+    final = _read_penalty(outcome.get("final_penalty"))
+    if final is not None:
+        penalty_type, months = final
+        return charges, articles, penalty_type, months, False, None
+    if len(judgments) == 1 and isinstance(judgments[0], dict):
+        single = _read_penalty(judgments[0].get("penalty"))
+        if single is not None:
+            penalty_type, months = single
+            return charges, articles, penalty_type, months, False, None
+        return charges, articles, PenaltyType.UNKNOWN.value, None, True, "missing_penalty_fields"
+    exclusion = "missing_final_penalty" if len(judgments) > 1 else "missing_penalty_fields"
+    return charges, articles, PenaltyType.UNKNOWN.value, None, True, exclusion
 
 
 def iter_cmdl(path: str | Path, *, split: str, limit: int | None = None) -> Iterator[CaseUnit]:
@@ -70,7 +106,9 @@ def iter_cmdl(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                     str(outcome["name"]) for outcome in outcomes
                 ]
                 for defendant_index, outcome in enumerate(outcomes):
-                    charges, articles, penalty_type, months = _normalize_outcome(outcome)
+                    charges, articles, penalty_type, months, mask_penalty, exclusion = (
+                        _normalize_outcome(outcome)
+                    )
                     name = str(outcome["name"])
                     yield CaseUnit(
                         dataset="cmdl",
@@ -85,6 +123,8 @@ def iter_cmdl(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                         source_path=f"{source}:{line_number}",
                         conviction_articles=articles,
                         co_defendants=tuple(dict.fromkeys(item for item in names if item != name)),
+                        mask_penalty=mask_penalty,
+                        penalty_exclusion=exclusion,
                     )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid CMDL record at {source}:{line_number}: {exc}") from exc

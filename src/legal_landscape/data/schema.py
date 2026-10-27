@@ -32,6 +32,8 @@ class CaseUnit:
     conviction_articles: tuple[str, ...] = ()
     sentencing_articles: tuple[str, ...] = ()
     co_defendants: tuple[str, ...] = ()
+    mask_penalty: bool = False
+    penalty_exclusion: str | None = None
 
     def __post_init__(self) -> None:
         if not all((self.dataset, self.split, self.case_id, self.group_id, self.source_path)):
@@ -46,6 +48,10 @@ class CaseUnit:
             raise ValueError("months must be non-negative")
         if any(not item.strip() for item in self.conviction_articles + self.sentencing_articles):
             raise ValueError("article labels must be non-empty")
+        if self.penalty_exclusion is not None and (
+            not self.mask_penalty or self.penalty_type != PenaltyType.UNKNOWN.value
+        ):
+            raise ValueError("an excluded penalty label cannot be supervised")
 
     @property
     def is_sentence_regression_eligible(self) -> bool:

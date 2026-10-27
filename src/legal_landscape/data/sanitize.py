@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 
-SANITIZER_VERSION = "v2"
+SANITIZER_VERSION = "v3"
 MASK = "[已屏蔽]"
 
 
@@ -32,24 +32,36 @@ class SanitizedText:
 _BRACKET = re.compile(r"\[([^\[\]]+)\]")
 _SEGMENT = re.compile(r"[^。；！？\n]+")
 _RESULT_STATEMENT = re.compile(r"(?:公诉机关|人民检察院|检察院)指控")
-# Each marker opens the prosecution's or court's legal conclusion; the rest of the
-# sentence carries charge names, cited provisions, or a sentencing recommendation.
-_CONCLUSION = re.compile(
-    r"(?:公诉机关|检察院|检察机关|公诉人)认为|本院认为|据此|综上"
-    r"|其(?:上述)?行为已?(?:触犯|构成)|(?:应当|应)以|追究其?刑事责任"
-    r"|提请(?:本院|法院|依法)|依法(?:惩处|判处|处罚|追究)|量刑建议"
+# Markers that introduce the prosecution's or court's conclusion for the current case.
+# Boundaries keep them from firing inside 根据此前 / 答应以.
+_STRONG_CONCLUSION = re.compile(
+    r"(?:公诉机关|检察院|检察机关|公诉人)认为|本院认为|(?<!根)据此|综上"
+    r"|追究其?刑事责任"
+    r"|提请(?:本院|法院|依法)|量刑建议"
     r"|建议(?=[^。；！？\n]{0,40}?(?:判|量刑|幅度|刑|罪|撤销|并罚|拘役|管制|缓刑|罚金"
     r"|[一二三四五六七八九十两0-9]+(?:年|个月)))"
     r"|(?:依据|依照|根据)《"
+    r"|(?:应当以|(?<!答)应以)"
 )
+# Weaker sentencing language. A historical cue in the same clause (曾、此前、前科)
+# keeps the past punishment instead of treating it as this case's conclusion.
+_WEAK_CONCLUSION = re.compile(
+    r"其(?:上述)?行为已?(?:触犯|构成)"
+    r"|依法(?:惩处|判处|处罚|追究)"
+    r"|(?<!不)(?:可以|应当|应|酌情)(?:依法)?"
+    r"(?:从轻|从重|减轻|加重|从宽|从严)"
+    r"(?:、(?:从轻|从重|减轻|加重|从宽|从严))*处罚"
+)
+_HISTORY = re.compile(r"曾|曾经|以前|此前|当年|前科")
 _NUMBER = "[一二三四五六七八九十百千零〇两0-9]+"
 _ARTICLE = re.compile(
     rf"(?:《[^》]{{0,30}}》|刑法)?第{_NUMBER}条(?:之{_NUMBER})?(?:第{_NUMBER}款)?"
     rf"(?:第{_NUMBER}项)?|第{_NUMBER}款"
 )
-# Charge names after a legal cue, including names absent from the training vocabulary.
+# Charge names after a legal cue. Bare 以 is not a cue: it also occurs in 不以 and 答应以.
 _CUED_CHARGE = re.compile(
-    r"(?:犯|以|构成|涉嫌|触犯)([\u4e00-\u9fa5、]{2,12}?(?<![认悔无有获得])罪)"
+    r"(?:犯|构成|涉嫌|触犯|(?:应当|(?<!答)应)以)"
+    r"([\u4e00-\u9fa5、]{2,12}?(?<![认悔无有获得])罪)"
 )
 
 
@@ -84,12 +96,25 @@ def _lexicon_pattern(lexicon: tuple[str, ...]) -> re.Pattern[str] | None:
     )
 
 
+def _locally_historical(segment: str, marker_start: int) -> bool:
+    """True when a past-punishment cue governs this marker inside the current clause."""
+    local = segment[:marker_start]
+    cut = max(local.rfind(separator) for separator in ("，", ",", "、"))
+    return _HISTORY.search(local[cut + 1 :]) is not None
+
+
 def _conclusion_spans(text: str) -> list[tuple[str, int, int]]:
     spans: list[tuple[str, int, int]] = []
     for segment in _SEGMENT.finditer(text):
-        marker = _CONCLUSION.search(segment.group(0))
-        if marker is not None:
-            spans.append(("conclusion", segment.start() + marker.start(), segment.end()))
+        body = segment.group(0)
+        starts = [match.start() for match in _STRONG_CONCLUSION.finditer(body)]
+        starts.extend(
+            match.start()
+            for match in _WEAK_CONCLUSION.finditer(body)
+            if not _locally_historical(body, match.start())
+        )
+        if starts:
+            spans.append(("conclusion", segment.start() + min(starts), segment.end()))
     return spans
 
 

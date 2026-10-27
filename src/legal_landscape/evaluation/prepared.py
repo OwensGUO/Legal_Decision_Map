@@ -56,11 +56,18 @@ class _MultiLabel:
         truth = np.asarray([row[f"true_{prefix}"] for row in rows], dtype=bool)
         prediction = np.asarray([row[f"predicted_{prefix}"] for row in rows], dtype=bool)
         unseen_key = f"unseen_true_{prefix[:-1]}_labels"
-        if any(row.get(unseen_key) for row in rows):
-            # Labels unseen in training form one extra class the model can never predict.
-            unseen = np.asarray([[bool(row.get(unseen_key))] for row in rows])
-            truth = np.hstack([truth, unseen])
-            prediction = np.hstack([prediction, np.zeros_like(unseen)])
+        unseen_index: dict[str, int] = {}
+        for row in rows:
+            for label in row.get(unseen_key) or ():
+                unseen_index.setdefault(str(label), len(unseen_index))
+        if unseen_index:
+            # Each distinct unseen label is its own class. Predictions stay zero.
+            extra = np.zeros((len(rows), len(unseen_index)), dtype=bool)
+            for row_index, row in enumerate(rows):
+                for label in row.get(unseen_key) or ():
+                    extra[row_index, unseen_index[str(label)]] = True
+            truth = np.hstack([truth, extra])
+            prediction = np.hstack([prediction, np.zeros_like(extra)])
         self.tp = (truth & prediction).astype(float)
         self.fp = (~truth & prediction).astype(float)
         self.fn = (truth & ~prediction).astype(float)

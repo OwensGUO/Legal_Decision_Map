@@ -178,6 +178,7 @@ def build_dataset(
         split: {"units_with_unseen_charge": 0, "units_with_unseen_article": 0} for split in paths
     }
     dropped_units = dict.fromkeys(paths, 0)
+    penalty_exclusions = {"missing_final_penalty": 0, "missing_penalty_fields": 0}
     for split, source in paths.items():
         iterator = _iter_cases(data, source, split=split, limit=limit)
         count = 0
@@ -218,6 +219,10 @@ def build_dataset(
                         coverage[split]["units_with_unseen_article"] += any(
                             item not in plan.train_articles for item in case.conviction_articles
                         )
+                        if case.penalty_exclusion:
+                            penalty_exclusions[case.penalty_exclusion] = (
+                                penalty_exclusions.get(case.penalty_exclusion, 0) + 1
+                            )
                         count += 1
                     task.advance(accepted=count, dropped=dropped_units[split])
             task.succeed(processed=count + dropped_units[split])
@@ -251,6 +256,7 @@ def build_dataset(
             "exempt",
             "unknown",
         ],
+        "penalty_label_exclusions": penalty_exclusions,
     }
     (destination / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"

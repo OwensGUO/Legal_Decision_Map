@@ -116,8 +116,9 @@ def test_generation_parent_limit_counts_processed_rows_before_long_case_skips(tm
         "case_id": f"c{i}", "target_defendant": "某甲", "charges": ["盗窃"],
         "fact_strict": "很长的事实" * 100 if i == 0 else "某甲未退赃。",
         "factors": LegalFactors(restitution=False).to_dict(),
+        "penalty_type": "fixed_term", "imprisonment_months": 12,
     }, ensure_ascii=False) + "\n" for i in range(3)))
-    requests, skipped = module["_requests"](
+    requests, skipped, _exclusions = module["_requests"](
         source, 12, (), max_source_chars=100, parent_limit=2,
     )
     assert skipped == 1
@@ -131,9 +132,10 @@ def test_generation_uses_strict_parent_text_and_all_parent_charges(tmp_path):
     source.write_text(json.dumps({
         "case_id": "c1", "target_defendant": "某甲", "charges": ["盗窃", "故意伤害"],
         "fact_conservative": "某甲犯盗窃罪。", "fact_strict": "某甲犯[已屏蔽]，盗走手机。",
-        "factors": LegalFactors(restitution=False, conduct="秘密窃取").to_dict(),
+        "factors": LegalFactors(amount=10000, restitution=False, conduct="秘密窃取").to_dict(),
     }, ensure_ascii=False) + "\n")
-    requests, _ = module["_requests"](source, 12, (("盗窃", "诈骗"),))
+    requests, _, exclusions = module["_requests"](source, 12, (("盗窃", "诈骗"),))
+    assert exclusions["not_single_charge"] == 1
     assert {r.parent_text for r in requests} == {"某甲犯[已屏蔽]，盗走手机。"}
     assert "charge_flip" not in {r.spec.intervention_type for r in requests}
 

@@ -11,23 +11,18 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from legal_landscape.data.sanitize import MASK, sanitize_text
-from legal_landscape.factors.extract import conduct_cues, extract_factors
+from legal_landscape.factors.extract import (
+    RESTITUTION_CUES,
+    conduct_cues,
+    cue_polarity,
+    extract_factors,
+)
 from legal_landscape.factors.schema import InterventionSpec
 
 _PENALTY = re.compile(
     r"有期徒刑|拘役|管制(?!刀具)|缓刑|罚金|死刑|无期|从轻|减轻|从重|免予刑事处罚|判处|刑期"
 )
 _AMOUNT = re.compile(r"([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万)?\s*元")
-_RESTITUTION_DONE = re.compile(r"(?<!未)(?<!未能)(?<!拒不)(?<!没有)(?:退赃|退赔|返还赃款)")
-_RESTITUTION_NOT_DONE = (
-    "未退赃",
-    "未退赔",
-    "未能退赃",
-    "未能退赔",
-    "拒不退赔",
-    "没有退赃",
-    "没有退赔",
-)
 _WHITESPACE = re.compile(r"\s+")
 _NGRAM = 8
 # Errors meaning the text reveals labels or outcomes; these are never used for training,
@@ -85,31 +80,102 @@ def _amount_appears(text: str, amount: float) -> bool:
     return any(abs(value - amount) <= tolerance for value in mentioned_amounts(text))
 
 
-def _target_change_appears(text: str, spec: InterventionSpec) -> bool:
+def _clauses(text: str) -> list[str]:
+    return [item for item in re.findall(r"[^。；！？\n]+", text) if item.strip()]
+
+
+def _other_defendants(spec: InterventionSpec) -> tuple[str, ...]:
+    return tuple(
+        name for name in spec.co_defendants if name and name != spec.target_defendant
+    )
+
+
+def _names_overlap(target: str, others: tuple[str, ...]) -> bool:
+    names = (target, *others)
+    return any(
+        left != right and (left in right or right in left)
+        for left in names
+        for right in others
+    )
+
+
+def _sentence_supports_change(sentence: str, spec: InterventionSpec) -> bool:
     for name in spec.changed_fields:
         value = getattr(spec.target_factors, name)
-        if name == "restitution" and value is True and not _RESTITUTION_DONE.search(text):
+        if name == "restitution" and value is not None:
+            if cue_polarity(sentence, RESTITUTION_CUES) != value:
+                return False
+        elif name == "conduct" and isinstance(value, str):
+            if value not in conduct_cues(sentence):
+                return False
+        elif name == "amount" and value is not None and not _amount_appears(sentence, float(value)):
             return False
-        if (
-            name == "restitution"
-            and value is False
-            and not any(cue in text for cue in _RESTITUTION_NOT_DONE)
-        ):
-            return False
+    return True
+
+
+def _target_scope(text: str, spec: InterventionSpec) -> str:
+    """Sentences that name the target and do not name another defendant."""
+    others = _other_defendants(spec)
+    if not others:
+        return text
+    return "".join(
+        sentence
+        for sentence in _clauses(text)
+        if spec.target_defendant in sentence
+        and not any(name in sentence for name in others)
+    )
+
+
+def _attribution_ambiguous(text: str, spec: InterventionSpec) -> bool:
+    """Shared clauses, bare pronouns, or overlapping names cannot prove a defendant edit."""
+    others = _other_defendants(spec)
+    if not others:
+        return False
+    if _names_overlap(spec.target_defendant, others):
+        return True
+    for sentence in _clauses(text):
+        if not _sentence_supports_change(sentence, spec):
+            continue
+        mentions_target = spec.target_defendant in sentence
+        mentions_other = any(name in sentence for name in others)
+        if mentions_target == mentions_other:
+            return True
+    return False
+
+
+def _target_change_appears(text: str, spec: InterventionSpec) -> bool:
+    text = _target_scope(text, spec)
+    for name in spec.changed_fields:
+        value = getattr(spec.target_factors, name)
+        if name == "restitution" and value is not None:
+            if cue_polarity(text, RESTITUTION_CUES) is not value:
+                return False
         if name == "conduct" and isinstance(value, str):
             cues = conduct_cues(text)
             source = spec.source_factors.conduct
             if value not in cues or (source is not None and source != value and source in cues):
                 return False
-        if name == "amount" and value is not None and not _amount_appears(text, value):
+        if name == "amount" and value is not None and not _amount_appears(text, float(value)):
+            return False
+        source_amount = spec.source_factors.amount
+        if (
+            name == "amount"
+            and source_amount is not None
+            and value is not None
+            and abs(float(source_amount) - float(value)) > max(1.0, abs(float(value)) * 1e-3)
+            and _amount_appears(text, float(source_amount))
+        ):
             return False
     return True
 
 
 def _factor_drift(parent_text: str, text: str, spec: InterventionSpec) -> list[str]:
     """Re-extract factors from both texts instead of trusting the generator's report."""
-    before = extract_factors(parent_text, target_defendant=spec.target_defendant)
-    after = extract_factors(text, target_defendant=spec.target_defendant)
+    others = _other_defendants(spec)
+    before = extract_factors(
+        parent_text, target_defendant=spec.target_defendant, co_defendants=others
+    )
+    after = extract_factors(text, target_defendant=spec.target_defendant, co_defendants=others)
     errors: list[str] = []
     for name in before.to_dict():
         if name in spec.changed_fields:
@@ -117,6 +183,14 @@ def _factor_drift(parent_text: str, text: str, spec: InterventionSpec) -> list[s
                 errors.append("factor_mismatch:restitution")
         elif getattr(after, name) != getattr(before, name):
             errors.append(f"non_target_changed:{name}")
+    for other in others:
+        company = tuple(name for name in (spec.target_defendant, *others) if name != other)
+        parent_other = extract_factors(
+            parent_text, target_defendant=other, co_defendants=company
+        )
+        child_other = extract_factors(text, target_defendant=other, co_defendants=company)
+        if parent_other != child_other:
+            errors.append(f"non_target_defendant_changed:{other}")
     return errors
 
 
@@ -182,7 +256,9 @@ def validate_generation(
     reported = parsed.get("target_defendant", spec.target_defendant)
     if reported != spec.target_defendant or spec.target_defendant not in text:
         errors.append("identity_not_preserved")
-    if not _target_change_appears(text, spec):
+    if _attribution_ambiguous(text, spec):
+        errors.append("attribution_ambiguous")
+    elif not _target_change_appears(text, spec):
         errors.append("target_change_missing")
     errors.extend(_factor_drift(parent_text, text, spec))
     leakage, sanitized = _leakage(parent_text, text, spec, tuple(charge_lexicon))

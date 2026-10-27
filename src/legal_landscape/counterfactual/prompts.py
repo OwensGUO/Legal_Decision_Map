@@ -7,7 +7,7 @@ import json
 from legal_landscape.factors.extract import CONDUCT_CUES
 from legal_landscape.factors.schema import InterventionSpec
 
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v4"
 
 _CUES = dict(CONDUCT_CUES)
 
@@ -36,7 +36,8 @@ def _edit(field: str, value: object, defendant: str) -> str:
 def build_messages(parent_text: str, spec: InterventionSpec) -> list[dict[str, str]]:
     system = (
         "你是法律事实改写器。只修改指定的事实要素，其余文字尽量逐字保留，"
-        "保持其他事实要素与被告人身份不变。原文中的“××”和“[已屏蔽]”是遮蔽标记，"
+        "保持其他事实要素与被告人身份不变，不要改写其他被告人的事实。"
+        "原文中的“××”和“[已屏蔽]”是遮蔽标记，"
         "必须原样保留，不得补全、替换或删除。不得写出任何罪名、法条、刑罚、量刑建议"
         "或法律评价（例如“构成××罪”“从轻处罚”）。不要输出思维过程。"
         "只返回JSON对象：{\"counterfactual_text\": 改写后的完整案件事实}。"
@@ -44,6 +45,7 @@ def build_messages(parent_text: str, spec: InterventionSpec) -> list[dict[str, s
     user = {
         "source_text": parent_text,
         "target_defendant": spec.target_defendant,
+        "other_defendants": list(spec.co_defendants),
         "edits": [
             _edit(field, getattr(spec.target_factors, field), spec.target_defendant)
             for field in spec.changed_fields

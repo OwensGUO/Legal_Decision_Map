@@ -57,6 +57,7 @@ class GenerationRequest:
             (
                 self.spec.parent_case_id,
                 self.spec.target_defendant,
+                "\n".join(self.spec.co_defendants),
                 self.spec.rule_id,
                 text_sha256(self.parent_text),
                 PROMPT_VERSION,
@@ -250,6 +251,7 @@ def _realize(
         "target_charge": spec.target_charge,
         "rank_direction": spec.rank_direction,
         "rule_id": spec.rule_id,
+        "co_defendants": list(spec.co_defendants),
         "model_revision": generator_identity["checkpoint_fingerprint"],
         "generator_identity": dict(generator_identity),
         "prompt_version": prompt_version,

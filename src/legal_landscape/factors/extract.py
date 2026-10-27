@@ -11,6 +11,11 @@ _AMOUNT = re.compile(
     r"(?:涉案(?:金额)?|价值|获利|金额)[^，。；]{0,12}?([0-9]+(?:\.[0-9]+)?)\s*(万)?元"
 )
 _SENTENCE = re.compile(r"[^。；！？\n]*[。；！？\n]?")
+_CLAUSE = re.compile(r"[^，。；！？\n]+")
+_NEGATIONS = ("尚未", "未能", "拒不", "没有", "并未", "未", "不", "无")
+SURRENDER_CUES = ("投案自首", "主动投案", "构成自首", "自首")
+RESTITUTION_CUES = ("返还赃款", "退赃", "退赔")
+CONFESSION_CUES = ("如实供述", "坦白", "认罪")
 
 # Cues describe behaviour only. Charge names such as "诈骗" or "寻衅滋事" are excluded:
 # they restate the label rather than the facts and would leak it through [FACTORS].
@@ -30,11 +35,44 @@ CONDUCT_CUES = (
 )
 
 
-def _flag(text: str, positives: tuple[str, ...], negatives: tuple[str, ...]) -> bool | None:
-    if any(item in text for item in negatives):
-        return False
-    if any(item in text for item in positives):
+def _cue_negated(clause: str, index: int) -> bool:
+    """A negation applies to a cue later in the same clause, across a short modifier gap."""
+    window = clause[max(0, index - 8) : index]
+    for marker in _NEGATIONS:
+        position = window.rfind(marker)
+        if position < 0:
+            continue
+        gap = window[position + len(marker) :]
+        if "已" in gap:
+            continue
+        if re.fullmatch(r"[\u4e00-\u9fa5]{0,6}", gap) is None:
+            continue
         return True
+    return False
+
+
+def cue_polarity(text: str, cues: tuple[str, ...]) -> bool | None:
+    """Return True, False, or None when cues are absent or contradict each other.
+
+    Longer cues win over suffixes such as 自首 inside 构成自首. Negation is not
+    treated as the affirmative cue it contains, and a clause that both affirms
+    and denies the same factor stays unknown.
+    """
+    ordered = tuple(sorted(set(cues), key=len, reverse=True))
+    states: set[bool] = set()
+    for clause in _CLAUSE.findall(text) or (text,):
+        index = 0
+        while index < len(clause):
+            matched = next((cue for cue in ordered if clause.startswith(cue, index)), None)
+            if matched is None:
+                index += 1
+                continue
+            states.add(not _cue_negated(clause, index))
+            index += len(matched)
+    if states == {True}:
+        return True
+    if states == {False}:
+        return False
     return None
 
 
@@ -82,9 +120,9 @@ def extract_factors(
         role = "principal"
     return LegalFactors(
         amount=amount,
-        surrender=_flag(local, ("投案自首", "主动投案", "构成自首"), ("不构成自首", "无自首")),
-        restitution=_flag(local, ("退赃", "退赔", "返还赃款"), ("未退赃", "拒不退赔")),
-        confession=_flag(local, ("认罪", "如实供述", "坦白"), ("拒不认罪", "不认罪")),
+        surrender=cue_polarity(local, SURRENDER_CUES),
+        restitution=cue_polarity(local, RESTITUTION_CUES),
+        confession=cue_polarity(local, CONFESSION_CUES),
         role=role,
         conduct=_conduct(local),
     )

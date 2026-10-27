@@ -48,7 +48,17 @@ def test_view_selects_current_twelve_requests_without_modifying_historical_cache
     rows = [json.loads(line) for line in view.read_text().splitlines()]
     assert [row["generation_id"] for row in rows] == [r.generation_id for r in current]
     assert report == {"rows": 12, "valid": 12, "excluded": 1}
-    parents = {r.spec.parent_case_id: {"fact_conservative": r.parent_text} for r in current}
+    parents = {
+        r.spec.parent_case_id: {
+            "fact_conservative": r.parent_text,
+            "target_defendant": r.spec.target_defendant,
+            "charges": ["盗窃"],
+            "penalty_type": "fixed_term",
+            "imprisonment_months": 12,
+            "factors": {"restitution": False},
+        }
+        for r in current
+    }
     assert len(load_counterfactual_pairs(view, parents, filter_valid=True)) == 12
     assert view.stat().st_mtime_ns > 0
 
@@ -131,6 +141,15 @@ def test_view_preserves_invalid_generations_for_unfiltered_ablation(cache, parse
     )
     assert report["valid"] == 0
     assert json.loads(view.read_text())["validation"]["valid"] is False
-    parents = {requests[0].spec.parent_case_id: {"fact_conservative": requests[0].parent_text}}
+    parents = {
+        requests[0].spec.parent_case_id: {
+            "fact_conservative": requests[0].parent_text,
+            "target_defendant": requests[0].spec.target_defendant,
+            "charges": ["盗窃"],
+            "penalty_type": "fixed_term",
+            "imprisonment_months": 12,
+            "factors": {"restitution": False},
+        }
+    }
     assert len(load_counterfactual_pairs(view, parents, filter_valid=False)) == 1
     assert load_counterfactual_pairs(view, parents, filter_valid=True) == []

@@ -112,6 +112,57 @@ def bootstrap_metric_set(
     return result
 
 
+def _sample_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    if row.get("generation_id"):
+        return ("generation", str(row["generation_id"]))
+    if row.get("case_id"):
+        return ("case", str(row["case_id"]), row.get("intervention_type"))
+    raise ValueError("prediction row has no stable case_id or generation_id")
+
+
+def _truth_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(row.get("group_id")),
+        tuple(row.get("true_charges") or ()),
+        tuple(row.get("true_articles") or ()),
+        row.get("penalty_type"),
+        row.get("true_months"),
+        row.get("intervention_type"),
+        row.get("rank_direction"),
+        row.get("target_charge"),
+    )
+
+
+def assert_paired_rows(
+    candidate: list[dict[str, Any]], reference: list[dict[str, Any]]
+) -> None:
+    """Require the same samples, groups, truths, and intervention definitions.
+
+    Row order may differ. Missing, repeated, or disagreeing rows are errors.
+    """
+    def index(rows: list[dict[str, Any]]) -> dict[tuple[Any, ...], dict[str, Any]]:
+        found: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for row in rows:
+            key = _sample_key(row)
+            if key in found:
+                raise ValueError(f"paired comparison has a repeated sample {key}")
+            found[key] = row
+        return found
+
+    if not any(row.get("case_id") or row.get("generation_id") for row in (*candidate, *reference)):
+        return
+    left, right = index(candidate), index(reference)
+    if set(left) != set(right):
+        missing = sorted(set(left) ^ set(right))[:3]
+        raise ValueError(f"paired comparison sample sets differ, for example {missing}")
+    for key, row in left.items():
+        other = right[key]
+        if str(row.get("group_id")) != str(other.get("group_id")):
+            raise ValueError(f"sample {key} is in different groups")
+        if _truth_signature(row) != _truth_signature(other):
+            raise ValueError(f"sample {key} has different truth or intervention fields")
+
+
 def paired_cluster_test(
     candidate: list[dict[str, Any]],
     reference: list[dict[str, Any]],
@@ -124,6 +175,7 @@ def paired_cluster_test(
     description: str = "Paired bootstrap",
 ) -> dict[str, float | int]:
     """Compare two systems with paired whole-group bootstrap resampling."""
+    assert_paired_rows(candidate, reference)
     if iterations <= 0:
         raise ValueError("iterations must be positive")
     candidate_groups = _group_rows(candidate, group_key)
@@ -223,6 +275,10 @@ def fast_paired_test(
     """``paired_cluster_test`` for several endpoints from one shared resampling sequence."""
     if iterations <= 0:
         raise ValueError("iterations must be positive")
+    candidate_rows = getattr(candidate, "source_rows", None)
+    reference_rows = getattr(reference, "source_rows", None)
+    if candidate_rows is not None and reference_rows is not None:
+        assert_paired_rows(candidate_rows, reference_rows)
     if set(candidate.group_keys) != set(reference.group_keys):
         raise ValueError("paired comparison requires identical group IDs")
     keys = tuple(sorted(candidate.group_keys))

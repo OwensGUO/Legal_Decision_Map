@@ -10,6 +10,43 @@ except ImportError:  # The project keeps non-model tooling usable before GPU dep
 
 @unittest.skipIf(torch is None, "PyTorch is not installed in this interpreter")
 class ModelLossTests(unittest.TestCase):
+    def test_unknown_factor_fields_do_not_supervise_and_known_booleans_do(self) -> None:
+        from legal_landscape.models.losses import compute_typed_losses
+
+        logits = torch.zeros(2, 5, requires_grad=True)
+        targets = torch.tensor([
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0, 0.0],
+        ])
+        # amount existence, surrender, restitution, confession, accessory role
+        mask = torch.tensor([
+            [True, False, True, True, False],
+            [False, False, False, False, False],
+        ])
+        losses = compute_typed_losses(
+            factor_logits=logits, factor_targets=targets, factor_mask=mask,
+        )
+        losses.factor.backward()
+        grad = logits.grad
+        assert grad is not None
+        self.assertEqual(grad[0, 1].item(), 0.0)
+        self.assertEqual(grad[0, 4].item(), 0.0)
+        self.assertNotEqual(grad[0, 2].item(), 0.0)
+        self.assertNotEqual(grad[0, 3].item(), 0.0)
+        self.assertTrue(torch.all(grad[1] == 0))
+        self.assertGreater(losses.factor.item(), 0.0)
+
+        unknown = torch.zeros(1, 5, requires_grad=True)
+        empty = compute_typed_losses(
+            factor_logits=unknown,
+            factor_targets=torch.zeros(1, 5),
+            factor_mask=torch.zeros(1, 5, dtype=torch.bool),
+        )
+        empty.factor.backward()
+        self.assertEqual(empty.factor.item(), 0.0)
+        assert unknown.grad is not None
+        self.assertTrue(torch.all(unknown.grad == 0))
+
     def test_soft_charge_marginalization_weights_sum_to_one(self) -> None:
         from legal_landscape.models.heads import marginalize_sentence
 
@@ -165,6 +202,65 @@ class ModelLossTests(unittest.TestCase):
             torch.allclose(output["charge_probabilities"].sum(-1), torch.full((2,), 1.5))
         )
         self.assertTrue(torch.allclose(output["charge_weights"].sum(-1), torch.ones(2)))
+
+
+def _ddp_factor_mask_worker(rank, world_size, init_path, root):
+    import os
+    from pathlib import Path
+
+    import torch.distributed as distributed
+
+    os.environ.update({
+        "RANK": str(rank), "LOCAL_RANK": str(rank), "WORLD_SIZE": str(world_size),
+        "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": "29521",
+    })
+    distributed.init_process_group(
+        "gloo", init_method=f"file://{init_path}", rank=rank, world_size=world_size,
+    )
+    try:
+        from legal_landscape.models.losses import compute_typed_losses
+
+        torch.manual_seed(0)
+        layer = torch.nn.Linear(2, 5)
+        model = torch.nn.parallel.DistributedDataParallel(layer)
+        logits = model(torch.ones(2, 2))
+        mask = torch.tensor([
+            [True, False, True, True, False],
+            [False, False, False, False, False],
+        ])
+        targets = torch.zeros(2, 5)
+        targets[0, 3] = 1.0
+        loss = compute_typed_losses(
+            factor_logits=logits, factor_targets=targets, factor_mask=mask,
+        )
+        loss.factor.backward()
+        weight_grad = model.module.weight.grad.detach().cpu()
+        torch.save(weight_grad, Path(root) / f"rank-{rank}.pt")
+    finally:
+        distributed.destroy_process_group()
+
+
+def test_ddp_unknown_factor_fields_have_no_gradient(tmp_path):
+    import pytest
+
+    pytest.importorskip("torch")
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("Torch Gloo distributed runtime is not installed")
+    torch.multiprocessing.spawn(
+        _ddp_factor_mask_worker,
+        args=(2, str(tmp_path / "init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+    grads = [
+        torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True) for rank in range(2)
+    ]
+    # Output rows are amount, surrender, restitution, confession, role.
+    assert torch.allclose(grads[0], grads[1])
+    assert torch.count_nonzero(grads[0][1]).item() == 0
+    assert torch.count_nonzero(grads[0][4]).item() == 0
+    assert torch.count_nonzero(grads[0][2]).item() > 0
+    assert torch.count_nonzero(grads[0][3]).item() > 0
 
 
 if __name__ == "__main__":

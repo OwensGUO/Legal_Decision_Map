@@ -15,6 +15,7 @@ except ImportError:
 from legal_landscape.training.train import (
     DeterministicEpochSampler,
     build_experiment,
+    counterfactual_record,
     extract_text_backbone,
     format_model_input,
     inspect_model_config,
@@ -977,6 +978,21 @@ def training_progress_runtime(monkeypatch, tmp_path):
                         },
                         "case_sampler": {"epoch": 0, "start_batch": 0, "seed": 42},
                         "pair_sampler": None,
+                        "compatibility": train.resume_compatibility(
+                            training={
+                                "max_steps": max_steps,
+                                "epochs": 1,
+                                "gradient_accumulation_steps": gradient_accumulation_steps,
+                                "checkpoint_every": 1,
+                                **(training_overrides or {}),
+                            },
+                            charge_vocabulary=["盗窃"],
+                            article_vocabulary=["criminal_law:264"],
+                            penalty_vocabulary=["fixed_term"],
+                            validation_identity=(
+                                train._file_identity(validation_path) if validation else None
+                            ),
+                        ),
                     }
                 )
             )
@@ -1414,6 +1430,51 @@ def test_qlora_preparation_receives_quantized_text_model(
     assert outer.config.use_cache is False
 
 
+def test_resume_rejects_vocabulary_order_and_locked_training_but_not_log_keys():
+    from legal_landscape.training.train import resume_compatibility
+
+    training = {"learning_rate": 2e-4, "epochs": 1, "checkpoint_every": 10, "max_steps": 4}
+    current = resume_compatibility(
+        training=training,
+        charge_vocabulary=["盗窃", "诈骗"],
+        article_vocabulary=["criminal_law:264"],
+        penalty_vocabulary=["fixed_term"],
+        validation_identity=None,
+    )
+    progress = {"seed": 7, "input_identity": {"train": {"sha256": "a"}}, "compatibility": current}
+    validate_resume_metadata(
+        progress, expected_seed=7, expected_input_identity=progress["input_identity"],
+        expected_compatibility=current,
+    )
+    reordered = resume_compatibility(
+        training=training,
+        charge_vocabulary=["诈骗", "盗窃"],
+        article_vocabulary=["criminal_law:264"],
+        penalty_vocabulary=["fixed_term"],
+        validation_identity=None,
+    )
+    with pytest.raises(ValueError, match="incompatible"):
+        validate_resume_metadata(
+            progress, expected_seed=7, expected_input_identity=progress["input_identity"],
+            expected_compatibility=reordered,
+        )
+    changed_rate = resume_compatibility(
+        training={**training, "learning_rate": 1e-4, "checkpoint_every": 99, "max_steps": 8},
+        charge_vocabulary=["盗窃", "诈骗"],
+        article_vocabulary=["criminal_law:264"],
+        penalty_vocabulary=["fixed_term"],
+        validation_identity=None,
+    )
+    with pytest.raises(ValueError, match="incompatible"):
+        validate_resume_metadata(
+            progress, expected_seed=7, expected_input_identity=progress["input_identity"],
+            expected_compatibility=changed_rate,
+        )
+    assert changed_rate["training_config"]["learning_rate"] == 1e-4
+    assert "checkpoint_every" not in changed_rate["training_config"]
+    assert changed_rate["log_only_keys"] == ["checkpoint_every", "max_steps", "validation_limit"]
+
+
 def test_resume_mismatch_reports_changed_input_and_recovery():
     progress = {
         "seed": 42,
@@ -1426,8 +1487,15 @@ def test_resume_mismatch_reports_changed_input_and_recovery():
         "train": dict(progress["input_identity"]["train"]),
         "counterfactual": {"path": "/data/views/main.jsonl", "bytes": 12, "sha256": "new"},
     }
+    compatibility = {"processing_version": "2026-10-27-label-protocol"}
+    progress["compatibility"] = compatibility
     with pytest.raises(ValueError) as error:
-        validate_resume_metadata(progress, expected_seed=42, expected_input_identity=expected)
+        validate_resume_metadata(
+            progress,
+            expected_seed=42,
+            expected_input_identity=expected,
+            expected_compatibility=compatibility,
+        )
     message = str(error.value)
     assert "counterfactual" in message
     assert "/data/cache.jsonl" in message and "/data/views/main.jsonl" in message
@@ -1480,26 +1548,38 @@ class TrainingPlanTests(unittest.TestCase):
         self.assertEqual(restored.state_dict(), {"epoch": 1, "start_index": 0, "seed": 42})
 
     def test_resume_metadata_rejects_seed_or_input_changes(self) -> None:
+        compatibility = {"processing_version": "2026-10-27-label-protocol"}
         progress = {
             "seed": 42,
             "input_identity": {"train": {"sha256": "abc", "bytes": 10}},
+            "compatibility": compatibility,
         }
         validate_resume_metadata(
             progress,
             expected_seed=42,
             expected_input_identity={"train": {"sha256": "abc", "bytes": 10}},
+            expected_compatibility=compatibility,
         )
         with self.assertRaisesRegex(ValueError, "seed"):
             validate_resume_metadata(
                 progress,
                 expected_seed=2026,
                 expected_input_identity=progress["input_identity"],
+                expected_compatibility=compatibility,
             )
         with self.assertRaisesRegex(ValueError, "input"):
             validate_resume_metadata(
                 progress,
                 expected_seed=42,
                 expected_input_identity={"train": {"sha256": "changed", "bytes": 10}},
+                expected_compatibility=compatibility,
+            )
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            validate_resume_metadata(
+                {**progress, "compatibility": None},
+                expected_seed=42,
+                expected_input_identity=progress["input_identity"],
+                expected_compatibility=compatibility,
             )
 
     def test_experiment_matrix_has_all_requested_variants(self) -> None:
@@ -1599,15 +1679,17 @@ class TrainingPlanTests(unittest.TestCase):
             "validation": {
                 "valid": True, "errors": [], "parsed": {"counterfactual_text": "原始反事实"}
             },
-            "counterfactual_strict": "反事实",
+            "counterfactual_strict": "某甲涉案1010元。",
             "target_factors": {"amount": 1010.0},
+            "changed_fields": ["amount"],
+            "target_defendant": "某甲",
             "target_charge": None,
             "rank_direction": None,
         }
         invalid = {
             **valid,
             "validation": {"valid": False, "errors": ["excessive_rewrite"]},
-            "counterfactual_strict": "坏样本",
+            "counterfactual_strict": "某甲涉案1010元，后被抓获。",
         }
         leaked = {
             **valid,
@@ -1627,11 +1709,57 @@ class TrainingPlanTests(unittest.TestCase):
                 load_counterfactual_pairs(path, {}, filter_valid=True)
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0]["parent_text"], "父事实")
-        self.assertEqual(pairs[0]["counterfactual_text"], "反事实")
-        self.assertEqual(pairs[0]["counterfactual_factors"], {"amount": 1010.0})
+        self.assertEqual(pairs[0]["counterfactual_text"], "某甲涉案1010元。")
+        self.assertEqual(pairs[0]["counterfactual_factors"]["amount"], 1010.0)
         self.assertEqual(
-            [pair["counterfactual_text"] for pair in unfiltered], ["反事实", "坏样本"]
+            [pair["counterfactual_text"] for pair in unfiltered],
+            ["某甲涉案1010元。", "某甲涉案1010元，后被抓获。"],
         )
+
+    def test_predictor_factors_come_from_text_not_cached_rule_targets(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        parent = {
+            "case_id": "c1",
+            "dataset": "cail",
+            "target_defendant": "某甲",
+            "fact_strict": "某甲涉案1000元。",
+            "factors": {"amount": 1000.0},
+            "charges": ["盗窃"],
+            "co_defendants": [],
+        }
+        def row(amount, text):
+            return {
+                "parent_case_id": "c1",
+                "target_defendant": "某甲",
+                "intervention_type": "invariant",
+                "changed_fields": ["amount"],
+                "source_factors": {"amount": 1000.0},
+                "target_factors": {"amount": amount},
+                "validation": {"valid": True, "errors": []},
+                "counterfactual_strict": text,
+                "co_defendants": [],
+            }
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cf.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in (
+                    row(1010.0, "某甲涉案1010元。"),
+                    row(9999.0, "某甲涉案1010元。"),
+                    row(1010.0, "某甲没有写金额。"),
+                )),
+                encoding="utf-8",
+            )
+            pairs = load_counterfactual_pairs(path, {"c1": parent}, filter_valid=True)
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["counterfactual_factors"]["amount"], 1010.0)
+        self.assertEqual(pairs[0]["expected_factors"]["amount"], 1010.0)
+        rendered = format_model_input(
+            counterfactual_record(pairs[0]), use_factors=True
+        )
+        self.assertIn("1010", rendered)
+        self.assertNotIn("9999", rendered)
 
     def test_augmentation_records_use_counterfactual_text_factors_and_mask_penalty(self) -> None:
         from legal_landscape.training.train import augmentation_records

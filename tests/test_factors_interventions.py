@@ -21,6 +21,35 @@ def test_extracts_supported_legal_factors_from_literal_fact() -> None:
     assert validate_factors(factors) == ()
 
 
+@pytest.mark.parametrize(
+    ("text", "field"),
+    [
+        ("未如实供述", "confession"),
+        ("未主动投案", "surrender"),
+        ("未退赔", "restitution"),
+        ("没有退赃", "restitution"),
+        ("未能退赔", "restitution"),
+        ("尚未退赃", "restitution"),
+        ("拒不退赔", "restitution"),
+    ],
+)
+def test_negated_factor_cues_are_false_rather_than_affirmative(text, field) -> None:
+    factors = extract_factors(f"被告人甲{text}。", target_defendant="甲")
+    assert getattr(factors, field) is False
+
+
+def test_untui_and_untuipei_have_the_same_state() -> None:
+    stolen = extract_factors("被告人甲未退赃。", target_defendant="甲")
+    compensated = extract_factors("被告人甲未退赔。", target_defendant="甲")
+    assert stolen.restitution is False
+    assert compensated.restitution is False
+
+
+def test_conflicting_restitution_cues_are_unknown() -> None:
+    factors = extract_factors("被告人甲未退赃，但已退赔。", target_defendant="甲")
+    assert factors.restitution is None
+
+
 def test_negated_mitigation_is_not_marked_true() -> None:
     factors = extract_factors("被告人拒不认罪，未退赃，不构成自首。", target_defendant="被告人")
     assert factors.confession is False
@@ -116,6 +145,8 @@ def test_intervention_builder_produces_all_typed_rules() -> None:
         charges=("盗窃",),
         factors=factors,
         charge_boundaries=(("盗窃", "诈骗"),),
+        penalty_type="fixed_term",
+        imprisonment_months=12,
     )
     by_type = {item.intervention_type: item for item in specs}
     assert set(by_type) == {"invariant", "charge_flip", "sentence_rank"}
@@ -134,11 +165,47 @@ def test_sentence_rule_is_conditional_and_reverses_when_mitigation_removed() -> 
         charges=("故意伤害",),
         factors=factors,
         charge_boundaries=(),
+        penalty_type="fixed_term",
+        imprisonment_months=24,
     )
     [ranked] = [item for item in specs if item.intervention_type == "sentence_rank"]
     assert ranked.target_factors.restitution is False
     assert ranked.rank_direction == 1
     assert "故意伤害" in ranked.rule_id
+
+
+@pytest.mark.parametrize(
+    ("override", "reason"),
+    [
+        ({"charges": ("盗窃", "诈骗")}, "not_single_charge"),
+        ({"penalty_type": "life", "imprisonment_months": None}, "penalty_life"),
+        ({"penalty_type": "death", "imprisonment_months": None}, "penalty_death"),
+        ({"penalty_type": "exempt", "imprisonment_months": None}, "penalty_exempt"),
+        ({"imprisonment_months": None}, "missing_months"),
+        ({"factors": LegalFactors(restitution=None)}, "unknown_restitution"),
+    ],
+)
+def test_sentence_rank_stays_out_of_ineligible_cases(override, reason) -> None:
+    from legal_landscape.counterfactual.interventions import sentence_rank_exclusion
+
+    arguments = {
+        "parent_case_id": "c1",
+        "defendant": "某甲",
+        "charges": ("盗窃",),
+        "factors": LegalFactors(restitution=True),
+        "charge_boundaries": (),
+        "penalty_type": "fixed_term",
+        "imprisonment_months": 12,
+    }
+    arguments.update(override)
+    specs = propose_interventions(**arguments)
+    assert all(item.intervention_type != "sentence_rank" for item in specs)
+    assert sentence_rank_exclusion(
+        charges=arguments["charges"],
+        penalty_type=arguments["penalty_type"],
+        imprisonment_months=arguments["imprisonment_months"],
+        restitution=arguments["factors"].restitution,
+    ) == reason
 
 
 def test_charge_in_several_boundary_groups_flips_to_every_neighbour() -> None:

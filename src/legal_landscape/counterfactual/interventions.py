@@ -46,6 +46,55 @@ def _same_band_amount(amount: float) -> float | None:
     return None
 
 
+def sentence_rank_exclusion(
+    *,
+    charges: Sequence[str],
+    penalty_type: str | None,
+    imprisonment_months: int | float | None,
+    restitution: bool | None,
+) -> str | None:
+    """Why a case is outside the conditional month-ranking task, or None if it is eligible.
+
+    The task is a weak ordering constraint, not a human-labelled counterfactual sentence.
+    """
+    if len(tuple(charges)) != 1:
+        return "not_single_charge"
+    if penalty_type != "fixed_term":
+        return f"penalty_{penalty_type or 'missing'}"
+    try:
+        months = float(imprisonment_months)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "missing_months"
+    if months != months or months < 0:
+        return "missing_months"
+    if restitution is None:
+        return "unknown_restitution"
+    return None
+
+
+def filter_sentence_rank_rows(
+    rows: Sequence[dict],
+) -> tuple[list[dict], dict[str, int]]:
+    """Drop sentence-rank rows outside the shared eligibility rule and count the reasons."""
+    kept: list[dict] = []
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row.get("intervention_type") != "sentence_rank":
+            kept.append(row)
+            continue
+        reason = sentence_rank_exclusion(
+            charges=tuple(row.get("charges") or ()),
+            penalty_type=row.get("penalty_type"),
+            imprisonment_months=row.get("imprisonment_months"),
+            restitution=row.get("restitution"),
+        )
+        if reason is None:
+            kept.append(row)
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    return kept, counts
+
+
 def propose_interventions(
     *,
     parent_case_id: str,
@@ -53,6 +102,9 @@ def propose_interventions(
     charges: Sequence[str],
     factors: LegalFactors,
     charge_boundaries: Iterable[tuple[str, ...]],
+    co_defendants: Sequence[str] = (),
+    penalty_type: str | None = None,
+    imprisonment_months: int | float | None = None,
 ) -> tuple[InterventionSpec, ...]:
     """Create conditional soft-constraint proposals from a source case."""
     if not charges:
@@ -72,6 +124,7 @@ def propose_interventions(
                 rank_direction=None,
                 changed_fields=("amount",),
                 rule_id=f"{label}:amount_same_legal_band",
+                co_defendants=tuple(co_defendants),
             )
         )
     # A flip relabels the whole case with one charge, which is only sound for single-charge parents.
@@ -88,20 +141,29 @@ def propose_interventions(
                 rank_direction=None,
                 changed_fields=("conduct",),
                 rule_id=f"boundary:{label}->{target_charge}",
+                co_defendants=tuple(co_defendants),
             )
         )
-    removing = factors.restitution is True
-    proposals.append(
-        InterventionSpec(
-            parent_case_id=parent_case_id,
-            target_defendant=defendant,
-            intervention_type="sentence_rank",
-            source_factors=factors,
-            target_factors=replace(factors, restitution=not removing),
-            target_charge=None,
-            rank_direction=1 if removing else -1,
-            changed_fields=("restitution",),
-            rule_id=f"{label}:restitution_conditional_direction",
-        )
+    rank_reason = sentence_rank_exclusion(
+        charges=charges,
+        penalty_type=penalty_type,
+        imprisonment_months=imprisonment_months,
+        restitution=factors.restitution,
     )
+    if rank_reason is None:
+        removing = factors.restitution is True
+        proposals.append(
+            InterventionSpec(
+                parent_case_id=parent_case_id,
+                target_defendant=defendant,
+                intervention_type="sentence_rank",
+                source_factors=factors,
+                target_factors=replace(factors, restitution=not removing),
+                target_charge=None,
+                rank_direction=1 if removing else -1,
+                changed_fields=("restitution",),
+                rule_id=f"{label}:restitution_conditional_direction",
+                co_defendants=tuple(co_defendants),
+            )
+        )
     return tuple(proposals)

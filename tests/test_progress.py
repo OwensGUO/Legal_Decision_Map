@@ -252,6 +252,60 @@ def test_rich_renderer_respects_color_width_ascii_and_final_status():
     assert "\x1b[" not in stream.getvalue()
 
 
+def _visible_progress(reporter) -> str:
+    with reporter.progress.console.capture() as capture:
+        reporter.progress.console.print(reporter.progress.get_renderable())
+    return capture.get()
+
+
+def test_rich_progress_uses_a_stable_bar_instead_of_a_spinner():
+    stream = io.StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "always", "NO_COLOR": "1", "COLUMNS": "100", "LC_ALL": "C.UTF-8"},
+        is_terminal=True,
+    ) as reporter:
+        with reporter.task("Generate counterfactuals", total=4) as task:
+            task.update(completed=2)
+            running = _visible_progress(reporter)
+    finished = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stream.getvalue())
+    assert "████████░░░░░░░░" in running
+    assert "████████░░░░░░░░" in finished
+    assert not any(character in running for character in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    assert not running.lstrip().startswith("ok")
+
+
+def test_ascii_terminal_uses_a_hash_bar_instead_of_a_spinner():
+    stream = io.StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "always", "NO_COLOR": "1", "COLUMNS": "100", "LC_ALL": "C"},
+        is_terminal=True,
+    ) as reporter:
+        with reporter.task("Train", total=4) as task:
+            task.update(completed=2)
+            running = _visible_progress(reporter)
+    finished = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stream.getvalue())
+    assert "[########--------]" in running
+    assert "[########--------]" in finished
+    assert all(ord(character) < 128 for character in running + finished)
+
+
+def test_unknown_total_does_not_render_a_bar():
+    stream = io.StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "always", "NO_COLOR": "1", "COLUMNS": "100", "LC_ALL": "C.UTF-8"},
+        is_terminal=True,
+    ) as reporter:
+        with reporter.task("Build train", total=None) as task:
+            task.advance()
+    rendered = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stream.getvalue())
+    assert "1/?" in rendered
+    assert "█" not in rendered
+    assert "[" not in rendered
+
+
 def test_rich_renderer_uses_ascii_for_named_non_utf8_locale():
     stream = io.StringIO()
     with create_progress_reporter(

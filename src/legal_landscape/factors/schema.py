@@ -43,6 +43,7 @@ class InterventionSpec:
     rank_direction: Literal[-1, 0, 1] | None
     changed_fields: tuple[str, ...]
     rule_id: str
+    co_defendants: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.parent_case_id or not self.target_defendant or not self.rule_id:
@@ -62,6 +63,7 @@ class InterventionSpec:
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["changed_fields"] = list(self.changed_fields)
+        value["co_defendants"] = list(self.co_defendants)
         return value
 
     @classmethod
@@ -72,5 +74,6 @@ class InterventionSpec:
                 "source_factors": LegalFactors.from_dict(value["source_factors"]),
                 "target_factors": LegalFactors.from_dict(value["target_factors"]),
                 "changed_fields": tuple(value["changed_fields"]),
+                "co_defendants": tuple(value.get("co_defendants") or ()),
             }
         )

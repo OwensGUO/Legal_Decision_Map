@@ -161,10 +161,14 @@ def compute_typed_losses(
             if factor_mask is None
             else factor_mask.bool()
         )
-        per_item = F.binary_cross_entropy_with_logits(
+        per_field = F.binary_cross_entropy_with_logits(
             factor_logits, factor_targets, reduction="none"
-        ).mean(-1)
-        factor = _masked_mean(per_item, mask, zero)
+        )
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(-1).expand_as(per_field)
+        if mask.shape != per_field.shape:
+            raise ValueError("factor mask must match factor targets")
+        factor = per_field[mask].mean() if bool(mask.any()) else zero
         counts["factor"] = int(mask.sum().item())
 
     invariant = boundary = response = zero

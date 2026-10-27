@@ -75,12 +75,72 @@ def test_fast_paired_test_reproduces_row_resampling() -> None:
             assert math.isclose(fast[name][key], slow[key], abs_tol=1e-12)
 
 
-def _row(true, predicted, group="g1"):
+def _row(true, predicted, group="g1", **extra):
     return {
         "group_id": group, "true_charges": true, "predicted_charges": predicted,
         "penalty_type": "fixed_term", "predicted_penalty_type": "fixed_term",
         "true_months": 6.0, "predicted_months": 6.0,
+        **extra,
     }
+
+
+def test_complete_cmdl_limit_and_paired_identity(tmp_path) -> None:
+    from legal_landscape.evaluation.bootstrap import assert_paired_rows
+
+    module = runpy.run_path(str(ROOT / "scripts" / "evaluate_model.py"))
+    rows = [
+        {"group_id": "case-a", "case_id": "a-1", "true_charges": [1]},
+        {"group_id": "case-a", "case_id": "a-2", "true_charges": [0]},
+        {"group_id": "case-b", "case_id": "b-1", "true_charges": [1]},
+    ]
+    destination = tmp_path / "cmdl.jsonl"
+    destination.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    selected = module["read_rows"](destination, 1, complete_groups=True)
+    assert [row["case_id"] for row in selected] == ["a-1", "a-2"]
+    swapped = [rows[1], rows[0]]
+    assert_paired_rows(rows[:2], swapped)
+    with pytest.raises(ValueError, match="sample sets differ"):
+        assert_paired_rows(rows[:2], rows[:1])
+    with pytest.raises(ValueError, match="repeated"):
+        assert_paired_rows(rows[:2], [*rows[:2], rows[0]])
+    changed = [{**rows[0], "true_charges": [0]}, rows[1]]
+    with pytest.raises(ValueError, match="different truth"):
+        assert_paired_rows(rows[:2], changed)
+
+
+def test_missing_article_labels_stop_scoring(tmp_path) -> None:
+    module = runpy.run_path(str(ROOT / "scripts" / "evaluate_model.py"))
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps({
+        "group_id": "g", "case_id": "c",
+        "true_charges": [1], "predicted_charges": [1],
+        "true_articles": [0, 0], "predicted_articles": [0, 0],
+        "articles_available": False,
+        "penalty_type": "fixed_term", "predicted_penalty_type": "fixed_term",
+        "true_months": 6, "predicted_months": 6,
+    }) + "\n", encoding="utf-8")
+    args = type("Args", (), {
+        "limit": 10, "kind": "static", "parent_records": None, "metadata": None,
+    })()
+    with pytest.raises(SystemExit, match="missing article"):
+        module["_load"](path, args)
+
+
+def test_distinct_unseen_labels_are_separate_macro_classes() -> None:
+    prepared = prepare_static([
+        _row([1], [1], unseen_true_charge_labels=["X", "Y"]),
+        _row([0], [0], "g2", unseen_true_charge_labels=["X"]),
+    ])
+    # Sample 1: A,X,Y true and only A predicted. Sample 2 shares unseen label X.
+    # Micro: tp=1, fn=3 (X,Y,X) → F1 = 2/5? User asked one sample A/X/Y predict A → 0.5.
+    one = prepare_static([_row([1], [1], unseen_true_charge_labels=["X", "Y"])])
+    one_metrics = one.metrics(None)
+    assert one_metrics["charge_micro_f1"] == 0.5
+    assert one_metrics["charge_macro_f1"] == pytest.approx(1 / 3)
+    # Shared unseen label X is one column. Resampling cannot add a class.
+    assert prepared.charge.supported.sum() == 3
+    assert prepared.charge.tp.shape[1] == 3
+    assert prepared.metrics(np.array([2.0, 0.0]))["charge_macro_f1"] != 0.0
 
 
 def test_macro_average_uses_classes_present_in_the_full_test_truth() -> None:

@@ -19,6 +19,32 @@ from legal_landscape.training.train import (
 )
 
 
+def test_factor_supervision_masks_unknown_booleans_and_keeps_amount_existence() -> None:
+    from legal_landscape.training.train import factor_supervision
+
+    partial_target, partial_mask = factor_supervision({
+        "amount": None,
+        "surrender": None,
+        "restitution": False,
+        "confession": True,
+        "role": "unknown",
+    })
+    assert partial_target == [0.0, 0.0, 0.0, 1.0, 0.0]
+    assert partial_mask == [True, False, True, True, False]
+    known_target, known_mask = factor_supervision({
+        "amount": 12.0,
+        "surrender": True,
+        "restitution": False,
+        "confession": False,
+        "role": "principal",
+    })
+    assert known_target == [1.0, 1.0, 0.0, 0.0, 0.0]
+    assert known_mask == [True, True, True, True, True]
+    absent_target, absent_mask = factor_supervision({})
+    assert absent_target[0] == 0.0
+    assert absent_mask == [True, False, False, False, False]
+
+
 def test_learning_rate_warms_up_then_decays_by_cosine_to_the_floor() -> None:
     factors = [learning_rate_factor(step, 100, 10, 0.1) for step in range(100)]
     assert factors[0] == pytest.approx(0.1)

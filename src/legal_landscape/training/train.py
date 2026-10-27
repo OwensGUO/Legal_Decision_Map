@@ -192,6 +192,29 @@ def shard_batches(
     return padded[process_index::num_processes]
 
 
+def main_accumulation_should_sync(
+    microbatches_completed_in_epoch: int,
+    accumulation_steps: int,
+    *,
+    at_epoch_end: bool,
+) -> bool:
+    """Whether this main microbatch must update parameters and the learning rate.
+
+    ``microbatches_completed_in_epoch`` counts only main batches yielded in the current
+    epoch pass, starting at 1. Full windows sync on multiples of ``accumulation_steps``.
+    A short final window syncs at the main epoch boundary so its gradients are applied.
+    Counterfactual batches are not part of this decision. Resuming is valid only from a
+    completed update, so a restored epoch pass starts a new window.
+    """
+    if accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if microbatches_completed_in_epoch < 1:
+        raise ValueError("main microbatch count must be positive")
+    if microbatches_completed_in_epoch % accumulation_steps == 0:
+        return True
+    return bool(at_epoch_end)
+
+
 def learning_rate_factor(
     step: int, total_steps: int, warmup_steps: int, min_ratio: float
 ) -> float:
@@ -311,11 +334,53 @@ def _dependency_versions() -> dict[str, str]:
     return versions
 
 
+PROCESSING_VERSION = "2026-10-27-label-protocol"
+RESUME_LOCKED_TRAINING_KEYS = (
+    "learning_rate",
+    "epochs",
+    "gradient_accumulation_steps",
+    "warmup_ratio",
+    "min_learning_rate_ratio",
+    "per_device_batch_size",
+    "max_tokens_per_batch",
+)
+# These may change between a checkpoint and the process that restores it.
+RESUME_LOG_ONLY_KEYS = ("checkpoint_every", "max_steps", "validation_limit")
+
+
+def resume_compatibility(
+    *,
+    training: dict[str, Any],
+    charge_vocabulary: list[str],
+    article_vocabulary: list[str],
+    penalty_vocabulary: list[str],
+    validation_identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Identity that must match before a checkpoint can restore training."""
+    from legal_landscape.counterfactual.prompts import PROMPT_VERSION
+    from legal_landscape.data.sanitize import SANITIZER_VERSION
+
+    return {
+        "processing_version": PROCESSING_VERSION,
+        "sanitizer_version": SANITIZER_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "charge_vocabulary": list(charge_vocabulary),
+        "article_vocabulary": list(article_vocabulary),
+        "penalty_vocabulary": list(penalty_vocabulary),
+        "training_config": {
+            key: training[key] for key in RESUME_LOCKED_TRAINING_KEYS if key in training
+        },
+        "validation_identity": validation_identity,
+        "log_only_keys": list(RESUME_LOG_ONLY_KEYS),
+    }
+
+
 def validate_resume_metadata(
     progress: dict[str, Any],
     *,
     expected_seed: int,
     expected_input_identity: dict[str, Any],
+    expected_compatibility: dict[str, Any],
 ) -> None:
     """Reject checkpoints produced from a different deterministic run input."""
     if int(progress.get("seed", -1)) != expected_seed:
@@ -343,6 +408,13 @@ def validate_resume_metadata(
             "RESUME_TRAINING=0 bash run.sh (archives selected runs and preserves "
             "the counterfactual generation cache). For scripts/train_model.py, use "
             "a new --output-dir without --resume-from-checkpoint."
+        )
+    saved_compatibility = progress.get("compatibility")
+    if saved_compatibility != expected_compatibility:
+        raise ValueError(
+            "checkpoint is incompatible with the current processing and training setup: "
+            f"checkpoint={saved_compatibility!r}, current={expected_compatibility!r}. "
+            "Use a new OUTPUT_ROOT; do not delete this check to reuse an older checkpoint."
         )
 
 
@@ -455,6 +527,28 @@ def training_plan(config: dict[str, Any], *, experiment: str) -> dict[str, Any]:
     }
 
 
+def factor_supervision(factors: dict[str, Any] | None) -> tuple[list[float], list[bool]]:
+    """Targets and a per-field mask for the five factor outputs.
+
+    Amount is an existence observation: every case is supervised as present or
+    absent. Surrender, restitution, confession, and accessory status are boolean
+    tasks and are masked while unknown. ``False`` remains a real negative label.
+    """
+    values = factors or {}
+    amount = values.get("amount")
+    targets = [1.0 if amount is not None else 0.0]
+    mask = [True]
+    for key in ("surrender", "restitution", "confession"):
+        value = values.get(key)
+        known = isinstance(value, bool)
+        targets.append(1.0 if value is True else 0.0)
+        mask.append(known)
+    role = values.get("role")
+    targets.append(1.0 if role == "accessory" else 0.0)
+    mask.append(role in {"principal", "accessory"})
+    return targets, mask
+
+
 def format_model_input(
     record: dict[str, Any], *, use_factors: bool, max_fact_chars: int | None = None
 ) -> str:
@@ -510,6 +604,38 @@ def load_processed_records(path: str | Path, *, limit: int | None = None) -> lis
     return records
 
 
+def _factor_values_match(observed: Any, expected: Any) -> bool:
+    if isinstance(observed, int | float) and isinstance(expected, int | float):
+        return abs(float(observed) - float(expected)) <= max(1.0, abs(float(expected)) * 1e-3)
+    return observed == expected
+
+
+def _observed_counterfactual_factors(
+    row: dict[str, Any], parent: dict[str, Any], text: str
+) -> dict[str, Any] | None:
+    """Factors read from the final text. Rule targets are not observations.
+
+    When the cache names the fields it claims to have changed, a text that does
+    not realize those values is rejected. Extraction failure does not fall back
+    to the rule target.
+    """
+    from legal_landscape.factors.extract import extract_factors
+
+    target = str(row.get("target_defendant") or parent.get("target_defendant") or "")
+    others = tuple(row.get("co_defendants") or parent.get("co_defendants") or ())
+    observed = extract_factors(text, target_defendant=target, co_defendants=others).to_dict()
+    changed = tuple(row.get("changed_fields") or ())
+    expected = row.get("target_factors")
+    if not changed:
+        return observed
+    if not isinstance(expected, dict):
+        return None
+    for field in changed:
+        if not _factor_values_match(observed.get(field), expected.get(field)):
+            return None
+    return observed
+
+
 def load_counterfactual_pairs(
     path: str | Path,
     parents: dict[str, dict[str, Any]],
@@ -544,6 +670,27 @@ def load_counterfactual_pairs(
                 counterfactual_text = row.get("counterfactual_strict")
                 if not isinstance(counterfactual_text, str) or not counterfactual_text:
                     continue
+                observed = _observed_counterfactual_factors(row, parent, counterfactual_text)
+                if observed is None:
+                    continue
+                if row.get("intervention_type") == "sentence_rank":
+                    from legal_landscape.counterfactual.interventions import (
+                        sentence_rank_exclusion,
+                    )
+
+                    parent_factors = parent.get("factors") or {}
+                    reason = sentence_rank_exclusion(
+                        charges=tuple(parent.get("charges") or ()),
+                        penalty_type=parent.get("penalty_type"),
+                        imprisonment_months=parent.get("imprisonment_months"),
+                        restitution=(
+                            parent_factors.get("restitution")
+                            if isinstance(parent_factors, dict)
+                            else None
+                        ),
+                    )
+                    if reason is not None:
+                        continue
                 pairs.append(
                     {
                         "parent_record": parent,
@@ -552,12 +699,14 @@ def load_counterfactual_pairs(
                         or parent.get("fact_raw")
                         or "",
                         "counterfactual_text": counterfactual_text,
-                        "counterfactual_factors": row.get("target_factors")
-                        or parent.get("factors")
-                        or {},
+                        "counterfactual_factors": observed,
+                        "expected_factors": row.get("target_factors")
+                        if isinstance(row.get("target_factors"), dict)
+                        else {},
                         "intervention_type": row["intervention_type"],
                         "target_charge": row.get("target_charge"),
                         "rank_direction": row.get("rank_direction"),
+                        "generation_id": row.get("generation_id"),
                     }
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -575,7 +724,7 @@ def counterfactual_record(pair: dict[str, Any]) -> dict[str, Any]:
         **pair["parent_record"],
         "fact_conservative": pair["counterfactual_text"],
         "fact_strict": pair["counterfactual_text"],
-        "factors": pair.get("counterfactual_factors") or pair["parent_record"].get("factors"),
+        "factors": pair.get("counterfactual_factors", pair["parent_record"].get("factors")),
     }
 
 
@@ -722,6 +871,7 @@ def make_counterfactual_prediction_rows(
             {
                 "case_id": pair["parent_record"]["case_id"],
                 "group_id": pair["parent_record"]["group_id"],
+                "generation_id": pair.get("generation_id"),
                 "intervention_type": pair["intervention_type"],
                 "target_charge": charge_to_index[target] if target is not None else None,
                 "parent_charge_indices": [
@@ -735,6 +885,10 @@ def make_counterfactual_prediction_rows(
                 "counterfactual_charge_probabilities": counterfactual_prob,
                 "parent_sentence": float(parent_sentence),
                 "counterfactual_sentence": float(counterfactual_sentence),
+                "charges": list(pair["parent_record"].get("charges") or ()),
+                "penalty_type": pair["parent_record"].get("penalty_type"),
+                "imprisonment_months": pair["parent_record"].get("imprisonment_months"),
+                "restitution": (pair["parent_record"].get("factors") or {}).get("restitution"),
             }
         )
     return rows
@@ -1056,6 +1210,50 @@ def _progress_enabled_for_process(*, is_main_process: bool) -> bool:
     return is_main_process
 
 
+@contextmanager
+def _main_accumulation_context(accelerator: Any, model: Any, should_sync: bool):
+    """Skip DDP allreduce except on a main-batch update boundary.
+
+    ``accelerator.backward`` still divides every loss by the configured accumulation
+    steps, including the short final window. That matches Accelerate's own tail scaling.
+    """
+    if should_sync or not getattr(accelerator, "use_distributed", False):
+        yield
+        return
+    with accelerator.no_sync(model):
+        yield
+
+
+def _untracked_counterfactual_loader(
+    dataset: Any,
+    batch_sampler: Any,
+    collate_fn: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    accelerator: Any,
+) -> Any:
+    """Yield counterfactual samples without joining Accelerate's gradient-state stack.
+
+    Preparing this loader would make its ``end_of_dataloader`` flag the active one and
+    could sync or skip the main tail. Ranks still see the same shard a prepared loader
+    would have produced.
+    """
+    num_processes = int(getattr(accelerator, "num_processes", 1) or 1)
+    process_index = int(getattr(accelerator, "process_index", 0) or 0)
+    sampler = batch_sampler
+    if num_processes > 1:
+        from accelerate.data_loader import BatchSamplerShard
+
+        sampler = BatchSamplerShard(
+            batch_sampler,
+            num_processes=num_processes,
+            process_index=process_index,
+            split_batches=False,
+            even_batches=True,
+        )
+    from torch.utils.data import DataLoader
+
+    return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_fn)
+
+
 def _report_optimizer_step(
     task: ProgressTask, step: int, max_steps: int, total_loss: float
 ) -> None:
@@ -1094,6 +1292,19 @@ def run_real_training(
     step = 0
     completed_microbatches = 0
     progress: dict[str, Any] = {}
+    metadata_path = Path(train_data).parent / "metadata.json"
+    saved_metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    )
+    compatibility = resume_compatibility(
+        training=dict(config.get("training", {})),
+        charge_vocabulary=list(saved_metadata.get("charge_vocabulary") or ()),
+        article_vocabulary=list(saved_metadata.get("article_vocabulary") or ()),
+        penalty_vocabulary=list(saved_metadata.get("penalty_vocabulary") or ()),
+        validation_identity=(
+            _file_identity(validation_data) if validation_data is not None else None
+        ),
+    )
     if resume_from_checkpoint is not None:
         progress_path = Path(resume_from_checkpoint) / "training_progress.json"
         if not progress_path.is_file():
@@ -1104,6 +1315,7 @@ def run_real_training(
                 progress,
                 expected_seed=seed,
                 expected_input_identity=input_identity,
+                expected_compatibility=compatibility,
             )
         except ValueError as exc:
             raise ValueError(f"{progress_path}: {exc}") from exc
@@ -1338,6 +1550,7 @@ def run_real_training(
         sentence_targets = torch.zeros(len(batch), dtype=torch.float32)
         sentence_mask = torch.zeros(len(batch), dtype=torch.bool)
         factor_targets = torch.zeros((len(batch), 5), dtype=torch.float32)
+        factor_mask = torch.zeros((len(batch), 5), dtype=torch.bool)
         for index, item in enumerate(batch):
             # Evaluation labels outside the training vocabulary have no output unit.
             for charge in item["charges"]:
@@ -1350,7 +1563,9 @@ def run_real_training(
             ]
             for article in item_articles:
                 article_targets[index, article_to_index[article]] = 1.0
-            article_mask[index] = bool(item_articles)
+            article_mask[index] = (
+                bool(item_articles) and item.get("articles_available") is not False
+            )
             penalty_targets[index] = penalty_to_index[item["penalty_type"]]
             penalty_mask[index] = not item.get("mask_penalty", False)
             eligible = (
@@ -1362,15 +1577,9 @@ def run_real_training(
                 sentence_targets[index] = float(item["imprisonment_months"])
                 sentence_mask[index] = True
             factors = item.get("factors") or {}
-            factor_targets[index] = torch.tensor(
-                [
-                    float(factors.get("amount") is not None),
-                    float(factors.get("surrender") is True),
-                    float(factors.get("restitution") is True),
-                    float(factors.get("confession") is True),
-                    float(factors.get("role") == "accessory"),
-                ]
-            )
+            supervised_targets, supervised_mask = factor_supervision(factors)
+            factor_targets[index] = torch.tensor(supervised_targets)
+            factor_mask[index] = torch.tensor(supervised_mask)
         result = {
             **encoded,
             "charge_targets": charge_targets,
@@ -1381,6 +1590,7 @@ def run_real_training(
             "sentence_targets": sentence_targets,
             "sentence_mask": sentence_mask,
             "factor_targets": factor_targets,
+            "factor_mask": factor_mask,
         }
         if all("_prediction_index" in item for item in batch):
             result["record_indices"] = torch.tensor(
@@ -1464,8 +1674,12 @@ def run_real_training(
         lr=base_learning_rate,
     )
     predictor, optimizer, loader = accelerator.prepare(predictor, optimizer, loader)
-    if pair_loader is not None:
-        pair_loader = accelerator.prepare(pair_loader)
+    if pair_sampler is not None:
+        # Do not prepare this loader. Its iterator must not become the active
+        # gradient-state dataloader or it will move optimizer boundaries.
+        pair_loader = _untracked_counterfactual_loader(
+            pairs, pair_sampler, collate_pairs, accelerator
+        )
     if resume_from_checkpoint is not None:
         accelerator.load_state(str(resume_from_checkpoint))
     destination.mkdir(parents=True, exist_ok=True)
@@ -1503,6 +1717,7 @@ def run_real_training(
                             pair_sampler.state_dict() if pair_sampler is not None else None
                         ),
                         "input_identity": input_identity,
+                        "compatibility": compatibility,
                         "dependency_versions": _dependency_versions(),
                         "model_config": asdict(inspected),
                     },
@@ -1671,8 +1886,18 @@ def run_real_training(
         ) as train_progress:
             predictor.train()
             for _epoch in range(case_sampler.epoch, epochs) if step < max_steps else ():
+                microbatches_in_epoch = 0
                 for batch in loader:
-                    with accelerator.accumulate(predictor):
+                    microbatches_in_epoch += 1
+                    # The prepared main loader sets this before yielding its last batch.
+                    # Counterfactual iteration must not be consulted here.
+                    should_sync = main_accumulation_should_sync(
+                        microbatches_in_epoch,
+                        gradient_accumulation_steps,
+                        at_epoch_end=bool(getattr(loader, "end_of_dataloader", False)),
+                    )
+                    accelerator.sync_gradients = should_sync
+                    with _main_accumulation_context(accelerator, predictor, should_sync):
                         output = predictor(batch["input_ids"], batch.get("attention_mask"))
                         supervised_losses = compute_typed_losses(
                             charge_logits=output["charge_logits"],
@@ -1692,6 +1917,9 @@ def run_real_training(
                             factor_targets=batch["factor_targets"]
                             if experiment.use_factors
                             else None,
+                            factor_mask=batch.get("factor_mask")
+                            if experiment.use_factors
+                            else None,
                             weights=weights,
                             multilabel_reduction=multilabel_reduction,
                         )
@@ -1709,7 +1937,7 @@ def run_real_training(
                         # their DDP backward passes) stay aligned across ranks.
                         if pair_iterator is not None and completed_microbatches % pair_every == 0:
                             try:
-                                pair_batch = next(pair_iterator)
+                                pair_batch = device_batch(next(pair_iterator))
                             except StopIteration:
                                 if pair_sampler is None:
                                     raise RuntimeError(
@@ -1717,7 +1945,7 @@ def run_real_training(
                                     ) from None
                                 pair_sampler.next_epoch()
                                 pair_iterator = iter(pair_loader)  # type: ignore[arg-type]
-                                pair_batch = next(pair_iterator)
+                                pair_batch = device_batch(next(pair_iterator))
                             pair_types = pair_batch["pair_types"]
                             needs_parent_charge, needs_parent_sentence = (
                                 _distributed_parent_requirements(
@@ -1819,7 +2047,7 @@ def run_real_training(
                             del pair_batch
                             if pair_sampler is not None:
                                 pair_sampler.advance(accelerator.num_processes)
-                        completed_optimizer_step = accelerator.sync_gradients
+                        completed_optimizer_step = should_sync
                         learning_rate = base_learning_rate * learning_rate_factor(
                             step, max_steps, warmup_steps, min_learning_rate_ratio
                         )

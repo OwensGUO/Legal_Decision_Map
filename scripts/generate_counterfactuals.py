@@ -15,7 +15,10 @@ from legal_landscape.counterfactual.generate import (
     VLLMHTTPGenerator,
     generate_records,
 )
-from legal_landscape.counterfactual.interventions import propose_interventions
+from legal_landscape.counterfactual.interventions import (
+    propose_interventions,
+    sentence_rank_exclusion,
+)
 from legal_landscape.counterfactual.prompts import PROMPT_VERSION
 from legal_landscape.counterfactual.provenance import (
     MANIFEST_NAME,
@@ -69,6 +72,7 @@ def _requests(
     """Build at most ``limit`` requests; cases longer than ``max_source_chars`` are skipped."""
     requests: list[GenerationRequest] = []
     skipped_long = 0
+    rank_exclusions: dict[str, int] = {}
     with path.open("r", encoding="utf-8") as handle:
         for number, line in enumerate(handle, start=1):
             if parent_limit is not None and number > parent_limit:
@@ -86,19 +90,30 @@ def _requests(
                     skipped_long += 1
                     continue
                 factors = LegalFactors.from_dict(row["factors"])
+                rank_reason = sentence_rank_exclusion(
+                    charges=tuple(row.get("charges") or ()),
+                    penalty_type=row.get("penalty_type"),
+                    imprisonment_months=row.get("imprisonment_months"),
+                    restitution=factors.restitution,
+                )
+                if rank_reason is not None:
+                    rank_exclusions[rank_reason] = rank_exclusions.get(rank_reason, 0) + 1
                 for spec in propose_interventions(
                     parent_case_id=row["case_id"],
                     defendant=row["target_defendant"],
                     charges=tuple(row["charges"]),
                     factors=factors,
                     charge_boundaries=boundaries,
+                    co_defendants=tuple(row.get("co_defendants") or ()),
+                    penalty_type=row.get("penalty_type"),
+                    imprisonment_months=row.get("imprisonment_months"),
                 ):
                     requests.append(GenerationRequest(parent_text, spec))
                     if len(requests) >= limit:
                         break
             if len(requests) >= limit:
                 break
-    return requests, skipped_long
+    return requests, skipped_long, rank_exclusions
 
 
 def _charge_lexicon(path: Path) -> tuple[str, ...]:
@@ -163,7 +178,7 @@ def main() -> int:
         )
     )
     max_source_chars = config.get("max_source_chars")
-    requests, skipped_long = _requests(
+    requests, skipped_long, rank_exclusions = _requests(
         args.input,
         args.limit,
         boundaries,
@@ -196,6 +211,7 @@ def main() -> int:
         **summary,
         "requests": len(requests),
         "skipped_long_cases": skipped_long,
+        "sentence_rank_exclusions": rank_exclusions,
         "skipped_completed": result.skipped_completed,
         "skipped_duplicate": result.skipped_duplicate,
         "generated": len(result.records),
