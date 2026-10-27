@@ -18,6 +18,39 @@ pytest.importorskip("accelerate")
 pytest.importorskip("transformers")
 pytest.importorskip("tensorboard")
 
+
+def _pair_rows(parents, *, kind: str | None = None) -> str:
+    from tests.support import cache_identity
+
+    rows = []
+    for index, record in enumerate(parents):
+        intervention = kind or ("invariant", "charge_flip", "sentence_rank")[index % 3]
+        if intervention == "charge_flip":
+            text, changed, target = (
+                "某甲谎称借用财物。",
+                ["conduct"],
+                {"conduct": "虚构事实使被害人自愿交付"},
+            )
+            target_charge, rank = "诈骗", None
+        elif intervention == "sentence_rank":
+            text, changed, target = "某甲已退赃。", ["restitution"], {"restitution": True}
+            target_charge, rank = None, 1
+        else:
+            text, changed, target = "某甲涉案101元。", ["amount"], {"amount": 101.0}
+            target_charge, rank = None, None
+        rows.append(json.dumps({
+            "parent_case_id": record["case_id"],
+            "intervention_type": intervention,
+            "target_charge": target_charge,
+            "rank_direction": rank,
+            "changed_fields": changed,
+            "target_factors": target,
+            "validation": {"valid": True, "errors": []},
+            "counterfactual_strict": text,
+            **cache_identity(record["fact_strict"], defendant=record["target_defendant"]),
+        }, ensure_ascii=False))
+    return "".join(row + "\n" for row in rows)
+
 class TinyTokenizer:
     pad_token_id = 0
 
@@ -128,19 +161,8 @@ def test_real_training_completes_ddp_accumulation_with_inactive_heads(
         "article_vocabulary": ["criminal_law:264"],
         "penalty_vocabulary": ["fixed_term", "life"],
     }))
-    def pairs(parents):
-        return "".join(json.dumps({
-            "parent_case_id": record["case_id"],
-            "intervention_type": ("invariant", "charge_flip", "sentence_rank")[index % 3],
-            "target_charge": "诈骗" if index % 3 == 1 else None,
-            "rank_direction": 1 if index % 3 == 2 else None,
-            "target_factors": {},
-            "validation": {"valid": True, "errors": []},
-            "counterfactual_strict": "改写事实",
-        }) + "\n" for index, record in enumerate(parents))
-
-    (tmp_path / "pairs.jsonl").write_text(pairs(records))
-    (tmp_path / "heldout_pairs.jsonl").write_text(pairs(evaluation))
+    (tmp_path / "pairs.jsonl").write_text(_pair_rows(records))
+    (tmp_path / "heldout_pairs.jsonl").write_text(_pair_rows(evaluation))
 
     torch.multiprocessing.spawn(
         _training_worker,
@@ -193,19 +215,8 @@ def _write_fixture(tmp_path):
         "penalty_vocabulary": ["fixed_term", "life"],
     }))
 
-    def pairs(parents):
-        return "".join(json.dumps({
-            "parent_case_id": record["case_id"],
-            "intervention_type": ("invariant", "charge_flip", "sentence_rank")[index % 3],
-            "target_charge": "诈骗" if index % 3 == 1 else None,
-            "rank_direction": 1 if index % 3 == 2 else None,
-            "target_factors": {},
-            "validation": {"valid": True, "errors": []},
-            "counterfactual_strict": "改写事实",
-        }) + "\n" for index, record in enumerate(parents))
-
-    (tmp_path / "pairs.jsonl").write_text(pairs(records))
-    (tmp_path / "heldout_pairs.jsonl").write_text(pairs(held_out["evaluation"]))
+    (tmp_path / "pairs.jsonl").write_text(_pair_rows(records))
+    (tmp_path / "heldout_pairs.jsonl").write_text(_pair_rows(held_out["evaluation"]))
 
 
 @pytest.mark.skipif(
@@ -281,15 +292,21 @@ def _write_accumulation_case(root: Path, *, records: int, pairs: int) -> None:
         "penalty_vocabulary": ["fixed_term", "life"],
     }))
     parents = rows[:pairs] if pairs else []
-    (root / "pairs.jsonl").write_text("".join(json.dumps({
-        "parent_case_id": row["case_id"],
-        "intervention_type": "invariant",
-        "target_charge": None,
-        "rank_direction": None,
-        "target_factors": {},
-        "validation": {"valid": True, "errors": []},
-        "counterfactual_strict": "改写事实",
-    }) + "\n" for row in parents))
+    (root / "pairs.jsonl").write_text(_pair_rows(parents, kind="invariant"))
+
+
+class DropoutTinyBackbone(torch.nn.Module):
+    """CPU backbone whose dropout consumes the global generator during training."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(16, 4)
+        self.dropout = torch.nn.Dropout(0.5)
+        self.projection = torch.nn.Linear(4, 4)
+
+    def forward(self, input_ids, **kwargs):
+        hidden = self.projection(self.dropout(self.embedding(input_ids)))
+        return SimpleNamespace(last_hidden_state=hidden)
 
 
 def _run_accumulation_case(
@@ -300,15 +317,18 @@ def _run_accumulation_case(
     max_steps: int,
     resume: Path | None = None,
     checkpoint_every: int = 0,
+    model_path: str = "tiny",
+    backbone_factory=None,
 ) -> dict:
     """Real Accelerator loop. The returned weight is the live parameter after optimizer updates."""
     from accelerate.state import AcceleratorState, GradientState
 
     inspected = InspectedModelConfig("tiny", (), "tiny", "base_model", (), False, 4)
     holder: dict = {}
+    factory = backbone_factory or TinyCheckpointedBackbone
 
     def load_backbone(config):
-        model = TinyCheckpointedBackbone()
+        model = factory()
         holder["initial"] = model.projection.weight.detach().cpu().clone()
         holder["model"] = model
         return model, inspected
@@ -321,7 +341,7 @@ def _run_accumulation_case(
             patch("legal_landscape.training.train.load_backbone", side_effect=load_backbone),
         ):
             result = run_real_training(
-                {"model": {"path": "tiny"}, "training": {
+                {"model": {"path": model_path}, "training": {
                     "seed": 42, "mixed_precision": "no", "max_steps": max_steps,
                     "epochs": epochs, "per_device_batch_size": 1,
                     "gradient_accumulation_steps": 2, "checkpoint_every": checkpoint_every,
@@ -340,6 +360,7 @@ def _run_accumulation_case(
     result = dict(result)
     result["weight_changed"] = not torch.allclose(final, holder["initial"])
     result["weight"] = final.view(-1)[:4].tolist()
+    result["flat_weight"] = final.detach().cpu().flatten().tolist()
     return result
 
 
@@ -381,6 +402,244 @@ def test_main_microbatches_decide_real_optimizer_updates(
         tmp_path, experiment=experiment, epochs=epochs, max_steps=0,
     )
     _assert_update_schedule(tmp_path, result, steps=steps, microbatches=micro)
+
+
+def test_interrupted_resume_matches_uninterrupted_updates_and_samples(tmp_path):
+    """A checkpoint resumed under the same run consumes the same batches and updates."""
+    from legal_landscape.training.train import TokenBudgetBatchSampler, format_model_input
+
+    uninterrupted = tmp_path / "full"
+    interrupted = tmp_path / "split"
+    for root in (uninterrupted, interrupted):
+        root.mkdir()
+        _write_accumulation_case(root, records=8, pairs=1)
+    full = _run_accumulation_case(uninterrupted, experiment="M", epochs=1, max_steps=4)
+    _run_accumulation_case(interrupted, experiment="M", epochs=1, max_steps=2)
+    midpoint = json.loads(
+        (interrupted / "output/checkpoint-final/training_progress.json").read_text()
+    )
+    resumed = _run_accumulation_case(
+        interrupted,
+        experiment="M",
+        epochs=1,
+        max_steps=4,
+        resume=interrupted / "output/checkpoint-final",
+    )
+    full_progress = json.loads(
+        (uninterrupted / "output/checkpoint-final/training_progress.json").read_text()
+    )
+    resumed_progress = json.loads(
+        (interrupted / "output/checkpoint-final/training_progress.json").read_text()
+    )
+    records = [
+        json.loads(line)
+        for line in (uninterrupted / "train.jsonl").read_text().splitlines()
+    ]
+    lengths = [
+        min(len(format_model_input(record, use_factors=True, max_fact_chars=4096)), 4096)
+        for record in records
+    ]
+    order = list(TokenBudgetBatchSampler(lengths, max_tokens=4096, max_batch=1, seed=42))
+    full_logs = [
+        json.loads(line)
+        for line in (uninterrupted / "output/train.jsonl").read_text().splitlines()
+        if "learning_rate" in line
+    ]
+    resumed_logs = [
+        json.loads(line)
+        for line in (interrupted / "output/train.jsonl").read_text().splitlines()
+        if "learning_rate" in line
+    ]
+    assert midpoint["steps"] == 2
+    assert midpoint["case_sampler"]["start_batch"] == 4
+    assert order[: midpoint["case_sampler"]["start_batch"]] == order[:4]
+    assert full_progress["case_sampler"] == resumed_progress["case_sampler"]
+    assert full_progress["case_sampler"]["start_batch"] == len(order)
+    assert full_progress["completed_microbatches"] == 8
+    assert resumed_progress["completed_microbatches"] == 8
+    assert [row["step"] for row in full_logs] == [1, 2, 3, 4]
+    assert [row["step"] for row in resumed_logs] == [1, 2, 3, 4]
+    full_rates = [row["learning_rate"] for row in full_logs]
+    assert full_rates == [row["learning_rate"] for row in resumed_logs]
+    assert _adam_update_count(uninterrupted / "output/checkpoint-final") == 4
+    assert _adam_update_count(interrupted / "output/checkpoint-final") == 4
+    assert full["weight"] == pytest.approx(resumed["weight"])
+    assert full["steps"] == resumed["steps"] == 4
+
+
+def _write_tokenizer_model(
+    path: Path, *, token: str = "甲", pad: int = 0, added: list[str] | None = None
+) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "tokenizer.json").write_text(
+        json.dumps({"model": {"vocab": {"[PAD]": 0, token: 1}}}, sort_keys=True),
+        encoding="utf-8",
+    )
+    (path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "bos_token": token,
+                "eos_token": token,
+                "pad_token": "[PAD]",
+                "additional_special_tokens": added or [],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (path / "special_tokens_map.json").write_text(
+        json.dumps({"pad_token": "[PAD]", "unk_token": "[UNK]"}, sort_keys=True),
+        encoding="utf-8",
+    )
+    (path / "added_tokens.json").write_text(
+        json.dumps(
+            [{"content": item, "id": 10 + index} for index, item in enumerate(added or [])],
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "architectures": ["BertModel"],
+                "hidden_size": 4,
+                "vocab_size": 32,
+                "pad_token_id": pad,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_resume_rejects_tokenizer_and_config_content_changes(tmp_path) -> None:
+    """Saved checkpoints bind tokenizer files and config.json, not only the directory path."""
+    original = tmp_path / "model-a"
+    copied = tmp_path / "model-b"
+    _write_tokenizer_model(original, token="甲", added=["<extra>"])
+    _write_accumulation_case(tmp_path, records=4, pairs=0)
+    _run_accumulation_case(
+        tmp_path, experiment="B3", epochs=1, max_steps=1, model_path=str(original)
+    )
+    progress_path = tmp_path / "output/checkpoint-final/training_progress.json"
+    saved = json.loads(progress_path.read_text(encoding="utf-8"))
+    fingerprint = saved["compatibility"]["model"]["tokenizer_identity"]
+    assert fingerprint["status"] == "present"
+    assert "tokenizer.json" in fingerprint["files"]
+    assert "config.json" in fingerprint["files"]
+
+    _write_tokenizer_model(copied, token="甲", added=["<extra>"])
+    continued = _run_accumulation_case(
+        tmp_path,
+        experiment="B3",
+        epochs=1,
+        max_steps=1,
+        resume=tmp_path / "output/checkpoint-final",
+        model_path=str(copied),
+    )
+    assert continued["steps"] == 1
+
+    _write_tokenizer_model(original, token="乙", added=["<extra>"])
+    with pytest.raises(ValueError, match="tokenizer or model config content changed"):
+        _run_accumulation_case(
+            tmp_path,
+            experiment="B3",
+            epochs=1,
+            max_steps=1,
+            resume=tmp_path / "output/checkpoint-final",
+            model_path=str(original),
+        )
+    _write_tokenizer_model(original, token="甲", added=["<extra>"])
+    (original / "added_tokens.json").write_text(
+        json.dumps([{"content": "<other>", "id": 11}]), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="tokenizer or model config content changed"):
+        _run_accumulation_case(
+            tmp_path,
+            experiment="B3",
+            epochs=1,
+            max_steps=1,
+            resume=tmp_path / "output/checkpoint-final",
+            model_path=str(original),
+        )
+    _write_tokenizer_model(original, token="甲", added=["<extra>"])
+    config = json.loads((original / "config.json").read_text(encoding="utf-8"))
+    config["pad_token_id"] = 3
+    (original / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="tokenizer or model config content changed"):
+        _run_accumulation_case(
+            tmp_path,
+            experiment="B3",
+            epochs=1,
+            max_steps=1,
+            resume=tmp_path / "output/checkpoint-final",
+            model_path=str(original),
+        )
+
+    legacy = tmp_path / "legacy-checkpoint"
+    legacy.mkdir()
+    legacy_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    del legacy_progress["compatibility"]["model"]["tokenizer_identity"]
+    (legacy / "training_progress.json").write_text(
+        json.dumps(legacy_progress), encoding="utf-8"
+    )
+    _write_tokenizer_model(original, token="甲", added=["<extra>"])
+    with pytest.raises(ValueError, match="no tokenizer and model-config fingerprint"):
+        _run_accumulation_case(
+            tmp_path,
+            experiment="B3",
+            epochs=1,
+            max_steps=1,
+            resume=legacy,
+            model_path=str(original),
+        )
+
+
+def test_cpu_dropout_resume_matches_uninterrupted_training(tmp_path, monkeypatch) -> None:
+    """Recreating loaders after resume must not consume the dropout generator."""
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    uninterrupted = tmp_path / "full"
+    interrupted = tmp_path / "split"
+    for root in (uninterrupted, interrupted):
+        root.mkdir()
+        _write_accumulation_case(root, records=3, pairs=1)
+    full = _run_accumulation_case(
+        uninterrupted,
+        experiment="M",
+        epochs=2,
+        max_steps=4,
+        backbone_factory=DropoutTinyBackbone,
+    )
+    _run_accumulation_case(
+        interrupted,
+        experiment="M",
+        epochs=2,
+        max_steps=2,
+        backbone_factory=DropoutTinyBackbone,
+    )
+    resumed = _run_accumulation_case(
+        interrupted,
+        experiment="M",
+        epochs=2,
+        max_steps=4,
+        resume=interrupted / "output/checkpoint-final",
+        backbone_factory=DropoutTinyBackbone,
+    )
+    full_progress = json.loads(
+        (uninterrupted / "output/checkpoint-final/training_progress.json").read_text()
+    )
+    resumed_progress = json.loads(
+        (interrupted / "output/checkpoint-final/training_progress.json").read_text()
+    )
+    assert full["steps"] == resumed["steps"] == 4
+    assert full_progress["completed_microbatches"] == resumed_progress["completed_microbatches"]
+    assert full_progress["case_sampler"] == resumed_progress["case_sampler"]
+    assert full_progress["pair_sampler"] == resumed_progress["pair_sampler"]
+    assert _adam_update_count(uninterrupted / "output/checkpoint-final") == 4
+    assert _adam_update_count(interrupted / "output/checkpoint-final") == 4
+    assert full["flat_weight"] == resumed["flat_weight"]
 
 
 def test_resume_continues_main_accumulation_window(tmp_path):

@@ -750,14 +750,31 @@ def training_progress_runtime(monkeypatch, tmp_path):
     heldout_pairs_path = tmp_path / "heldout_pairs.jsonl"
 
     def pair_row(parent_id, pair_type="invariant", valid=True):
+        from tests.support import cache_identity
+
+        if pair_type == "charge_flip":
+            text, changed, target = (
+                "某甲谎称借用财物。",
+                ["conduct"],
+                {"conduct": "虚构事实使被害人自愿交付"},
+            )
+            target_charge, rank = "盗窃", None
+        elif pair_type == "sentence_rank":
+            text, changed, target = "某甲已退赃。", ["restitution"], {"restitution": True}
+            target_charge, rank = None, 1
+        else:
+            text, changed, target = "某甲涉案101元。", ["amount"], {"amount": 101.0}
+            target_charge, rank = None, None
         return {
             "parent_case_id": parent_id,
             "intervention_type": pair_type,
-            "target_charge": "盗窃" if pair_type == "charge_flip" else None,
-            "rank_direction": 1 if pair_type == "sentence_rank" else None,
-            "target_factors": {},
-            "validation": {"valid": valid, "errors": []},
-            "counterfactual_strict": "改写事实",
+            "target_charge": target_charge,
+            "rank_direction": rank,
+            "changed_fields": changed,
+            "target_factors": target,
+            "validation": {"valid": valid, "errors": [] if valid else ["excessive_rewrite"]},
+            "counterfactual_strict": text,
+            **cache_identity("案件事实"),
         }
 
     heldout_pairs_path.write_text(
@@ -826,6 +843,13 @@ def training_progress_runtime(monkeypatch, tmp_path):
         def backward(tensors, grad_tensors):
             events.append(("parent_backward", tuple(grad_tensors)))
 
+    class Generator:
+        def __init__(self, device="cpu"):
+            self.device = device
+
+        def manual_seed(self, seed):
+            return self
+
     modules = {
         "torch": SimpleNamespace(
             nn=SimpleNamespace(Module=object),
@@ -839,6 +863,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
             autograd=Autograd(),
             tensor=lambda value, **kwargs: Tensor(list(value)),
             int64=object(),
+            Generator=Generator,
         ),
         "torch.utils.data": SimpleNamespace(DataLoader=Loader),
         "torch.utils.tensorboard": SimpleNamespace(SummaryWriter=Writer),
@@ -963,6 +988,16 @@ def training_progress_runtime(monkeypatch, tmp_path):
             )
         )
         resume = None
+        training_config = {
+            "model": {"path": "fake"},
+            "training": {
+                "max_steps": max_steps,
+                "epochs": 1,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "checkpoint_every": 1,
+                **(training_overrides or {}),
+            },
+        }
         if restored_step:
             resume = tmp_path / "resume"
             resume.mkdir(exist_ok=True)
@@ -979,13 +1014,10 @@ def training_progress_runtime(monkeypatch, tmp_path):
                         "case_sampler": {"epoch": 0, "start_batch": 0, "seed": 42},
                         "pair_sampler": None,
                         "compatibility": train.resume_compatibility(
-                            training={
-                                "max_steps": max_steps,
-                                "epochs": 1,
-                                "gradient_accumulation_steps": gradient_accumulation_steps,
-                                "checkpoint_every": 1,
-                                **(training_overrides or {}),
-                            },
+                            config=training_config,
+                            experiment_name=experiment_name,
+                            limit=None,
+                            num_processes=train.resume_world_size(),
                             charge_vocabulary=["盗窃"],
                             article_vocabulary=["criminal_law:264"],
                             penalty_vocabulary=["fixed_term"],
@@ -997,16 +1029,7 @@ def training_progress_runtime(monkeypatch, tmp_path):
                 )
             )
         result = train.run_real_training(
-            {
-                "model": {"path": "fake"},
-                "training": {
-                    "max_steps": max_steps,
-                    "epochs": 1,
-                    "gradient_accumulation_steps": gradient_accumulation_steps,
-                    "checkpoint_every": 1,
-                    **(training_overrides or {}),
-                },
-            },
+            training_config,
             train_data=train_path,
             output_dir=tmp_path / "output",
             experiment_name=experiment_name,
@@ -1433,21 +1456,30 @@ def test_qlora_preparation_receives_quantized_text_model(
 def test_resume_rejects_vocabulary_order_and_locked_training_but_not_log_keys():
     from legal_landscape.training.train import resume_compatibility
 
+    def identity(training):
+        return resume_compatibility(
+            config={"model": {"max_length": 32}, "training": training},
+            experiment_name="B3",
+            limit=8,
+            num_processes=1,
+            charge_vocabulary=["盗窃", "诈骗"],
+            article_vocabulary=["criminal_law:264"],
+            penalty_vocabulary=["fixed_term"],
+            validation_identity=None,
+        )
+
     training = {"learning_rate": 2e-4, "epochs": 1, "checkpoint_every": 10, "max_steps": 4}
-    current = resume_compatibility(
-        training=training,
-        charge_vocabulary=["盗窃", "诈骗"],
-        article_vocabulary=["criminal_law:264"],
-        penalty_vocabulary=["fixed_term"],
-        validation_identity=None,
-    )
+    current = identity(training)
     progress = {"seed": 7, "input_identity": {"train": {"sha256": "a"}}, "compatibility": current}
     validate_resume_metadata(
         progress, expected_seed=7, expected_input_identity=progress["input_identity"],
         expected_compatibility=current,
     )
     reordered = resume_compatibility(
-        training=training,
+        config={"model": {"max_length": 32}, "training": training},
+        experiment_name="B3",
+        limit=8,
+        num_processes=1,
         charge_vocabulary=["诈骗", "盗窃"],
         article_vocabulary=["criminal_law:264"],
         penalty_vocabulary=["fixed_term"],
@@ -1458,12 +1490,8 @@ def test_resume_rejects_vocabulary_order_and_locked_training_but_not_log_keys():
             progress, expected_seed=7, expected_input_identity=progress["input_identity"],
             expected_compatibility=reordered,
         )
-    changed_rate = resume_compatibility(
-        training={**training, "learning_rate": 1e-4, "checkpoint_every": 99, "max_steps": 8},
-        charge_vocabulary=["盗窃", "诈骗"],
-        article_vocabulary=["criminal_law:264"],
-        penalty_vocabulary=["fixed_term"],
-        validation_identity=None,
+    changed_rate = identity(
+        {**training, "learning_rate": 1e-4, "checkpoint_every": 99, "max_steps": 8}
     )
     with pytest.raises(ValueError, match="incompatible"):
         validate_resume_metadata(
@@ -1472,7 +1500,16 @@ def test_resume_rejects_vocabulary_order_and_locked_training_but_not_log_keys():
         )
     assert changed_rate["training_config"]["learning_rate"] == 1e-4
     assert "checkpoint_every" not in changed_rate["training_config"]
-    assert changed_rate["log_only_keys"] == ["checkpoint_every", "max_steps", "validation_limit"]
+    assert "max_steps" not in changed_rate["log_only_keys"]
+    assert changed_rate["schedule"]["max_steps"] == 8
+    assert changed_rate["log_only_keys"] == [
+        "checkpoint_every",
+        "validation_limit",
+        "inference_batch_size",
+        "inference_max_tokens_per_batch",
+        "select_best_checkpoint",
+        "keep_best_and_latest_checkpoints",
+    ]
 
 
 def test_resume_mismatch_reports_changed_input_and_recovery():
@@ -1673,6 +1710,8 @@ class TrainingPlanTests(unittest.TestCase):
             "factors": {},
             "charges": ["盗窃"],
         }
+        from tests.support import cache_identity
+
         valid = {
             "parent_case_id": "c1",
             "intervention_type": "invariant",
@@ -1685,6 +1724,7 @@ class TrainingPlanTests(unittest.TestCase):
             "target_defendant": "某甲",
             "target_charge": None,
             "rank_direction": None,
+            **cache_identity("父事实"),
         }
         invalid = {
             **valid,
@@ -1729,6 +1769,8 @@ class TrainingPlanTests(unittest.TestCase):
             "charges": ["盗窃"],
             "co_defendants": [],
         }
+        from tests.support import cache_identity
+
         def row(amount, text):
             return {
                 "parent_case_id": "c1",
@@ -1740,6 +1782,7 @@ class TrainingPlanTests(unittest.TestCase):
                 "validation": {"valid": True, "errors": []},
                 "counterfactual_strict": text,
                 "co_defendants": [],
+                **cache_identity("某甲涉案1000元。"),
             }
         with TemporaryDirectory() as directory:
             path = Path(directory) / "cf.jsonl"

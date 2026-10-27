@@ -159,16 +159,30 @@ def bootstrap_names(kind: str) -> tuple[str, ...]:
     return DEFAULT_PRIMARY_ENDPOINTS[kind]
 
 
-def _load(path: Path, args: argparse.Namespace) -> Any:
-    rows = read_rows(path, args.limit, complete_groups=args.kind == "cmdl")
-    missing_articles = [
-        row for row in rows if row.get("articles_available") is False
-    ]
+def _require_article_labels(rows: list[dict[str, Any]]) -> None:
+    """Stop scoring when article truth is absent or was never marked as available.
+
+    A missing marker on a historical prediction file is not evidence that every article
+    is negative. Unseen article labels are a different case and stay in the metric.
+    """
+    if any("articles_available" not in row for row in rows):
+        raise SystemExit(
+            "prediction rows lack articles_available; historical files are not assumed to be "
+            "labeled, and missing article annotations are not all-negative truth. "
+            "Rebuild predictions from processed records."
+        )
+    missing_articles = [row for row in rows if row.get("articles_available") is not True]
     if missing_articles:
         raise SystemExit(
             f"refusing to score {len(missing_articles)} records with missing article labels; "
             "they are not all-negative article truth"
         )
+
+
+def _load(path: Path, args: argparse.Namespace) -> Any:
+    rows = read_rows(path, args.limit, complete_groups=args.kind == "cmdl")
+    if args.kind in {"static", "cmdl"}:
+        _require_article_labels(rows)
     if args.kind == "counterfactual" and args.parent_records is not None:
         if args.metadata is None:
             raise SystemExit("--parent-records requires --metadata")

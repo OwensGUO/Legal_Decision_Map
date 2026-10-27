@@ -133,9 +133,12 @@ def test_evaluation_entrypoint_saves_json_when_progress_stream_is_broken(
 
     source = tmp_path / "predictions.jsonl"
     source.write_text(json.dumps({
-        "group_id": "g1", "true_charges": [1, 0], "predicted_charges": [1, 0],
+        "group_id": "g1", "case_id": "c1", "articles_available": True,
+        "charge_vocabulary": ["盗窃", "诈骗"],
+        "true_charges": [1, 0], "predicted_charges": [1, 0],
         "true_articles": [1, 0], "predicted_articles": [1, 0],
         "predicted_months": 12.0, "true_months": 12.0, "penalty_type": "fixed_term",
+        "predicted_penalty_type": "fixed_term",
     }) + "\n")
     destination = tmp_path / "metrics.json"
     main = runpy.run_path(str(ROOT / "scripts/evaluate_model.py"))["main"]

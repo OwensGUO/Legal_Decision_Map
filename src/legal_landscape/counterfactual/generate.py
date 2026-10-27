@@ -17,6 +17,7 @@ from typing import Any, Protocol
 from legal_landscape.counterfactual.prompts import PROMPT_VERSION, build_messages
 from legal_landscape.counterfactual.provenance import MANIFEST_NAME, ensure_manifest
 from legal_landscape.counterfactual.validators import (
+    VALIDATOR_VERSION,
     ValidationResult,
     has_leakage,
     validate_generation,
@@ -52,7 +53,12 @@ class GenerationRequest:
 
     @property
     def generation_id(self) -> str:
-        # A changed parent text, prompt, or sanitizer must never reuse a cached generation.
+        """Identity of one current request.
+
+        Prompt, sanitizer, and validator versions are all part of the key. A row written
+        by an older validator keeps its historical id. Resume appends the current id
+        instead of treating that historical row as the completed request.
+        """
         material = "\0".join(
             (
                 self.spec.parent_case_id,
@@ -62,6 +68,7 @@ class GenerationRequest:
                 text_sha256(self.parent_text),
                 PROMPT_VERSION,
                 SANITIZER_VERSION,
+                VALIDATOR_VERSION,
             )
         )
         return hashlib.sha256(material.encode()).hexdigest()[:24]
@@ -256,6 +263,7 @@ def _realize(
         "generator_identity": dict(generator_identity),
         "prompt_version": prompt_version,
         "sanitizer_version": SANITIZER_VERSION,
+        "validator_version": VALIDATOR_VERSION,
         "parent_text_sha256": text_sha256(request.parent_text),
         "sampling": sampling,
         "seed": seed,

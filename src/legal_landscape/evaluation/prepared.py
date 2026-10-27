@@ -42,6 +42,7 @@ class _Grouped:
             [positions.setdefault(str(row[group_key]), len(positions)) for row in rows]
         )
         self.group_keys = tuple(positions)
+        self.source_rows = rows
 
     def row_weights(self, group_counts: np.ndarray | None) -> np.ndarray:
         if group_counts is None:

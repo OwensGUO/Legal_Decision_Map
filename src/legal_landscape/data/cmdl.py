@@ -16,40 +16,96 @@ _PENALTY_FIELDS = frozenset(
 )
 
 
+def _flag(penalty: dict[str, Any], name: str) -> bool | None:
+    if name not in penalty:
+        return False
+    value = penalty[name]
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+class _UnusablePenalty(ValueError):
+    """A placeholder or mistyped penalty field, not a negative month count."""
+
+
+def _months(penalty: dict[str, Any], name: str) -> int | None:
+    """Integer months, or ``None`` when the field is absent or a null placeholder.
+
+    A non-integer value such as a blank string makes the whole object unusable.
+    ``False`` is not a month count. Negative counts still raise.
+    """
+    if name not in penalty or penalty[name] is None or penalty[name] == "":
+        return None
+    value = penalty[name]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _UnusablePenalty(f"{name} must be an integer month count")
+    if value < 0:
+        raise ValueError(f"{name} months must be non-negative")
+    return value
+
+
 def _read_penalty(penalty: Any) -> tuple[str, int | None] | None:
-    """Parse one penalty object. ``None`` means the object is missing or not usable."""
+    """Parse one penalty object. ``None`` means the object is missing or not usable.
+
+    Exemption requires imprisonment, detention, and surveillance to all be the integer
+    zero. ``{"imprisonment": None}``, ``{"imprisonment": ""}``, and
+    ``{"death_penalty": False}`` are placeholders, not a real exemption.
+    """
     if not isinstance(penalty, dict) or not (_PENALTY_FIELDS & set(penalty)):
         return None
-    if bool(penalty.get("death_penalty")):
+    death = _flag(penalty, "death_penalty")
+    life = _flag(penalty, "life_imprisonment")
+    if death is None or life is None:
+        return None
+    try:
+        imprisonment = _months(penalty, "imprisonment")
+        detention = _months(penalty, "detention")
+        surveillance = _months(penalty, "surveillance")
+    except _UnusablePenalty:
+        return None
+    if death:
         return PenaltyType.DEATH.value, None
-    if bool(penalty.get("life_imprisonment")):
+    if life:
         return PenaltyType.LIFE.value, None
-    months = int(penalty.get("imprisonment") or 0)
-    if months < 0:
-        raise ValueError("imprisonment months must be non-negative")
-    if months > 0:
-        return PenaltyType.FIXED_TERM.value, months
-    detention = int(penalty.get("detention") or 0)
-    if detention < 0:
-        raise ValueError("detention months must be non-negative")
-    if detention > 0:
+    if imprisonment is not None and imprisonment > 0:
+        return PenaltyType.FIXED_TERM.value, imprisonment
+    if detention is not None and detention > 0:
         return PenaltyType.DETENTION.value, None
-    surveillance = int(penalty.get("surveillance") or 0)
-    if surveillance < 0:
-        raise ValueError("surveillance months must be non-negative")
-    if surveillance > 0:
+    if surveillance is not None and surveillance > 0:
         return PenaltyType.CONTROL.value, None
-    return PenaltyType.EXEMPT.value, None
+    if imprisonment == 0 and detention == 0 and surveillance == 0:
+        return PenaltyType.EXEMPT.value, None
+    return None
+
+
+def _read_articles(judgments: Any) -> tuple[tuple[str, ...], bool]:
+    """Article labels and whether every judgment actually supplied them.
+
+    An empty list is a real annotation. A missing or null field is not.
+    """
+    if not isinstance(judgments, list) or not judgments:
+        return (), False
+    labels: list[Any] = []
+    for judgment in judgments:
+        if not isinstance(judgment, dict) or "article" not in judgment:
+            return (), False
+        if judgment.get("article") is None:
+            return (), False
+        labels.extend(judgment.get("article") or ())
+    return normalize_criminal_articles(labels), True
 
 
 def _normalize_outcome(
     outcome: dict[str, Any],
-) -> tuple[tuple[str, ...], tuple[str, ...], str, int | None, bool, str | None]:
+) -> tuple[tuple[str, ...], tuple[str, ...], str, int | None, bool, str | None, str | None, bool]:
     """Charges and articles come from every judgment. The executed penalty does not.
 
     A usable ``final_penalty`` is the executed sentence. One judgment without that
     field can supply its own penalty. Several judgments without it are not summed:
-    the penalty label is unknown and must not be supervised.
+    the penalty label is unknown and must not be supervised. An unusable final
+    penalty is not an exemption: a single judgment falls back, and several judgments
+    stay unknown.
     """
     judgments = outcome.get("judgment") or []
     charges = tuple(
@@ -58,24 +114,30 @@ def _normalize_outcome(
         if isinstance(item, dict)
     )
     charges = tuple(item for item in charges if item)
-    articles = normalize_criminal_articles(
-        article
-        for judgment in judgments
-        if isinstance(judgment, dict)
-        for article in (judgment.get("article") or ())
-    )
-    final = _read_penalty(outcome.get("final_penalty"))
+    articles, articles_available = _read_articles(judgments)
+    final_raw = outcome.get("final_penalty")
+    final = _read_penalty(final_raw)
+    unusable_final = final_raw is not None and final is None
     if final is not None:
         penalty_type, months = final
-        return charges, articles, penalty_type, months, False, None
+        return charges, articles, penalty_type, months, False, None, None, articles_available
     if len(judgments) == 1 and isinstance(judgments[0], dict):
         single = _read_penalty(judgments[0].get("penalty"))
         if single is not None:
             penalty_type, months = single
-            return charges, articles, penalty_type, months, False, None
-        return charges, articles, PenaltyType.UNKNOWN.value, None, True, "missing_penalty_fields"
+            fallback = "unusable_final_penalty_fallback" if unusable_final else None
+            return (
+                charges, articles, penalty_type, months, False, None, fallback, articles_available
+            )
+        return (
+            charges, articles, PenaltyType.UNKNOWN.value, None, True,
+            "missing_penalty_fields", None, articles_available,
+        )
     exclusion = "missing_final_penalty" if len(judgments) > 1 else "missing_penalty_fields"
-    return charges, articles, PenaltyType.UNKNOWN.value, None, True, exclusion
+    return (
+        charges, articles, PenaltyType.UNKNOWN.value, None, True, exclusion, None,
+        articles_available,
+    )
 
 
 def iter_cmdl(path: str | Path, *, split: str, limit: int | None = None) -> Iterator[CaseUnit]:
@@ -106,9 +168,16 @@ def iter_cmdl(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                     str(outcome["name"]) for outcome in outcomes
                 ]
                 for defendant_index, outcome in enumerate(outcomes):
-                    charges, articles, penalty_type, months, mask_penalty, exclusion = (
-                        _normalize_outcome(outcome)
-                    )
+                    (
+                        charges,
+                        articles,
+                        penalty_type,
+                        months,
+                        mask_penalty,
+                        exclusion,
+                        fallback,
+                        articles_available,
+                    ) = _normalize_outcome(outcome)
                     name = str(outcome["name"])
                     yield CaseUnit(
                         dataset="cmdl",
@@ -125,6 +194,8 @@ def iter_cmdl(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                         co_defendants=tuple(dict.fromkeys(item for item in names if item != name)),
                         mask_penalty=mask_penalty,
                         penalty_exclusion=exclusion,
+                        articles_available=articles_available,
+                        penalty_fallback=fallback,
                     )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid CMDL record at {source}:{line_number}: {exc}") from exc

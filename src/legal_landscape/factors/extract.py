@@ -8,11 +8,46 @@ from collections.abc import Iterable
 from legal_landscape.factors.schema import LegalFactors
 
 _AMOUNT = re.compile(
-    r"(?:涉案(?:金额)?|价值|获利|金额)[^，。；]{0,12}?([0-9]+(?:\.[0-9]+)?)\s*(万)?元"
+    r"(?:涉案(?:金额)?|价值|获利|金额)[^0-9，。；]{0,12}?"
+    r"([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万)?元"
 )
 _SENTENCE = re.compile(r"[^。；！？\n]*[。；！？\n]?")
 _CLAUSE = re.compile(r"[^，。；！？\n]+")
 _NEGATIONS = ("尚未", "未能", "拒不", "没有", "并未", "未", "不", "无")
+# Words that may sit between a real negation and the behaviour it negates.
+_NEGATION_GAPS = (
+    "",
+    "主动",
+    "如实",
+    "全部",
+    "完全",
+    "及时",
+    "积极",
+    "当庭",
+    "彻底",
+    "足额",
+    "全额",
+    "予以",
+    "进行",
+    "马上",
+    "立即",
+)
+# Negation characters inside these words do not negate a later behaviour cue.
+_ABSORBED_NEGATION = (
+    "不但",
+    "不仅",
+    "不只",
+    "不光",
+    "不单",
+    "不过",
+    "不论",
+    "不管",
+    "未成年",
+    "未满",
+    "未婚",
+    "无前科",
+    "无犯罪前科",
+)
 SURRENDER_CUES = ("投案自首", "主动投案", "构成自首", "自首")
 RESTITUTION_CUES = ("返还赃款", "退赃", "退赔")
 CONFESSION_CUES = ("如实供述", "坦白", "认罪")
@@ -35,19 +70,45 @@ CONDUCT_CUES = (
 )
 
 
-def _cue_negated(clause: str, index: int) -> bool:
-    """A negation applies to a cue later in the same clause, across a short modifier gap."""
-    window = clause[max(0, index - 8) : index]
+def _marker_absorbed(prefix: str, marker_index: int) -> bool:
+    """True when the negation character belongs to a different word, such as 不但 or 无前科."""
+    for phrase in _ABSORBED_NEGATION:
+        for offset in range(len(phrase)):
+            start = marker_index - offset
+            if start < 0:
+                continue
+            if prefix.startswith(phrase, start) and start + len(phrase) > marker_index:
+                return True
+    return False
+
+
+def _cue_negated(clause: str, index: int) -> bool | None:
+    """Whether the cue at ``index`` is negated.
+
+    ``True`` means a negation attaches directly to this cue. ``False`` means the cue is
+    affirmative. ``None`` means a nearby negation does not reliably govern the cue, so the
+    caller must leave the factor unknown instead of emitting a definite label.
+    """
+    prefix = clause[max(0, index - 16) : index]
+    for marker in sorted(_NEGATIONS, key=len, reverse=True):
+        for gap in sorted(_NEGATION_GAPS, key=len, reverse=True):
+            tail = marker + gap
+            if not prefix.endswith(tail):
+                continue
+            if _marker_absorbed(prefix, len(prefix) - len(tail)):
+                continue
+            return True
+    window_start = max(0, len(prefix) - 12)
+    window = prefix[window_start:]
     for marker in _NEGATIONS:
-        position = window.rfind(marker)
-        if position < 0:
-            continue
-        gap = window[position + len(marker) :]
-        if "已" in gap:
-            continue
-        if re.fullmatch(r"[\u4e00-\u9fa5]{0,6}", gap) is None:
-            continue
-        return True
+        start = 0
+        while True:
+            found = window.find(marker, start)
+            if found < 0:
+                break
+            if not _marker_absorbed(prefix, window_start + found):
+                return None
+            start = found + len(marker)
     return False
 
 
@@ -59,7 +120,7 @@ def cue_polarity(text: str, cues: tuple[str, ...]) -> bool | None:
     and denies the same factor stays unknown.
     """
     ordered = tuple(sorted(set(cues), key=len, reverse=True))
-    states: set[bool] = set()
+    states: set[bool | None] = set()
     for clause in _CLAUSE.findall(text) or (text,):
         index = 0
         while index < len(clause):
@@ -67,7 +128,8 @@ def cue_polarity(text: str, cues: tuple[str, ...]) -> bool | None:
             if matched is None:
                 index += 1
                 continue
-            states.add(not _cue_negated(clause, index))
+            negated = _cue_negated(clause, index)
+            states.add(None if negated is None else not negated)
             index += len(matched)
     if states == {True}:
         return True
@@ -112,7 +174,9 @@ def extract_factors(
     amount_match = _AMOUNT.search(local)
     amount = None
     if amount_match:
-        amount = float(amount_match.group(1)) * (10000.0 if amount_match.group(2) else 1.0)
+        amount = float(re.sub("[,，]", "", amount_match.group(1))) * (
+            10000.0 if amount_match.group(2) else 1.0
+        )
     role = "unknown"
     if "从犯" in local:
         role = "accessory"

@@ -60,7 +60,22 @@ def test_fast_bootstrap_reproduces_row_resampling_for_label_set_free_metrics() -
 
 
 def test_fast_paired_test_reproduces_row_resampling() -> None:
-    candidate, reference = _static_rows(2), _static_rows(3)
+    reference = _static_rows(2)
+    rng = np.random.default_rng(3)
+    candidate = []
+    for index, row in enumerate(reference):
+        row["case_id"] = f"c{index}"
+        row["charge_vocabulary"] = ["a", "b", "c"]
+        row["article_vocabulary"] = ["a", "b", "c"]
+        row["unseen_true_charge_labels"] = []
+        row["unseen_true_article_labels"] = []
+        row["articles_available"] = True
+        predicted = [int(value) for value in rng.random(3) < 0.4]
+        candidate.append({
+            **row,
+            "predicted_charges": predicted,
+            "predicted_months": float(rng.integers(1, 40)),
+        })
     fast = fast_paired_test(
         prepare_static(candidate), prepare_static(reference), ("charge_accuracy", "sentence_mae"),
         iterations=60, seed=11,
@@ -89,9 +104,24 @@ def test_complete_cmdl_limit_and_paired_identity(tmp_path) -> None:
 
     module = runpy.run_path(str(ROOT / "scripts" / "evaluate_model.py"))
     rows = [
-        {"group_id": "case-a", "case_id": "a-1", "true_charges": [1]},
-        {"group_id": "case-a", "case_id": "a-2", "true_charges": [0]},
-        {"group_id": "case-b", "case_id": "b-1", "true_charges": [1]},
+        {
+            "group_id": "case-a",
+            "case_id": "a-1",
+            "true_charges": [1],
+            "charge_vocabulary": ["盗窃"],
+        },
+        {
+            "group_id": "case-a",
+            "case_id": "a-2",
+            "true_charges": [0],
+            "charge_vocabulary": ["盗窃"],
+        },
+        {
+            "group_id": "case-b",
+            "case_id": "b-1",
+            "true_charges": [1],
+            "charge_vocabulary": ["盗窃"],
+        },
     ]
     destination = tmp_path / "cmdl.jsonl"
     destination.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")

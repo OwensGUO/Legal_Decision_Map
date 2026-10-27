@@ -791,6 +791,10 @@ run_training() {
     --set "training.max_steps=$MAX_STEPS"
     --set "training.checkpoint_every=${CHECKPOINT_EVERY:-200}"
   )
+  # Lawformer has no SDPA kernel on the current stack. Other experiments keep SDPA.
+  if [[ "$experiment" == "B2" ]]; then
+    command+=(--set "model.attn_implementation=eager")
+  fi
   local resume_checkpoint=""
   local checkpoint_candidates=(
     "$training_root/checkpoint-final" "$training_root"/checkpoint-step-*

@@ -34,6 +34,8 @@ class CaseUnit:
     co_defendants: tuple[str, ...] = ()
     mask_penalty: bool = False
     penalty_exclusion: str | None = None
+    articles_available: bool | None = None
+    penalty_fallback: str | None = None
 
     def __post_init__(self) -> None:
         if not all((self.dataset, self.split, self.case_id, self.group_id, self.source_path)):

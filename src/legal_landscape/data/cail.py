@@ -37,6 +37,12 @@ def iter_cail(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                 if len(defendants) != 1:
                     raise ValueError("CAIL-small requires exactly one defendant")
                 penalty_type, months = _penalty(meta.get("term_of_imprisonment") or {})
+                if "relevant_articles" not in meta or meta.get("relevant_articles") is None:
+                    articles: tuple[str, ...] = ()
+                    articles_available = False
+                else:
+                    articles = normalize_criminal_articles(meta.get("relevant_articles") or ())
+                    articles_available = True
                 canonical = json.dumps(
                     {"fact": row["fact"], "criminals": defendants},
                     ensure_ascii=False,
@@ -56,9 +62,8 @@ def iter_cail(path: str | Path, *, split: str, limit: int | None = None) -> Iter
                     penalty_type=penalty_type,
                     imprisonment_months=months,
                     source_path=f"{source}:{line_number}",
-                    conviction_articles=normalize_criminal_articles(
-                        meta.get("relevant_articles") or ()
-                    ),
+                    conviction_articles=articles,
+                    articles_available=articles_available,
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid CAIL record at {source}:{line_number}: {exc}") from exc

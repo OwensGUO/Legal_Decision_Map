@@ -9,7 +9,7 @@ protocol:
   required_coverage_counts: [length, charges, defendants, generated, passed, excluded]
   sentence_rank: conditional weak ordering constraint, not a human-labelled counterfactual sentence
   server_acceptance: required on the server dependency set; local tests do not replace it
-  b2_attention: defer until a B2/Lawformer run; Longformer uses eager on the current local stack, other models keep their own implementation
+  b2_attention: Longformer checkpoints use eager attention; other architectures keep their configured implementation
 experiments:
   B0: {backbone: majority_mean}
   B1: {backbone: hfl/chinese-roberta-wwm-ext}

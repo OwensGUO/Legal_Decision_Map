@@ -178,7 +178,11 @@ def build_dataset(
         split: {"units_with_unseen_charge": 0, "units_with_unseen_article": 0} for split in paths
     }
     dropped_units = dict.fromkeys(paths, 0)
-    penalty_exclusions = {"missing_final_penalty": 0, "missing_penalty_fields": 0}
+    penalty_exclusions = {
+        "missing_final_penalty": 0,
+        "missing_penalty_fields": 0,
+        "unusable_final_penalty_fallback": 0,
+    }
     for split, source in paths.items():
         iterator = _iter_cases(data, source, split=split, limit=limit)
         count = 0
@@ -222,6 +226,10 @@ def build_dataset(
                         if case.penalty_exclusion:
                             penalty_exclusions[case.penalty_exclusion] = (
                                 penalty_exclusions.get(case.penalty_exclusion, 0) + 1
+                            )
+                        if case.penalty_fallback:
+                            penalty_exclusions[case.penalty_fallback] = (
+                                penalty_exclusions.get(case.penalty_fallback, 0) + 1
                             )
                         count += 1
                     task.advance(accepted=count, dropped=dropped_units[split])

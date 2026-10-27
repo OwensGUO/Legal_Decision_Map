@@ -167,14 +167,23 @@ def test_bootstrap_metric_set_emits_intervals_for_named_metrics() -> None:
     assert result["positive_rate"]["groups"] == 2
 
 
+def _paired_identity(case_id: str, group_id: str, value: float) -> dict:
+    return {
+        "case_id": case_id,
+        "group_id": group_id,
+        "charge_vocabulary": ["盗窃"],
+        "value": value,
+    }
+
+
 def test_paired_cluster_test_requires_matching_groups_and_reports_difference() -> None:
     candidate = [
-        {"group_id": "g1", "value": 2.0},
-        {"group_id": "g2", "value": 4.0},
+        _paired_identity("c1", "g1", 2.0),
+        _paired_identity("c2", "g2", 4.0),
     ]
     reference = [
-        {"group_id": "g1", "value": 1.0},
-        {"group_id": "g2", "value": 3.0},
+        _paired_identity("c1", "g1", 1.0),
+        _paired_identity("c2", "g2", 3.0),
     ]
     def metric(sample):
         return float(np.mean([row["value"] for row in sample]))
@@ -184,13 +193,13 @@ def test_paired_cluster_test_requires_matching_groups_and_reports_difference() -
     assert result["groups"] == 2
     assert 0.0 < result["p_value"] <= 1.0
 
-    with pytest.raises(ValueError, match="identical group IDs"):
+    with pytest.raises(ValueError, match="sample sets differ"):
         paired_cluster_test(candidate, reference[:1], metric, iterations=10)
 
 
 @pytest.mark.parametrize("operation", ("cluster", "metric_set", "paired"))
 def test_bootstrap_progress_advances_once_per_resample(operation: str) -> None:
-    rows = [{"group_id": "g1", "value": 1.0}]
+    rows = [_paired_identity("c1", "g1", 1.0)]
     stream = StringIO()
     reporter = PlainProgressReporter(stream, clock=lambda: 0.0, interval=0.0)
     calls = 0
@@ -224,7 +233,7 @@ def test_bootstrap_progress_advances_once_per_resample(operation: str) -> None:
 
 @pytest.mark.parametrize("operation", ("cluster", "metric_set", "paired"))
 def test_bootstrap_progress_fails_and_preserves_metric_error(operation: str) -> None:
-    rows = [{"group_id": "g1", "value": 1.0}]
+    rows = [_paired_identity("c1", "g1", 1.0)]
     stream = StringIO()
     reporter = PlainProgressReporter(stream, clock=lambda: 0.0, interval=0.0)
     error = RuntimeError("metric failed")

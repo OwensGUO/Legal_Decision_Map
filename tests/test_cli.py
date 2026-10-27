@@ -118,7 +118,7 @@ def test_generation_parent_limit_counts_processed_rows_before_long_case_skips(tm
         "factors": LegalFactors(restitution=False).to_dict(),
         "penalty_type": "fixed_term", "imprisonment_months": 12,
     }, ensure_ascii=False) + "\n" for i in range(3)))
-    requests, skipped, _exclusions = module["_requests"](
+    requests, skipped, _exclusions, _plan = module["_requests"](
         source, 12, (), max_source_chars=100, parent_limit=2,
     )
     assert skipped == 1
@@ -134,7 +134,7 @@ def test_generation_uses_strict_parent_text_and_all_parent_charges(tmp_path):
         "fact_conservative": "某甲犯盗窃罪。", "fact_strict": "某甲犯[已屏蔽]，盗走手机。",
         "factors": LegalFactors(amount=10000, restitution=False, conduct="秘密窃取").to_dict(),
     }, ensure_ascii=False) + "\n")
-    requests, _, exclusions = module["_requests"](source, 12, (("盗窃", "诈骗"),))
+    requests, _, exclusions, _plan = module["_requests"](source, 12, (("盗窃", "诈骗"),))
     assert exclusions["not_single_charge"] == 1
     assert {r.parent_text for r in requests} == {"某甲犯[已屏蔽]，盗走手机。"}
     assert "charge_flip" not in {r.spec.intervention_type for r in requests}
@@ -620,7 +620,11 @@ def test_environment_audit_reports_physical_cuda_visibility(monkeypatch) -> None
 def test_evaluation_cli_bootstrap_progress_and_five_holm_results(tmp_path) -> None:
     candidate = [
         {
+            "case_id": "c1",
             "group_id": "g1",
+            "charge_vocabulary": ["盗窃", "诈骗"],
+            "article_vocabulary": ["criminal_law:264", "criminal_law:266"],
+            "articles_available": True,
             "true_charges": [1, 0],
             "predicted_charges": [1, 0],
             "true_articles": [1, 0],
@@ -631,7 +635,11 @@ def test_evaluation_cli_bootstrap_progress_and_five_holm_results(tmp_path) -> No
             "predicted_penalty_type": "fixed_term",
         },
         {
+            "case_id": "c2",
             "group_id": "g2",
+            "charge_vocabulary": ["盗窃", "诈骗"],
+            "article_vocabulary": ["criminal_law:264", "criminal_law:266"],
+            "articles_available": True,
             "true_charges": [0, 1],
             "predicted_charges": [0, 1],
             "true_articles": [0, 1],

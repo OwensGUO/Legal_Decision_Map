@@ -113,32 +113,54 @@ def bootstrap_metric_set(
 
 
 def _sample_key(row: dict[str, Any]) -> tuple[Any, ...]:
-    if row.get("generation_id"):
-        return ("generation", str(row["generation_id"]))
-    if row.get("case_id"):
-        return ("case", str(row["case_id"]), row.get("intervention_type"))
-    raise ValueError("prediction row has no stable case_id or generation_id")
+    if row.get("intervention_type"):
+        generation_id = row.get("generation_id")
+        if not isinstance(generation_id, str) or not generation_id:
+            raise ValueError(
+                "counterfactual paired row lacks generation_id; "
+                "the parent case_id is not a stable pair key"
+            )
+        return ("generation", generation_id)
+    case_id = row.get("case_id")
+    if not isinstance(case_id, str) or not case_id:
+        raise ValueError("paired comparison row lacks case_id or generation_id")
+    return ("case", case_id)
+
+
+def _label_tuple(value: Any) -> tuple[Any, ...]:
+    if value is None:
+        return ()
+    return tuple(value)
 
 
 def _truth_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    if "charge_vocabulary" not in row:
+        raise ValueError("paired comparison row lacks charge_vocabulary")
+    article_vocabulary = row.get("article_vocabulary")
     return (
-        str(row.get("group_id")),
-        tuple(row.get("true_charges") or ()),
-        tuple(row.get("true_articles") or ()),
+        tuple(row["charge_vocabulary"]),
+        None if article_vocabulary is None else tuple(article_vocabulary),
+        _label_tuple(row.get("true_charges")),
+        _label_tuple(row.get("unseen_true_charge_labels")),
+        None if "true_articles" not in row else _label_tuple(row.get("true_articles")),
+        _label_tuple(row.get("unseen_true_article_labels")),
+        row.get("articles_available", "missing"),
         row.get("penalty_type"),
         row.get("true_months"),
         row.get("intervention_type"),
         row.get("rank_direction"),
         row.get("target_charge"),
+        row.get("rule_id"),
     )
 
 
 def assert_paired_rows(
     candidate: list[dict[str, Any]], reference: list[dict[str, Any]]
 ) -> None:
-    """Require the same samples, groups, truths, and intervention definitions.
+    """Require the same samples, groups, truths, vocabularies, and interventions.
 
-    Row order may differ. Missing, repeated, or disagreeing rows are errors.
+    Row order may differ. Missing identity, repeated rows, or disagreeing truths are errors.
+    Counterfactual rows pair on generation_id, not on the parent case alone.
     """
     def index(rows: list[dict[str, Any]]) -> dict[tuple[Any, ...], dict[str, Any]]:
         found: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -149,8 +171,6 @@ def assert_paired_rows(
             found[key] = row
         return found
 
-    if not any(row.get("case_id") or row.get("generation_id") for row in (*candidate, *reference)):
-        return
     left, right = index(candidate), index(reference)
     if set(left) != set(right):
         missing = sorted(set(left) ^ set(right))[:3]
@@ -277,8 +297,11 @@ def fast_paired_test(
         raise ValueError("iterations must be positive")
     candidate_rows = getattr(candidate, "source_rows", None)
     reference_rows = getattr(reference, "source_rows", None)
-    if candidate_rows is not None and reference_rows is not None:
-        assert_paired_rows(candidate_rows, reference_rows)
+    if not isinstance(candidate_rows, list) or not isinstance(reference_rows, list):
+        raise ValueError(
+            "paired comparison requires source row identity on both prepared inputs"
+        )
+    assert_paired_rows(candidate_rows, reference_rows)
     if set(candidate.group_keys) != set(reference.group_keys):
         raise ValueError("paired comparison requires identical group IDs")
     keys = tuple(sorted(candidate.group_keys))

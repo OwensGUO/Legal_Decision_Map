@@ -584,6 +584,7 @@ def test_build_counts_penalty_labels_refused_for_missing_final_penalty(tmp_path)
     assert metadata["penalty_label_exclusions"] == {
         "missing_final_penalty": 1,
         "missing_penalty_fields": 0,
+        "unusable_final_penalty_fallback": 0,
     }
 
 
@@ -619,21 +620,9 @@ def test_real_cmdl_records_with_final_penalty_match_that_penalty() -> None:
 
 
 def _spec_penalty(penalty: dict) -> tuple[str, int | None] | None:
-    recognized = {"death_penalty", "life_imprisonment", "imprisonment", "detention", "surveillance"}
-    if not recognized & set(penalty):
-        return None
-    if bool(penalty.get("death_penalty")):
-        return "death", None
-    if bool(penalty.get("life_imprisonment")):
-        return "life", None
-    months = int(penalty.get("imprisonment") or 0)
-    if months > 0:
-        return "fixed_term", months
-    if int(penalty.get("detention") or 0) > 0:
-        return "detention", None
-    if int(penalty.get("surveillance") or 0) > 0:
-        return "control", None
-    return "exempt", None
+    from legal_landscape.data.cmdl import _read_penalty
+
+    return _read_penalty(penalty)
 
 
 def test_cmdl_multi_charge_without_final_penalty_does_not_absorb_detention(tmp_path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -12,7 +13,9 @@ from typing import Any
 
 from legal_landscape.data.sanitize import MASK, sanitize_text
 from legal_landscape.factors.extract import (
+    CONFESSION_CUES,
     RESTITUTION_CUES,
+    SURRENDER_CUES,
     conduct_cues,
     cue_polarity,
     extract_factors,
@@ -37,12 +40,19 @@ LEAKAGE_ERRORS = frozenset(
         "mask_restored",
     }
 )
+_BOOLEAN_CUES = {
+    "restitution": RESTITUTION_CUES,
+    "surrender": SURRENDER_CUES,
+    "confession": CONFESSION_CUES,
+}
 _LEAKAGE_BY_CATEGORY = {
     "charge": "label_leakage",
     "article": "article_leakage",
     "conclusion": "conclusion_leakage",
     "result_statement": "conclusion_leakage",
 }
+# Bumped when validation changes which generations are accepted. Training refuses older caches.
+VALIDATOR_VERSION = "2026-10-27-scope-and-amount"
 
 
 @dataclass(frozen=True)
@@ -74,10 +84,59 @@ def mentioned_amounts(text: str) -> list[float]:
     return amounts
 
 
-def _amount_appears(text: str, amount: float) -> bool:
-    # The invariant rule moves amounts by 1%, so the tolerance must stay well below that.
-    tolerance = max(1.0, amount * 1e-3)
-    return any(abs(value - amount) <= tolerance for value in mentioned_amounts(text))
+def amounts_match(
+    left: float, right: float, *, distinct_from: float | None = None
+) -> bool:
+    """Yuan equality finer than any configured intervention gap.
+
+    Float and 万元 parsing noise is absorbed. When ``distinct_from`` is the other side of
+    an intervention, the tolerance is at most half that gap, so the source amount cannot
+    satisfy a check for the target amount.
+    """
+    left_value, right_value = float(left), float(right)
+    if not math.isfinite(left_value) or not math.isfinite(right_value):
+        return False
+    tolerance = max(1e-4, max(abs(left_value), abs(right_value)) * 1e-8)
+    if distinct_from is not None:
+        gap = abs(right_value - float(distinct_from))
+        if gap > 0:
+            tolerance = min(tolerance, gap / 2.0)
+    return abs(left_value - right_value) <= tolerance
+
+
+def _amount_appears(
+    text: str, amount: float, *, distinct_from: float | None = None
+) -> bool:
+    return any(
+        amounts_match(value, amount, distinct_from=distinct_from)
+        for value in mentioned_amounts(text)
+    )
+
+
+def _amount_change_realized(text: str, spec: InterventionSpec, target_amount: float) -> bool:
+    """The target defendant's case amount must become ``target_amount``.
+
+    A matching number attached to someone else, or the original amount left beside the new
+    one, does not realize the intervention.
+    """
+    scope = _target_scope(text, spec)
+    extracted = extract_factors(
+        scope,
+        target_defendant=spec.target_defendant,
+        co_defendants=_other_defendants(spec),
+    ).amount
+    source = spec.source_factors.amount
+    distinct = None if source is None else float(source)
+    if extracted is None or not amounts_match(
+        extracted, target_amount, distinct_from=distinct
+    ):
+        return False
+    if source is None or amounts_match(float(source), float(target_amount)):
+        return True
+    return not any(
+        amounts_match(value, float(source), distinct_from=float(target_amount))
+        for value in mentioned_amounts(scope)
+    )
 
 
 def _clauses(text: str) -> list[str]:
@@ -102,13 +161,21 @@ def _names_overlap(target: str, others: tuple[str, ...]) -> bool:
 def _sentence_supports_change(sentence: str, spec: InterventionSpec) -> bool:
     for name in spec.changed_fields:
         value = getattr(spec.target_factors, name)
-        if name == "restitution" and value is not None:
-            if cue_polarity(sentence, RESTITUTION_CUES) != value:
+        if name in _BOOLEAN_CUES and value is not None:
+            if cue_polarity(sentence, _BOOLEAN_CUES[name]) != value:
                 return False
         elif name == "conduct" and isinstance(value, str):
             if value not in conduct_cues(sentence):
                 return False
-        elif name == "amount" and value is not None and not _amount_appears(sentence, float(value)):
+        elif name == "amount" and value is not None and not _amount_appears(
+            sentence,
+            float(value),
+            distinct_from=(
+                None
+                if spec.source_factors.amount is None
+                else float(spec.source_factors.amount)
+            ),
+        ):
             return False
     return True
 
@@ -147,23 +214,16 @@ def _target_change_appears(text: str, spec: InterventionSpec) -> bool:
     text = _target_scope(text, spec)
     for name in spec.changed_fields:
         value = getattr(spec.target_factors, name)
-        if name == "restitution" and value is not None:
-            if cue_polarity(text, RESTITUTION_CUES) is not value:
+        if name in _BOOLEAN_CUES and value is not None:
+            if cue_polarity(text, _BOOLEAN_CUES[name]) is not value:
                 return False
         if name == "conduct" and isinstance(value, str):
             cues = conduct_cues(text)
             source = spec.source_factors.conduct
             if value not in cues or (source is not None and source != value and source in cues):
                 return False
-        if name == "amount" and value is not None and not _amount_appears(text, float(value)):
-            return False
-        source_amount = spec.source_factors.amount
-        if (
-            name == "amount"
-            and source_amount is not None
-            and value is not None
-            and abs(float(source_amount) - float(value)) > max(1.0, abs(float(value)) * 1e-3)
-            and _amount_appears(text, float(source_amount))
+        if name == "amount" and value is not None and not _amount_change_realized(
+            text, spec, float(value)
         ):
             return False
     return True
@@ -179,8 +239,8 @@ def _factor_drift(parent_text: str, text: str, spec: InterventionSpec) -> list[s
     errors: list[str] = []
     for name in before.to_dict():
         if name in spec.changed_fields:
-            if name == "restitution" and after.restitution != spec.target_factors.restitution:
-                errors.append("factor_mismatch:restitution")
+            if name in _BOOLEAN_CUES and getattr(after, name) != getattr(spec.target_factors, name):
+                errors.append(f"factor_mismatch:{name}")
         elif getattr(after, name) != getattr(before, name):
             errors.append(f"non_target_changed:{name}")
     for other in others:

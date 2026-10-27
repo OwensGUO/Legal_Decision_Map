@@ -335,31 +335,170 @@ def _dependency_versions() -> dict[str, str]:
 
 
 PROCESSING_VERSION = "2026-10-27-label-protocol"
-RESUME_LOCKED_TRAINING_KEYS = (
-    "learning_rate",
-    "epochs",
-    "gradient_accumulation_steps",
-    "warmup_ratio",
-    "min_learning_rate_ratio",
-    "per_device_batch_size",
-    "max_tokens_per_batch",
+_LOSS_WEIGHT_NAMES = ("article", "sentence", "invariant", "boundary", "response", "factor")
+# Logging and checkpoint selection. They do not change the sample stream or the loss.
+RESUME_LOG_ONLY_KEYS = (
+    "checkpoint_every",
+    "validation_limit",
+    "inference_batch_size",
+    "inference_max_tokens_per_batch",
+    "select_best_checkpoint",
+    "keep_best_and_latest_checkpoints",
 )
-# These may change between a checkpoint and the process that restores it.
-RESUME_LOG_ONLY_KEYS = ("checkpoint_every", "max_steps", "validation_limit")
+
+
+def _is_longformer(inspected: InspectedModelConfig) -> bool:
+    if inspected.model_type.lower() == "longformer":
+        return True
+    return any("longformer" in name.lower() for name in inspected.architectures)
+
+
+def configured_attention(model_config: dict[str, Any]) -> str:
+    """Attention implementation actually used for this checkpoint.
+
+    Longformer on the current stack has no SDPA kernel, so it always uses eager.
+    Other architectures keep the configured implementation, defaulting to SDPA.
+    """
+    requested = str(model_config.get("attn_implementation", "sdpa"))
+    path = model_config.get("path")
+    if path and (Path(path) / "config.json").is_file():
+        if _is_longformer(inspect_model_config(path)):
+            return "eager"
+    return requested
+
+
+def _resolved_max_length(config: dict[str, Any]) -> int:
+    model = config.get("model") or {}
+    return int(model.get("max_length", config.get("max_length", 4096)))
+
+
+_TOKENIZER_AND_CONFIG_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "tokenizer.model",
+    "config.json",
+)
+
+
+def _canonical_file_bytes(path: Path) -> bytes:
+    if path.suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    return path.read_bytes()
+
+
+def tokenizer_and_config_identity(model_path: str | Path | None) -> dict[str, Any]:
+    """Fingerprint tokenizer resources and config.json, not model weights.
+
+    The same files at another path match. A changed vocab, special token, added token,
+    or config does not. A missing directory is an explicit unavailable identity, not a
+    silent skip.
+    """
+    if not model_path:
+        return {"status": "unavailable", "files": {}}
+    root = Path(model_path)
+    if not root.is_dir():
+        return {"status": "unavailable", "files": {}}
+    files: dict[str, str] = {}
+    for name in _TOKENIZER_AND_CONFIG_FILES:
+        file = root / name
+        if not file.is_file():
+            continue
+        files[name] = hashlib.sha256(_canonical_file_bytes(file)).hexdigest()
+    return {"status": "present", "files": files}
+
+
+def _resolved_model_identity(config: dict[str, Any]) -> dict[str, Any]:
+    model = dict(config.get("model") or {})
+    training = config.get("training") or {}
+    quantization = model.get("quantization", "none")
+    identity: dict[str, Any] = {
+        "max_length": _resolved_max_length(config),
+        "quantization": quantization,
+        "attn_implementation": configured_attention(model),
+        "gradient_checkpointing": bool(
+            training.get("gradient_checkpointing", model.get("gradient_checkpointing", True))
+        ),
+        "tokenizer_identity": tokenizer_and_config_identity(model.get("path")),
+    }
+    if quantization == "nf4":
+        lora = dict(model.get("lora") or {})
+        identity["lora"] = {
+            "rank": int(lora.get("rank", 32)),
+            "alpha": int(lora.get("alpha", 64)),
+            "dropout": float(lora.get("dropout", 0.05)),
+        }
+    else:
+        identity["lora"] = None
+    return identity
+
+
+def _resolved_training_identity(training: dict[str, Any], *, max_length: int) -> dict[str, Any]:
+    batch = int(training.get("per_device_batch_size", 1))
+    return {
+        "learning_rate": float(training.get("learning_rate", 2e-4)),
+        "epochs": int(training.get("epochs", 1)),
+        "gradient_accumulation_steps": int(training.get("gradient_accumulation_steps", 8)),
+        "per_device_batch_size": batch,
+        "max_tokens_per_batch": int(training.get("max_tokens_per_batch", batch * max_length)),
+        "pair_every": max(1, int(training.get("pair_every", 1))),
+        "rank_margin": float(training.get("rank_margin", 1.0)),
+        "mixed_precision": str(training.get("mixed_precision", "bf16")),
+        "seed": int(training.get("seed", 42)),
+    }
+
+
+def _resolved_schedule(training: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "max_steps": int(training.get("max_steps", 1000)),
+        "warmup_ratio": float(training.get("warmup_ratio", 0.0)),
+        "min_learning_rate_ratio": float(training.get("min_learning_rate_ratio", 1.0)),
+    }
+
+
+def _resolved_loss(loss: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(loss or {})
+    reduction = str(payload.pop("multilabel_reduction", "sum"))
+    weights = {name: float(payload.pop(name, 1.0)) for name in _LOSS_WEIGHT_NAMES}
+    for name, value in payload.items():
+        weights[str(name)] = float(value)
+    return {"multilabel_reduction": reduction, "weights": weights}
+
+
+def resume_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
 
 
 def resume_compatibility(
     *,
-    training: dict[str, Any],
+    config: dict[str, Any],
+    experiment_name: str,
+    limit: int | None,
+    num_processes: int,
     charge_vocabulary: list[str],
     article_vocabulary: list[str],
     penalty_vocabulary: list[str],
     validation_identity: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Identity that must match before a checkpoint can restore training."""
+    """Normalized identity of everything that changes samples, loss, or parameters.
+
+    ``max_steps`` is part of the schedule, not a log setting: it sets the warmup and
+    cosine horizon. Resume may extend a positive cap; the restored run keeps its
+    optimizer step and then follows the new horizon. Shortening the cap, or switching
+    between a numeric cap and ``max_steps=0``, is rejected. Checkpoint frequency and
+    validation-display limits stay outside this identity.
+    """
     from legal_landscape.counterfactual.prompts import PROMPT_VERSION
     from legal_landscape.data.sanitize import SANITIZER_VERSION
 
+    training = dict(config.get("training") or {})
     return {
         "processing_version": PROCESSING_VERSION,
         "sanitizer_version": SANITIZER_VERSION,
@@ -367,12 +506,75 @@ def resume_compatibility(
         "charge_vocabulary": list(charge_vocabulary),
         "article_vocabulary": list(article_vocabulary),
         "penalty_vocabulary": list(penalty_vocabulary),
-        "training_config": {
-            key: training[key] for key in RESUME_LOCKED_TRAINING_KEYS if key in training
-        },
+        "experiment": asdict(build_experiment(experiment_name)),
+        "model": _resolved_model_identity(config),
+        "data_limit": None if limit is None else int(limit),
+        "num_processes": int(num_processes),
+        "training_config": _resolved_training_identity(
+            training, max_length=_resolved_max_length(config)
+        ),
+        "schedule": _resolved_schedule(training),
+        "loss": _resolved_loss(config.get("loss")),
         "validation_identity": validation_identity,
         "log_only_keys": list(RESUME_LOG_ONLY_KEYS),
     }
+
+
+def _schedule_extension_error(
+    saved: dict[str, Any] | None, current: dict[str, Any] | None
+) -> str | None:
+    saved_schedule = dict(saved or {})
+    current_schedule = dict(current or {})
+    saved_steps = saved_schedule.pop("max_steps", None)
+    current_steps = current_schedule.pop("max_steps", None)
+    if saved_schedule != current_schedule:
+        return "warmup or minimum learning-rate ratio changed"
+    if saved_steps == current_steps:
+        return None
+    if (
+        isinstance(saved_steps, int)
+        and isinstance(current_steps, int)
+        and not isinstance(saved_steps, bool)
+        and not isinstance(current_steps, bool)
+        and saved_steps > 0
+        and current_steps > saved_steps
+    ):
+        return None
+    return (
+        "max_steps changes the warmup/cosine horizon. Resume may extend a positive cap "
+        "and then follow the new horizon from the saved step; it cannot shorten the cap "
+        "or switch between a numeric cap and max_steps=0"
+    )
+
+
+def _tokenizer_identity_error(
+    saved: dict[str, Any], expected: dict[str, Any]
+) -> str | None:
+    saved_model = saved.get("model") if isinstance(saved.get("model"), dict) else {}
+    expected_model = expected.get("model") if isinstance(expected.get("model"), dict) else {}
+    saved_has = "tokenizer_identity" in saved_model
+    expected_has = "tokenizer_identity" in expected_model
+    if expected_has and not saved_has:
+        return (
+            "checkpoint has no tokenizer and model-config fingerprint; start a new run, "
+            "this checkpoint cannot be migrated in place"
+        )
+    if saved_has or expected_has:
+        if saved_model.get("tokenizer_identity") != expected_model.get("tokenizer_identity"):
+            return "tokenizer or model config content changed"
+    return None
+
+
+def _compared_compatibility(payload: dict[str, Any]) -> dict[str, Any]:
+    body = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"log_only_keys", "schedule"}
+    }
+    schedule = dict(payload.get("schedule") or {})
+    schedule.pop("max_steps", None)
+    body["schedule_without_horizon"] = schedule
+    return body
 
 
 def validate_resume_metadata(
@@ -380,7 +582,8 @@ def validate_resume_metadata(
     *,
     expected_seed: int,
     expected_input_identity: dict[str, Any],
-    expected_compatibility: dict[str, Any],
+    expected_compatibility: dict[str, Any] | None = None,
+    check_compatibility: bool = True,
 ) -> None:
     """Reject checkpoints produced from a different deterministic run input."""
     if int(progress.get("seed", -1)) != expected_seed:
@@ -409,12 +612,33 @@ def validate_resume_metadata(
             "the counterfactual generation cache). For scripts/train_model.py, use "
             "a new --output-dir without --resume-from-checkpoint."
         )
+    if not check_compatibility:
+        return
     saved_compatibility = progress.get("compatibility")
-    if saved_compatibility != expected_compatibility:
+    if not isinstance(saved_compatibility, dict) or not isinstance(expected_compatibility, dict):
         raise ValueError(
             "checkpoint is incompatible with the current processing and training setup: "
             f"checkpoint={saved_compatibility!r}, current={expected_compatibility!r}. "
-            "Use a new OUTPUT_ROOT; do not delete this check to reuse an older checkpoint."
+            "Use a new OUTPUT_ROOT; do not delete this checkpoint to reuse it."
+        )
+    extension_error = _schedule_extension_error(
+        saved_compatibility.get("schedule"), expected_compatibility.get("schedule")
+    )
+    tokenizer_error = _tokenizer_identity_error(saved_compatibility, expected_compatibility)
+    if (
+        tokenizer_error is not None
+        or extension_error is not None
+        or _compared_compatibility(saved_compatibility)
+        != _compared_compatibility(expected_compatibility)
+    ):
+        detail = tokenizer_error or extension_error or (
+            "configuration that affects inputs, bucketing, loss, sampling, or model "
+            "structure changed"
+        )
+        raise ValueError(
+            "checkpoint is incompatible with the current processing and training setup: "
+            f"{detail}. checkpoint={saved_compatibility!r}, current={expected_compatibility!r}. "
+            "Use a new OUTPUT_ROOT; do not delete this checkpoint to reuse it."
         )
 
 
@@ -604,9 +828,18 @@ def load_processed_records(path: str | Path, *, limit: int | None = None) -> lis
     return records
 
 
-def _factor_values_match(observed: Any, expected: Any) -> bool:
-    if isinstance(observed, int | float) and isinstance(expected, int | float):
-        return abs(float(observed) - float(expected)) <= max(1.0, abs(float(expected)) * 1e-3)
+def _factor_values_match(observed: Any, expected: Any, *, numeric: bool = False) -> bool:
+    """Compare one factor without treating bool as a number or None as False."""
+    if isinstance(observed, bool) or isinstance(expected, bool):
+        return isinstance(observed, bool) and isinstance(expected, bool) and observed == expected
+    if observed is None or expected is None:
+        return observed is None and expected is None
+    if numeric:
+        if isinstance(observed, int | float) and isinstance(expected, int | float):
+            from legal_landscape.counterfactual.validators import amounts_match
+
+            return amounts_match(float(observed), float(expected))
+        return False
     return observed == expected
 
 
@@ -631,9 +864,73 @@ def _observed_counterfactual_factors(
     if not isinstance(expected, dict):
         return None
     for field in changed:
-        if not _factor_values_match(observed.get(field), expected.get(field)):
+        if not _factor_values_match(
+            observed.get(field), expected.get(field), numeric=field == "amount"
+        ):
             return None
     return observed
+
+
+def _canonical_parent_text(parent: dict[str, Any]) -> str:
+    return str(
+        parent.get("fact_strict")
+        or parent.get("fact_conservative")
+        or parent.get("fact_raw")
+        or ""
+    )
+
+
+def _reject_counterfactual_cache(path: str | Path, line_number: int, reason: str) -> None:
+    raise ValueError(
+        f"counterfactual cache at {path}:{line_number} cannot be used ({reason}). "
+        "Regenerate the counterfactual cache with the current prompt, sanitizer, and "
+        "validator; the existing file was not modified."
+    )
+
+
+def _require_current_counterfactual(
+    path: str | Path, line_number: int, row: dict[str, Any], parent: dict[str, Any]
+) -> None:
+    """Reject old, incomplete, or parent-mismatched cache rows before they can train."""
+    from legal_landscape.counterfactual.generate import text_sha256
+    from legal_landscape.counterfactual.prompts import PROMPT_VERSION
+    from legal_landscape.counterfactual.validators import VALIDATOR_VERSION
+    from legal_landscape.data.sanitize import SANITIZER_VERSION
+
+    versions = {
+        "prompt_version": PROMPT_VERSION,
+        "sanitizer_version": SANITIZER_VERSION,
+        "validator_version": VALIDATOR_VERSION,
+    }
+    for field, expected in versions.items():
+        if row.get(field) != expected:
+            _reject_counterfactual_cache(
+                path,
+                line_number,
+                f"{field} is {row.get(field)!r}, expected {expected!r}",
+            )
+    parent_text = _canonical_parent_text(parent)
+    if row.get("parent_text_sha256") != text_sha256(parent_text):
+        _reject_counterfactual_cache(
+            path, line_number, "parent_text_sha256 does not match the current parent text"
+        )
+    defendant = row.get("target_defendant")
+    if not defendant or defendant != parent.get("target_defendant"):
+        _reject_counterfactual_cache(
+            path, line_number, "target defendant does not match the current parent case"
+        )
+    if not isinstance(row.get("intervention_type"), str) or not row.get("intervention_type"):
+        _reject_counterfactual_cache(path, line_number, "intervention_type is missing")
+    changed = row.get("changed_fields")
+    fields_ok = (
+        isinstance(changed, list)
+        and bool(changed)
+        and all(isinstance(item, str) for item in changed)
+    )
+    if not fields_ok:
+        _reject_counterfactual_cache(path, line_number, "changed_fields are missing")
+    if not isinstance(row.get("target_factors"), dict):
+        _reject_counterfactual_cache(path, line_number, "target_factors are missing")
 
 
 def load_counterfactual_pairs(
@@ -646,7 +943,8 @@ def load_counterfactual_pairs(
     """Join generated counterfactual records back to original cases by ID.
 
     Only the sanitized ``counterfactual_strict`` text is used. Records with label or outcome
-    leakage are skipped even when ``filter_valid`` is false.
+    leakage are skipped even when ``filter_valid`` is false. Version, parent-text, and
+    intervention identity mismatches are errors: the cache file is left unchanged.
     """
     from legal_landscape.counterfactual.validators import has_leakage
 
@@ -655,11 +953,6 @@ def load_counterfactual_pairs(
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
-                validation = row.get("validation") or {}
-                if filter_valid and not validation.get("valid", False):
-                    continue
-                if row.get("leakage") or has_leakage(validation.get("errors") or ()):
-                    continue
                 parent_id = str(row["parent_case_id"])
                 if parent_id not in parents:
                     raise ValueError(
@@ -667,6 +960,12 @@ def load_counterfactual_pairs(
                         "counterfactuals must come from the same split as their parents"
                     )
                 parent = parents[parent_id]
+                _require_current_counterfactual(path, line_number, row, parent)
+                validation = row.get("validation") or {}
+                if filter_valid and not validation.get("valid", False):
+                    continue
+                if row.get("leakage") or has_leakage(validation.get("errors") or ()):
+                    continue
                 counterfactual_text = row.get("counterfactual_strict")
                 if not isinstance(counterfactual_text, str) or not counterfactual_text:
                     continue
@@ -791,19 +1090,33 @@ def make_static_prediction_rows(
         predicted_charges = [int(value >= threshold) for value in probabilities]
         if not any(predicted_charges):
             predicted_charges[max(range(len(probabilities)), key=probabilities.__getitem__)] = 1
-        true_articles = [0] * len(article_vocabulary)
-        record_articles = record.get("conviction_articles") or ()
-        unseen_articles = [item for item in record_articles if item not in article_to_index]
-        for article in record_articles:
-            if article in article_to_index:
-                true_articles[article_to_index[article]] = 1
+        articles_available = (
+            record["articles_available"] if "articles_available" in record else None
+        )
         predicted_articles = [int(value >= article_cutoff) for value in article_probs]
         if article_probs and not any(predicted_articles):
             predicted_articles[max(range(len(article_probs)), key=article_probs.__getitem__)] = 1
+        if articles_available is False:
+            # Missing annotations must not become an all-negative article target.
+            true_articles = None
+            record_articles = ()
+            unseen_articles: list[str] = []
+            article_correct = None
+        else:
+            true_articles = [0] * len(article_vocabulary)
+            record_articles = record.get("conviction_articles") or ()
+            unseen_articles = [item for item in record_articles if item not in article_to_index]
+            for article in record_articles:
+                if article in article_to_index:
+                    true_articles[article_to_index[article]] = 1
+            article_correct = predicted_articles == true_articles and not unseen_articles
         rows.append(
             {
                 "case_id": record["case_id"],
                 "group_id": record["group_id"],
+                "charge_vocabulary": list(charge_vocabulary),
+                "article_vocabulary": list(article_vocabulary),
+                "articles_available": articles_available,
                 "true_charges": true_charges,
                 "predicted_charges": predicted_charges,
                 "charge_probabilities": probabilities,
@@ -831,7 +1144,7 @@ def make_static_prediction_rows(
                 "true_months": record.get("imprisonment_months"),
                 "predicted_months": float(predicted_months),
                 "correct": predicted_charges == true_charges and not unseen_charges,
-                "article_correct": predicted_articles == true_articles and not unseen_articles,
+                "article_correct": article_correct,
             }
         )
     return rows
@@ -872,7 +1185,9 @@ def make_counterfactual_prediction_rows(
                 "case_id": pair["parent_record"]["case_id"],
                 "group_id": pair["parent_record"]["group_id"],
                 "generation_id": pair.get("generation_id"),
+                "charge_vocabulary": list(charge_vocabulary),
                 "intervention_type": pair["intervention_type"],
+                "rule_id": pair.get("rule_id"),
                 "target_charge": charge_to_index[target] if target is not None else None,
                 "parent_charge_indices": [
                     charge_to_index[label]
@@ -928,7 +1243,11 @@ def load_backbone(model_config: dict[str, Any]) -> tuple[Any, InspectedModelConf
     kwargs: dict[str, Any] = {
         "local_files_only": True,
         "trust_remote_code": bool(model_config.get("trust_remote_code", False)),
-        "attn_implementation": model_config.get("attn_implementation", "sdpa"),
+        "attn_implementation": (
+            "eager"
+            if _is_longformer(inspected)
+            else model_config.get("attn_implementation", "sdpa")
+        ),
     }
     if model_config.get("quantization") == "nf4":
         import torch
@@ -1224,6 +1543,27 @@ def _main_accumulation_context(accelerator: Any, model: Any, should_sync: bool):
         yield
 
 
+def _loader_generator(seed: int, epoch: int, stream: str):
+    """RNG used only to build a DataLoader iterator.
+
+    Iterator creation draws one integer. Keeping that draw off the global CPU generator
+    leaves dropout on the same sequence after a checkpoint restores that global state.
+    The seed is a function of the training seed, epoch, and stream, so recreating an
+    iterator for the same epoch does not depend on how many iterators were built earlier.
+    """
+    import torch
+
+    generator = torch.Generator(device="cpu")
+    stream_code = {"main": 1, "counterfactual": 2, "prediction": 3}[stream]
+    generator.manual_seed((int(seed) + 1) * 1_000_003 + int(epoch) * 97 + stream_code)
+    return generator
+
+
+def _use_loader_generator(loader: Any, seed: int, epoch: int, stream: str) -> None:
+    target = getattr(loader, "base_dataloader", loader)
+    target.generator = _loader_generator(seed, epoch, stream)
+
+
 def _untracked_counterfactual_loader(
     dataset: Any,
     batch_sampler: Any,
@@ -1292,24 +1632,55 @@ def run_real_training(
     step = 0
     completed_microbatches = 0
     progress: dict[str, Any] = {}
-    metadata_path = Path(train_data).parent / "metadata.json"
-    saved_metadata = (
-        json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
-    )
-    compatibility = resume_compatibility(
-        training=dict(config.get("training", {})),
-        charge_vocabulary=list(saved_metadata.get("charge_vocabulary") or ()),
-        article_vocabulary=list(saved_metadata.get("article_vocabulary") or ()),
-        penalty_vocabulary=list(saved_metadata.get("penalty_vocabulary") or ()),
-        validation_identity=(
-            _file_identity(validation_data) if validation_data is not None else None
-        ),
-    )
+    progress_path: Path | None = None
     if resume_from_checkpoint is not None:
         progress_path = Path(resume_from_checkpoint) / "training_progress.json"
         if not progress_path.is_file():
             raise FileNotFoundError(f"checkpoint progress not found: {progress_path}")
         progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        try:
+            validate_resume_metadata(
+                progress,
+                expected_seed=seed,
+                expected_input_identity=input_identity,
+                check_compatibility=False,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{progress_path}: {exc}") from exc
+
+    records = load_processed_records(train_data, limit=limit)
+    if not records:
+        raise ValueError("training data contains no records")
+    metadata_path = Path(train_data).parent / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    charges = list(metadata["charge_vocabulary"])
+    articles = list(metadata.get("article_vocabulary") or ())
+    if not articles:
+        articles = sorted(
+            {
+                str(article)
+                for record in records
+                for article in (record.get("conviction_articles") or ())
+            }
+        )
+    if not articles:
+        raise ValueError(
+            "training data has no conviction-article labels; rebuild the processed dataset"
+        )
+    penalties = list(metadata["penalty_vocabulary"])
+    compatibility = resume_compatibility(
+        config=config,
+        experiment_name=experiment_name,
+        limit=limit,
+        num_processes=resume_world_size(),
+        charge_vocabulary=charges,
+        article_vocabulary=articles,
+        penalty_vocabulary=penalties,
+        validation_identity=(
+            _file_identity(validation_data) if validation_data is not None else None
+        ),
+    )
+    if resume_from_checkpoint is not None:
         try:
             validate_resume_metadata(
                 progress,
@@ -1339,27 +1710,7 @@ def run_real_training(
 
     set_deterministic_seed(seed)
     experiment = build_experiment(experiment_name)
-    records = load_processed_records(train_data, limit=limit)
-    if not records:
-        raise ValueError("training data contains no records")
     destination = Path(output_dir)
-    metadata_path = Path(train_data).parent / "metadata.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    charges = list(metadata["charge_vocabulary"])
-    articles = list(metadata.get("article_vocabulary") or ())
-    if not articles:
-        articles = sorted(
-            {
-                str(article)
-                for record in records
-                for article in (record.get("conviction_articles") or ())
-            }
-        )
-    if not articles:
-        raise ValueError(
-            "training data has no conviction-article labels; rebuild the processed dataset"
-        )
-    penalties = list(metadata["penalty_vocabulary"])
     charge_to_index = {label: index for index, label in enumerate(charges)}
     article_to_index = {label: index for index, label in enumerate(articles)}
     penalty_to_index = {label: index for index, label in enumerate(penalties)}
@@ -1656,9 +2007,19 @@ def run_real_training(
         if pair_sampler is not None and progress.get("pair_sampler") is not None:
             pair_sampler.load_state_dict(progress["pair_sampler"])
 
-    loader = DataLoader(records, batch_sampler=case_sampler, collate_fn=collate_cases)
+    loader = DataLoader(
+        records,
+        batch_sampler=case_sampler,
+        collate_fn=collate_cases,
+        generator=_loader_generator(seed, case_sampler.epoch, "main"),
+    )
     pair_loader = (
-        DataLoader(pairs, batch_sampler=pair_sampler, collate_fn=collate_pairs)
+        DataLoader(
+            pairs,
+            batch_sampler=pair_sampler,
+            collate_fn=collate_pairs,
+            generator=_loader_generator(seed, pair_sampler.epoch, "counterfactual"),
+        )
         if pair_sampler is not None
         else None
     )
@@ -1681,6 +2042,13 @@ def run_real_training(
             pairs, pair_sampler, collate_pairs, accelerator
         )
     if resume_from_checkpoint is not None:
+        if int(accelerator.num_processes) != int(compatibility["num_processes"]):
+            raise ValueError(
+                "refusing to resume under a different process count: "
+                f"checkpoint={compatibility['num_processes']}, "
+                f"current={accelerator.num_processes}. Sampler cursors are not valid "
+                "across a world-size change; start a new run."
+            )
         accelerator.load_state(str(resume_from_checkpoint))
     destination.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(destination / "tensorboard") if accelerator.is_main_process else None
@@ -1696,6 +2064,8 @@ def run_real_training(
     warmup_steps = round(float(training.get("warmup_ratio", 0.0)) * max_steps)
     min_learning_rate_ratio = float(training.get("min_learning_rate_ratio", 1.0))
     checkpoint_every = int(training.get("checkpoint_every", 100))
+    if pair_loader is not None and pair_sampler is not None:
+        _use_loader_generator(pair_loader, seed, pair_sampler.epoch, "counterfactual")
     pair_iterator = iter(pair_loader) if pair_loader is not None else None
     loss_config = dict(config.get("loss", {}))
     multilabel_reduction = str(loss_config.pop("multilabel_reduction", "sum"))
@@ -1787,7 +2157,12 @@ def run_real_training(
             accelerator.num_processes,
             accelerator.process_index,
         )
-        local_loader = DataLoader(indexed, batch_sampler=batches, collate_fn=collate)
+        local_loader = DataLoader(
+            indexed,
+            batch_sampler=batches,
+            collate_fn=collate,
+            generator=_loader_generator(seed, 0, "prediction"),
+        )
         results: list[tuple[int, tuple[Any, ...]]] = []
         with (
             progress_reporter.task(
@@ -1887,6 +2262,7 @@ def run_real_training(
             predictor.train()
             for _epoch in range(case_sampler.epoch, epochs) if step < max_steps else ():
                 microbatches_in_epoch = 0
+                _use_loader_generator(loader, seed, case_sampler.epoch, "main")
                 for batch in loader:
                     microbatches_in_epoch += 1
                     # The prepared main loader sets this before yielding its last batch.
@@ -1944,6 +2320,9 @@ def run_real_training(
                                         "counterfactual sampler unexpectedly missing"
                                     ) from None
                                 pair_sampler.next_epoch()
+                                _use_loader_generator(
+                                    pair_loader, seed, pair_sampler.epoch, "counterfactual"
+                                )
                                 pair_iterator = iter(pair_loader)  # type: ignore[arg-type]
                                 pair_batch = device_batch(next(pair_iterator))
                             pair_types = pair_batch["pair_types"]

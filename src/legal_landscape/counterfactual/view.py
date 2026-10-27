@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from legal_landscape.counterfactual.generate import GenerationRequest, text_sha256
+from legal_landscape.counterfactual.validators import VALIDATOR_VERSION
 from legal_landscape.data.sanitize import SANITIZER_VERSION
 
 
@@ -56,6 +57,12 @@ def publish_request_view(
                     raise ValueError("prompt version mismatch; use a new cache output path")
                 if row.get("sanitizer_version") != SANITIZER_VERSION:
                     raise ValueError("sanitizer version mismatch; use a new cache output path")
+                if row.get("validator_version") != VALIDATOR_VERSION:
+                    raise ValueError(
+                        "validator version mismatch; resume generation so the current cache "
+                        "identity is appended. Historical rows stay in the cache and are not "
+                        "published."
+                    )
                 if row.get("parent_text_sha256") != text_sha256(wanted[generation_id].parent_text):
                     raise ValueError("parent text mismatch; rebuild the counterfactual cache")
                 spec = wanted[generation_id].spec.to_dict()

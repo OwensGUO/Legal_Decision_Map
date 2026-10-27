@@ -10,6 +10,7 @@ from legal_landscape.counterfactual.generate import (
     MockGenerator,
     generate_records,
 )
+from legal_landscape.counterfactual.prompts import PROMPT_VERSION
 from legal_landscape.counterfactual.provenance import generator_identity
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
 
@@ -28,7 +29,7 @@ def cache(tmp_path):
     path = tmp_path / "cache.jsonl"
     generate_records(
         requests, MockGenerator(), path, generator_identity=identity,
-        prompt_version="v1", sampling={}, seed=42, retries=0,
+        prompt_version=PROMPT_VERSION, sampling={}, seed=42, retries=0,
     )
     return requests, path, tmp_path / "views/current.jsonl", identity
 
@@ -41,7 +42,7 @@ def test_view_selects_current_twelve_requests_without_modifying_historical_cache
     before = path.read_bytes()
     current = list(reversed(requests[:12]))
     report = publish_request_view(
-        current, path, view, generator_identity=identity, prompt_version="v1",
+        current, path, view, generator_identity=identity, prompt_version=PROMPT_VERSION,
     )
 
     assert path.read_bytes() == before
@@ -97,7 +98,7 @@ def test_view_rejects_invalid_cache_and_preserves_previous_view(cache, damage):
 
     with pytest.raises(ValueError):
         publish_request_view(
-            requests[:1], path, view, generator_identity=identity, prompt_version="v1",
+            requests[:1], path, view, generator_identity=identity, prompt_version=PROMPT_VERSION,
         )
 
     assert path.read_bytes() == before
@@ -117,7 +118,7 @@ def test_view_publication_failure_preserves_previous_view_and_removes_temp(cache
     monkeypatch.setattr(view_module.os, "replace", fail_replace)
     with pytest.raises(OSError, match="publication failed"):
         view_module.publish_request_view(
-            requests[:1], path, view, generator_identity=identity, prompt_version="v1",
+            requests[:1], path, view, generator_identity=identity, prompt_version=PROMPT_VERSION,
         )
 
     assert view.read_text() == "previous view\n"
@@ -137,7 +138,7 @@ def test_view_preserves_invalid_generations_for_unfiltered_ablation(cache, parse
         selected["validation"]["parsed"] = None
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     report = publish_request_view(
-        requests[:1], path, view, generator_identity=identity, prompt_version="v1",
+        requests[:1], path, view, generator_identity=identity, prompt_version=PROMPT_VERSION,
     )
     assert report["valid"] == 0
     assert json.loads(view.read_text())["validation"]["valid"] is False
