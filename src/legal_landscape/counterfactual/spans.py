@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from legal_landscape.counterfactual.validators import amounts_match
 from legal_landscape.factors.extract import CONDUCT_CUES, RESTITUTION_CUES
 from legal_landscape.factors.schema import InterventionSpec
 
@@ -126,37 +127,13 @@ def _clause(value: bool) -> str:
     return "案发后已退赃退赔" if value else "案发后未退赃退赔"
 
 
-def _named_spans(spans: tuple[Span, ...], spec: InterventionSpec) -> tuple[Span, ...]:
-    """Spans that may carry the target's edit.
-
-    With co-defendants a clause must name the target, because an unnamed clause may
-    belong to anyone. A single-defendant case has exactly one actor, so a pronoun or
-    impersonal clause continues the same subject and stays eligible.
-    """
-    others = other_defendants(spec)
-    if not others:
-        return spans
-    return tuple(span for span in spans if mentions(span.text, spec.target_defendant, others))
-
-
-def _naming(text: str, spec: InterventionSpec) -> str:
-    """Prefix the defendant when a sentence would otherwise carry the edit by pronoun.
-
-    The validator only credits a change on a sentence that names the target and no other
-    defendant, so a pronoun sentence such as 其未退赃 is made explicit before it is edited.
-    """
-    return "" if mentions(text, spec.target_defendant, other_defendants(spec)) else (
-        spec.target_defendant
-    )
-
-
 def _restationalize(text: str, spec: InterventionSpec) -> str | None:
     """Replace every restitution clause inside the target scope with one canonical clause."""
     value = spec.target_factors.restitution
     if value is None:
         return None
     clause = _clause(bool(value))
-    spans = _named_spans(scope_spans(text, spec), spec)
+    spans = scope_spans(text, spec)
     if not spans:
         return None
     others = other_defendants(spec)
@@ -178,18 +155,36 @@ def _restationalize(text: str, spec: InterventionSpec) -> str | None:
     return result
 
 
+def _literal_is_source(match: re.Match[str], source: float | None) -> bool:
+    """The matched literal is the amount the intervention starts from.
+
+    A joint total or a compensation figure in the same clause is a different fact;
+    editing it would leave the intervened amount unchanged.
+    """
+    if source is None:
+        return True
+    try:
+        value = float(re.sub("[,，]", "", match.group(1)))
+    except ValueError:
+        return False
+    if match.group(2):
+        value *= 10000.0
+    return amounts_match(value, float(source))
+
+
 def _amountalize(text: str, spec: InterventionSpec) -> str | None:
     """Replace the target defendant's amount literal; 万元 sources are written back in 元."""
     target = spec.target_factors.amount
     if target is None:
         return None
-    spans = _named_spans(scope_spans(text, spec), spec)
+    source = spec.source_factors.amount
+    spans = scope_spans(text, spec)
     if not spans:
         return None
     literal = _format_amount(float(target)) + "元"
     for span in spans:
         match = _CUED_AMOUNT.search(span.text)
-        if match is not None:
+        if match is not None and _literal_is_source(match, source):
             start = span.start + match.start(1)
             end = span.start + match.end()
             return text[:start] + literal + text[end:]
@@ -197,28 +192,26 @@ def _amountalize(text: str, spec: InterventionSpec) -> str | None:
         if not mentions(span.text, spec.target_defendant, other_defendants(spec)):
             continue
         match = _ANY_AMOUNT.search(span.text)
-        if match is not None:
+        if match is not None and _literal_is_source(match, source):
             start = span.start + match.start(1)
             end = span.start + match.end()
             return text[:start] + literal + text[end:]
     return None
 
 
-def _quote_span(text: str, spec: InterventionSpec) -> Span | None:
-    """The sentence a behaviour flip must rewrite: source behaviour first, then a name."""
-    spans = scope_spans(text, spec)
-    if not spans:
-        return None
-    source = spec.source_factors.conduct
-    source_cues = dict(CONDUCT_CUES).get(source or "", ())
-    named = _named_spans(spans, spec)
-    for span in named:
-        if any(cue in span.text for cue in source_cues):
-            return span
-    for span in named:
-        if mentions(span.text, spec.target_defendant, other_defendants(spec)):
-            return span
-    return None
+def _source_clauses(text: str, spec: InterventionSpec) -> tuple[Span, ...]:
+    """Target clauses that still describe the source behaviour.
+
+    A flip must rewrite every one of them: one case can describe the same defendant
+    taking property in several counts, and rewriting a single clause leaves the others
+    contradicting the new conduct.
+    """
+    source_cues = dict(CONDUCT_CUES).get(spec.source_factors.conduct or "", ())
+    return tuple(
+        span
+        for span in scope_spans(text, spec)
+        if any(cue in span.text for cue in source_cues)
+    )
 
 
 def plan_realization(parent_text: str, spec: InterventionSpec) -> Realization:
@@ -239,10 +232,13 @@ def plan_realization(parent_text: str, spec: InterventionSpec) -> Realization:
             return Realization("skip", parent_text, reason="no_amount_span")
         text = edited
     if "conduct" in spec.changed_fields:
-        span = _quote_span(text, spec)
-        if span is None:
-            return Realization("skip", parent_text, reason="no_target_span")
-        return Realization("span", text, span=span, quote=span.text)
+        clauses = _source_clauses(text, spec)
+        if not clauses:
+            return Realization("skip", parent_text, reason="no_source_conduct_span")
+        if len(clauses) > 1:
+            # A single quoted rewrite cannot make a multi-count description consistent.
+            return Realization("skip", parent_text, reason="incomplete_flip")
+        return Realization("span", text, span=clauses[0], quote=clauses[0].text)
     if text == parent_text:
         return Realization("skip", parent_text, reason="no_supported_field")
     return Realization("deterministic", parent_text, text=text)

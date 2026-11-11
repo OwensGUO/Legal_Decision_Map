@@ -218,7 +218,7 @@ def test_generation_progress_keeps_moving_while_a_request_is_in_flight(tmp_path)
             return super().generate(parent_text, spec, seed=seed, quote=quote)
 
     output = tmp_path / "generated.jsonl"
-    request = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec("charge_flip"))
+    request = GenerationRequest("某甲盗走他人财物，涉案1000元并认罪。", _spec("charge_flip"))
     stream = StringIO()
     holder: dict[str, object] = {}
 
@@ -333,7 +333,7 @@ def test_generate_records_retries_invalid_output(tmp_path) -> None:
         stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
     ) as progress:
         records = generate_records(
-            [GenerationRequest("某甲秘密取得财物。", _spec("charge_flip"))],
+            [GenerationRequest("某甲盗走他人财物。", _spec("charge_flip"))],
             generator,
             tmp_path / "failed.jsonl",
             generator_identity=generator_identity({"selector": "broken"}, mock=True),
@@ -626,12 +626,12 @@ def test_transport_failures_are_not_written_and_rejections_are(tmp_path) -> None
             raise GenerationRejectedError("HTTP 400: prompt too long")
 
     down = GenerationRequest(
-        "某甲秘密取得财物。",
+        "某甲盗走他人财物。",
         InterventionSpec.from_dict(
             {**_spec("charge_flip").to_dict(), "parent_case_id": "down"}
         ),
     )
-    rejected = GenerationRequest("某甲秘密取得财物。", _spec("charge_flip"))
+    rejected = GenerationRequest("某甲盗走他人财物。", _spec("charge_flip"))
     output = tmp_path / "flaky.jsonl"
     stream = StringIO()
     with create_progress_reporter(
@@ -698,9 +698,9 @@ def test_generate_records_progress_counts_valid_and_transport_failure(tmp_path) 
                 raise GenerationTransportError("connection refused")
             return MockGenerator().generate(parent_text, spec, seed=seed, quote=quote)
 
-    valid = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec("charge_flip"))
+    valid = GenerationRequest("某甲盗走他人财物，涉案1000元并认罪。", _spec("charge_flip"))
     down = GenerationRequest(
-        "某甲秘密取得财物，涉案1000元并认罪。",
+        "某甲盗走他人财物，涉案1000元并认罪。",
         InterventionSpec.from_dict(
             {**_spec("charge_flip").to_dict(), "parent_case_id": "down"}
         ),

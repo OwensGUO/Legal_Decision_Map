@@ -229,3 +229,36 @@ def test_multi_defendant_clause_is_edited_without_disturbing_the_neighbour() -> 
         plan.base_text, plan.span, "张三虚构事实骗取现金3000元"
     )
     assert spliced == "张三与李四共同盗窃，张三虚构事实骗取现金3000元，李四负责望风。"
+
+
+def test_multiple_source_clauses_are_refused_before_the_model_is_called() -> None:
+    """A multi-count case describes the same conduct twice; one rewrite cannot fix both."""
+    parent = "张三盗走被害人手机一部。张三又盗走被害人现金500元。"
+    plan = plan_realization(parent, _flip_spec())
+    assert plan.kind == "skip"
+    assert plan.reason == "incomplete_flip"
+
+
+def test_flip_without_any_source_clause_is_refused() -> None:
+    plan = plan_realization("张三与李四共同实施行为。", _flip_spec())
+    assert plan.kind == "skip"
+    assert plan.reason == "no_source_conduct_span"
+
+
+def test_amount_splice_ignores_a_literal_that_is_not_the_source_amount() -> None:
+    """A joint total or a compensation figure is a different fact from the case amount."""
+    parent = "张三盗走财物，被盗财物共计价值7062元。案发后张三家属赔偿损失共计7132.62元。"
+    plan = plan_realization(parent, _amount_spec(7062.0, 7132.62))
+    assert plan.kind == "deterministic"
+    assert plan.text is not None
+    # Only the case amount moves; the pre-existing compensation figure stays untouched.
+    assert "7062元" not in plan.text
+    assert "被盗财物共计价值7132.62元" in plan.text
+    assert "赔偿损失共计7132.62元" in plan.text
+
+
+def test_amount_skip_when_only_a_different_figure_is_present() -> None:
+    parent = "张三赔偿被害人共计7132.62元。"
+    plan = plan_realization(parent, _amount_spec(7062.0, 7132.62))
+    assert plan.kind == "skip"
+    assert plan.reason == "no_amount_span"
