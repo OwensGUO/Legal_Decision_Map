@@ -181,15 +181,20 @@ def _sentence_supports_change(sentence: str, spec: InterventionSpec) -> bool:
 
 
 def _target_scope(text: str, spec: InterventionSpec) -> str:
-    """Sentences that name the target and do not name another defendant."""
+    """Clauses that name the target and do not name another defendant.
+
+    Clause-level: a multi-defendant narrative carries the target's fact and a
+    co-defendant's fact in neighbouring clauses of one sentence, so sentence-level
+    scoping would discard the edited clause and report a missing change.
+    """
     others = _other_defendants(spec)
     if not others:
         return text
     return "".join(
-        sentence
-        for sentence in _clauses(text)
-        if spec.target_defendant in sentence
-        and not any(name in sentence for name in others)
+        clause
+        for clause in _clauses(text)
+        if spec.target_defendant in clause
+        and not any(name in clause for name in others)
     )
 
 

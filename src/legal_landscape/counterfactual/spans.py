@@ -85,17 +85,20 @@ def mentions(text: str, name: str, others: tuple[str, ...]) -> bool:
 
 
 def scope_spans(parent_text: str, spec: InterventionSpec) -> tuple[Span, ...]:
-    """Sentences that may carry the target defendant's fact.
+    """Clauses that may carry the target defendant's fact.
 
-    A sentence belongs to the target when it names the target and no other defendant,
-    or when it names nobody (a pronoun continuation). Sentences that only name another
-    defendant never belong to the target.
+    Clause-level rather than sentence-level: a multi-defendant narrative puts the
+    target's fact in one comma-separated clause and another defendant's in the next,
+    so a sentence-level rule discards most of the evidence. A clause belongs to the
+    target when it names the target and no other defendant, or when it names nobody
+    (a pronoun or impersonal continuation). Clauses naming only another defendant
+    never belong to the target.
     """
     others = other_defendants(spec)
     if not others:
-        return sentence_spans(parent_text)
+        return clause_spans(parent_text)
     kept: list[Span] = []
-    for span in sentence_spans(parent_text):
+    for span in clause_spans(parent_text):
         names_target = mentions(span.text, spec.target_defendant, others)
         names_other = any(name in span.text for name in others)
         if names_target and not names_other:
@@ -118,12 +121,16 @@ def _clause(value: bool) -> str:
 
 
 def _named_spans(spans: tuple[Span, ...], spec: InterventionSpec) -> tuple[Span, ...]:
-    """Spans that name the target. With co-defendants, an unnamed span may belong to anyone."""
+    """Spans that may carry the target's edit.
+
+    With co-defendants a clause must name the target, because an unnamed clause may
+    belong to anyone. A single-defendant case has exactly one actor, so a pronoun or
+    impersonal clause continues the same subject and stays eligible.
+    """
     others = other_defendants(spec)
-    named = tuple(span for span in spans if mentions(span.text, spec.target_defendant, others))
-    if others and not named:
-        return ()
-    return named or spans
+    if not others:
+        return spans
+    return tuple(span for span in spans if mentions(span.text, spec.target_defendant, others))
 
 
 def _naming(text: str, spec: InterventionSpec) -> str:
@@ -147,26 +154,18 @@ def _restationalize(text: str, spec: InterventionSpec) -> str | None:
     if not spans:
         return None
     others = other_defendants(spec)
-    edits: list[tuple[int, int, str]] = []
-    for span in spans:
-        for candidate in clause_spans(span.text):
-            if any(cue in candidate.text for cue in RESTITUTION_CUES):
-                # Keep any defendant name that sits before the clause; add one when absent.
-                head = span.text[: candidate.start]
-                replacement = ("" if mentions(head, spec.target_defendant, others) else (
-                    spec.target_defendant
-                )) + clause
-                start = span.start + candidate.start
-                edits.append((start, span.start + candidate.end, replacement))
+    # A multi-defendant edit must name the target; a single-defendant one keeps the
+    # sentence's existing subject.
+    prefix = spec.target_defendant if others else ""
+    edits: list[tuple[int, int, str]] = [
+        (span.start, span.end, prefix + clause)
+        for span in spans
+        if any(cue in span.text for cue in RESTITUTION_CUES)
+    ]
     if not edits:
-        # No explicit restitution clause: state the fact at the end of a target sentence.
+        # No explicit restitution clause: state the fact at the end of a target clause.
         anchor = spans[0]
-        body = anchor.text
-        terminator = body[-1] if body and body[-1] in TERMINATORS else ""
-        if terminator:
-            body = body[:-1]
-        prefix = "" if mentions(body, spec.target_defendant, others) else spec.target_defendant
-        edits.append((anchor.start, anchor.start + len(body), body + "，" + prefix + clause))
+        edits.append((anchor.start, anchor.end, anchor.text + "，" + prefix + clause))
     result = text
     for start, end, new in reversed(edits):
         result = result[:start] + new + result[end:]
@@ -246,12 +245,17 @@ def plan_realization(parent_text: str, spec: InterventionSpec) -> Realization:
 def splice(base_text: str, span: Span, replacement: str) -> tuple[str, Span]:
     """Insert one replacement sentence at the planned span and report its new offsets."""
     body = replacement.strip()
-    if body and body[-1] in TERMINATORS:
-        terminator = body[-1]
-        body = body[:-1]
+    if span.text and span.text[-1] in TERMINATORS:
+        # A whole sentence: keep exactly one terminator.
+        if body and body[-1] in TERMINATORS:
+            terminator = body[-1]
+            body = body[:-1]
+        else:
+            terminator = span.text[-1]
+        full = body + terminator
     else:
-        terminator = span.text[-1] if span.text and span.text[-1] in TERMINATORS else "。"
-    full = body + terminator
+        # A clause inside a sentence: never terminate it, or the sentence splits.
+        full = body.rstrip(TERMINATORS)
     return _splice(base_text, span, full), Span(span.start, span.start + len(full), full)
 
 

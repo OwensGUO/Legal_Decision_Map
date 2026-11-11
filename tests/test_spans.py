@@ -64,10 +64,11 @@ def test_mentions_does_not_read_one_name_inside_a_longer_co_defendant() -> None:
     assert mentions("李某到案。", "李某", ("李某A",)) is True
 
 
-def test_scope_spans_drops_sentences_about_other_defendants_only() -> None:
-    text = "张三未退赃。李四未退赃。"
+def test_scope_spans_drops_clauses_about_other_defendants_only() -> None:
+    text = "张三与李四共同盗窃，张三分得300元，李四分得200元。"
     kept = [span.text for span in scope_spans(text, _restitution_spec(co=("李四",)))]
-    assert kept == ["张三未退赃。"]
+    # The shared opening clause names both actors, so only the target's own clause survives.
+    assert kept == ["张三分得300元"]
 
 
 def test_restitution_is_spliced_deterministically_and_validates() -> None:
@@ -119,7 +120,7 @@ def test_structural_skip_needs_no_model_call() -> None:
 def test_flip_plan_quotes_the_source_behaviour_sentence() -> None:
     plan = plan_realization("张三窃取他人财物，涉案金额5000元。无人报警。", _flip_spec())
     assert plan.kind == "span"
-    assert plan.quote == "张三窃取他人财物，涉案金额5000元。"
+    assert plan.quote == "张三窃取他人财物"
 
 
 @pytest.mark.parametrize(
@@ -216,3 +217,15 @@ def test_all_three_intervention_types_realize_end_to_end(tmp_path) -> None:
     )
     assert [record["validation"]["valid"] for record in result.records] == [True, True, True]
     assert [record["retry_count"] for record in result.records] == [0, 0, 0]
+
+
+def test_multi_defendant_clause_is_edited_without_disturbing_the_neighbour() -> None:
+    parent = "张三与李四共同盗窃，张三窃取现金3000元，李四负责望风。"
+    spec = _flip_spec()
+    plan = plan_realization(parent, spec)
+    assert plan.kind == "span"
+    assert plan.quote == "张三窃取现金3000元"
+    spliced, _ = splice(
+        plan.base_text, plan.span, "张三虚构事实骗取现金3000元"
+    )
+    assert spliced == "张三与李四共同盗窃，张三虚构事实骗取现金3000元，李四负责望风。"
