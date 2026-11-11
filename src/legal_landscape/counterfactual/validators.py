@@ -52,7 +52,7 @@ _LEAKAGE_BY_CATEGORY = {
     "result_statement": "conclusion_leakage",
 }
 # Bumped when validation changes which generations are accepted. Training refuses older caches.
-VALIDATOR_VERSION = "2026-11-11-span-splice"
+VALIDATOR_VERSION = "2026-11-11-clause-scope"
 
 
 @dataclass(frozen=True)
@@ -139,8 +139,21 @@ def _amount_change_realized(text: str, spec: InterventionSpec, target_amount: fl
     )
 
 
+_SENTENCE_UNIT = re.compile(r"[^。；！？\n]+[。；！？\n]?")
+
+
+def _sentence_units(text: str) -> list[str]:
+    return [item for item in _SENTENCE_UNIT.findall(text) if item.strip()]
+
+
 def _clauses(text: str) -> list[str]:
-    return [item for item in re.findall(r"[^。；！？\n]+", text) if item.strip()]
+    """Comma-separated clauses.
+
+    A multi-defendant narrative states the target's fact and a co-defendant's fact in
+    neighbouring comma clauses of one sentence, so sentence-level units cannot attribute
+    an edit: every such sentence names both actors.
+    """
+    return [item for item in re.findall(r"[^，。；！？\n]+", text) if item.strip()]
 
 
 def _other_defendants(spec: InterventionSpec) -> tuple[str, ...]:
@@ -180,22 +193,37 @@ def _sentence_supports_change(sentence: str, spec: InterventionSpec) -> bool:
     return True
 
 
-def _target_scope(text: str, spec: InterventionSpec) -> str:
-    """Clauses that name the target and do not name another defendant.
+def _scope_clauses(text: str, spec: InterventionSpec) -> list[str]:
+    """Clauses whose facts belong to the target defendant.
 
-    Clause-level: a multi-defendant narrative carries the target's fact and a
-    co-defendant's fact in neighbouring clauses of one sentence, so sentence-level
-    scoping would discard the edited clause and report a missing change.
+    Clause-level, with sentence inheritance: a multi-defendant narrative puts the
+    target's fact and a co-defendant's fact in neighbouring clauses of one sentence,
+    so a sentence-level rule discards both. A clause that names nobody belongs to
+    whoever its own sentence names, which keeps an amount clause such as
+    价值50.5元 attached to its subject without letting a pronoun clause in a shared
+    sentence be read as the target's.
     """
     others = _other_defendants(spec)
     if not others:
+        return _clauses(text)
+    kept: list[str] = []
+    for sentence in _sentence_units(text):
+        sentence_target = spec.target_defendant in sentence
+        sentence_other = any(name in sentence for name in others)
+        for clause in _clauses(sentence):
+            names_target = spec.target_defendant in clause
+            names_other = any(name in clause for name in others)
+            if names_target and not names_other:
+                kept.append(clause)
+            elif not names_target and not names_other and sentence_target and not sentence_other:
+                kept.append(clause)
+    return kept
+
+
+def _target_scope(text: str, spec: InterventionSpec) -> str:
+    if not _other_defendants(spec):
         return text
-    return "".join(
-        clause
-        for clause in _clauses(text)
-        if spec.target_defendant in clause
-        and not any(name in clause for name in others)
-    )
+    return "".join(_scope_clauses(text, spec))
 
 
 def _attribution_ambiguous(text: str, spec: InterventionSpec) -> bool:
@@ -205,13 +233,18 @@ def _attribution_ambiguous(text: str, spec: InterventionSpec) -> bool:
         return False
     if _names_overlap(spec.target_defendant, others):
         return True
-    for sentence in _clauses(text):
-        if not _sentence_supports_change(sentence, spec):
-            continue
-        mentions_target = spec.target_defendant in sentence
-        mentions_other = any(name in sentence for name in others)
-        if mentions_target == mentions_other:
-            return True
+    for sentence in _sentence_units(text):
+        for clause in _clauses(sentence):
+            if not _sentence_supports_change(clause, spec):
+                continue
+            mentions_target = spec.target_defendant in clause
+            mentions_other = any(name in clause for name in others)
+            if not mentions_target and not mentions_other:
+                # Inherit the sentence, so a subject-less clause is not read as shared.
+                mentions_target = spec.target_defendant in sentence
+                mentions_other = any(name in sentence for name in others)
+            if mentions_target == mentions_other:
+                return True
     return False
 
 

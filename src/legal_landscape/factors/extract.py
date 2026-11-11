@@ -13,6 +13,9 @@ _AMOUNT = re.compile(
 )
 _SENTENCE = re.compile(r"[^。；！？\n]*[。；！？\n]?")
 _CLAUSE = re.compile(r"[^，。；！？\n]+")
+# Units keep their delimiter so joined text stays readable and amounts stay cued.
+_SENTENCE_UNIT = re.compile(r"[^。；！？\n]+[。；！？\n]?")
+_CLAUSE_UNIT = re.compile(r"[^，。；！？\n]+[，。；！？\n]?")
 _NEGATIONS = ("尚未", "未能", "拒不", "没有", "并未", "未", "不", "无")
 # Words that may sit between a real negation and the behaviour it negates.
 _NEGATION_GAPS = (
@@ -151,18 +154,34 @@ def _conduct(text: str) -> str | None:
 
 
 def _defendant_text(text: str, target: str, co_defendants: Iterable[str]) -> str:
-    """Drop sentences that mention only other defendants of the same case."""
+    """Drop comma clauses that mention only other defendants of the same case.
+
+    Clause-level, not sentence-level: a joint narrative states each actor's own
+    behaviour in a separate clause ("A 与 B 共同盗窃" / "A 窃取现金" / "B 望风"), so a
+    sentence-level filter would either keep a co-defendant's behaviour or drop the
+    target's own.
+    """
     others = [name for name in co_defendants if name and name != target]
     if not target or not others:
         return text
     containing_target = [name for name in others if target in name]
     kept: list[str] = []
-    for sentence in _SENTENCE.findall(text):
-        stripped = sentence
-        for name in containing_target:
-            stripped = stripped.replace(name, "")
-        if target in stripped or not any(name in sentence for name in others):
-            kept.append(sentence)
+    for sentence in _SENTENCE_UNIT.findall(text):
+        sentence_target = target in sentence or not any(
+            name in sentence for name in others
+        )
+        sentence_other = any(name in sentence for name in others)
+        for clause in _CLAUSE_UNIT.findall(sentence):
+            stripped = clause
+            for name in containing_target:
+                stripped = stripped.replace(name, "")
+            names_target = target in stripped
+            names_other = any(name in clause for name in others)
+            if names_target and not names_other:
+                kept.append(clause)
+            elif not names_target and not names_other and sentence_target and not sentence_other:
+                # Inherit the sentence: 价值50元 belongs to whoever its sentence names.
+                kept.append(clause)
     return "".join(kept) or text
 
 

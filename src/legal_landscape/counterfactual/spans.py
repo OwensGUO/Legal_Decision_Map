@@ -1,10 +1,11 @@
-"""Sentence-level realization: deterministic edits, one quoted rewrite, and splicing.
+"""Clause-level realization: deterministic edits, one quoted rewrite, and splicing.
 
-The generator no longer rewrites a whole case. A plan picks the exact sentence span
+The generator no longer rewrites a whole case. A plan picks the exact comma clause
 that carries the target defendant's fact, deterministic fields (amount, restitution)
 are edited in place, and only a behaviour flip asks the model for one replacement
 sentence. Attribution is therefore a property of the span, not of re-extraction from
-free text.
+free text. Clauses rather than sentences because a joint narrative names the target
+and a co-defendant in neighbouring clauses of the same sentence.
 """
 
 from __future__ import annotations
@@ -98,13 +99,18 @@ def scope_spans(parent_text: str, spec: InterventionSpec) -> tuple[Span, ...]:
     if not others:
         return clause_spans(parent_text)
     kept: list[Span] = []
-    for span in clause_spans(parent_text):
-        names_target = mentions(span.text, spec.target_defendant, others)
-        names_other = any(name in span.text for name in others)
-        if names_target and not names_other:
-            kept.append(span)
-        elif not names_target and not names_other:
-            kept.append(span)
+    for sentence in sentence_spans(parent_text):
+        names_target = mentions(sentence.text, spec.target_defendant, others)
+        names_other = any(name in sentence.text for name in others)
+        for clause in clause_spans(sentence.text):
+            span = Span(sentence.start + clause.start, sentence.start + clause.end, clause.text)
+            clause_target = mentions(clause.text, spec.target_defendant, others)
+            clause_other = any(name in clause.text for name in others)
+            if clause_target and not clause_other:
+                kept.append(span)
+            elif not clause_target and not clause_other and names_target and not names_other:
+                # Inherit the sentence: an unnamed clause belongs to its sentence's subject.
+                kept.append(span)
     return tuple(kept)
 
 
