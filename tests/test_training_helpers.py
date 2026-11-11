@@ -152,3 +152,57 @@ def test_best_checkpoint_ties_prefer_more_training_steps(tmp_path) -> None:
             json.dumps({"steps": steps, "validation_score": 0.5})
         )
     assert select_best_checkpoint(tmp_path) == tmp_path / "checkpoint-final"
+
+
+def test_trainable_checkpoint_load_ignores_quantization_metadata(tmp_path) -> None:
+    """NF4 checkpoints store bitsandbytes statistics that are not model parameters."""
+    torch = pytest.importorskip("torch")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    from legal_landscape.training.train import load_trainable_weights
+
+    class Net(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.frozen = torch.nn.Linear(2, 2)
+            self.head = torch.nn.Linear(2, 1)
+            self.frozen.requires_grad_(False)
+
+    model = Net()
+    trained_head = model.head.weight.detach().clone() + 1
+    trained_bias = model.head.bias.detach().clone() + 0.5
+    original_frozen = model.frozen.weight.detach().clone()
+    metadata = torch.arange(8, dtype=torch.float32)
+    safetensors_torch.save_file(
+        {
+            "module.head.weight": trained_head,
+            "module.head.bias": trained_bias,
+            "module.frozen.weight": torch.ones_like(original_frozen),
+            "module.frozen.bias": torch.ones_like(model.frozen.bias),
+            "module.frozen.weight.absmax": metadata.clone(),
+            "module.frozen.weight.quant_map": metadata.clone(),
+            "module.frozen.weight.nested_absmax": metadata.clone(),
+            "module.frozen.weight.nested_quant_map": metadata.clone(),
+            "module.frozen.weight.quant_state.bitsandbytes__nf4": metadata.clone(),
+        },
+        tmp_path / "model.safetensors",
+    )
+    model.head.weight.data.zero_()
+    model.head.bias.data.zero_()
+    load_trainable_weights(model, tmp_path)
+    assert torch.equal(model.head.weight, trained_head)
+    assert torch.equal(model.head.bias, trained_bias)
+    assert torch.equal(model.frozen.weight, original_frozen)
+
+
+def test_trainable_checkpoint_load_rejects_a_missing_parameter(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    from legal_landscape.training.train import load_trainable_weights
+
+    model = torch.nn.Linear(2, 1)
+    safetensors_torch.save_file(
+        {"weight": model.weight.detach().clone()},
+        tmp_path / "model.safetensors",
+    )
+    with pytest.raises(RuntimeError, match="missing trainable parameters"):
+        load_trainable_weights(model, tmp_path)

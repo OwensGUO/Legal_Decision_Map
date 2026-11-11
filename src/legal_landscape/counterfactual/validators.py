@@ -52,7 +52,7 @@ _LEAKAGE_BY_CATEGORY = {
     "result_statement": "conclusion_leakage",
 }
 # Bumped when validation changes which generations are accepted. Training refuses older caches.
-VALIDATOR_VERSION = "2026-10-27-scope-and-amount"
+VALIDATOR_VERSION = "2026-11-11-span-splice"
 
 
 @dataclass(frozen=True)

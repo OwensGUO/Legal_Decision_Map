@@ -29,7 +29,11 @@ from legal_landscape.counterfactual.provenance import (
 from legal_landscape.counterfactual.view import publish_request_view
 from legal_landscape.data.sanitize import SANITIZER_VERSION
 from legal_landscape.factors.schema import InterventionSpec, LegalFactors
-from legal_landscape.progress import create_progress_reporter
+from legal_landscape.progress import (
+    NullProgressReporter,
+    ProgressReporter,
+    create_progress_reporter,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -90,6 +94,15 @@ def _parent_meta(
     }
 
 
+def _count_parent_rows(path: Path, parent_limit: int | None) -> int:
+    total = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for total, _line in enumerate(handle, start=1):
+            if parent_limit is not None and total >= parent_limit:
+                break
+    return total
+
+
 def _requests(
     path: Path,
     limit: int,
@@ -97,6 +110,7 @@ def _requests(
     *,
     max_source_chars: int | None = None,
     parent_limit: int | None = None,
+    progress: ProgressReporter | None = None,
 ) -> tuple[list[GenerationRequest], int, dict[str, int], dict[str, object]]:
     """Build at most ``limit`` requests; cases longer than ``max_source_chars`` are skipped.
 
@@ -119,76 +133,91 @@ def _requests(
             "defendant_count": meta["defendant_count"],
         }
 
-    with path.open("r", encoding="utf-8") as handle:
-        for number, line in enumerate(handle, start=1):
-            if parent_limit is not None and number > parent_limit:
-                break
-            row = json.loads(line)
-            if "spec" in row:
-                spec = InterventionSpec.from_dict(row["spec"])
-                parent_text = row["parent_text"]
-                meta = _parent_meta(
-                    case_id=spec.parent_case_id,
-                    case_group_id=_case_group_id(row, spec.parent_case_id),
-                    chars=len(parent_text),
-                    charges=(spec.target_charge,) if spec.target_charge else (),
-                    defendant_count=1 + len(spec.co_defendants),
-                    length_excluded=False,
-                )
-                parents.append(meta)
-                remember(GenerationRequest(parent_text, spec), meta)
-            else:
-                # The generator only sees label-agnostic strict text, the same text the
-                # predictor reads for the parent case.
-                parent_text = row["fact_strict"]
-                charges = tuple(row["charges"])
-                defendant_count = 1 + len(tuple(row.get("co_defendants") or ()))
-                if max_source_chars is not None and len(parent_text) > max_source_chars:
-                    skipped_long += 1
-                    parents.append(
-                        _parent_meta(
+    reporter = progress if progress is not None else NullProgressReporter()
+    total = _count_parent_rows(path, parent_limit)
+    seen = 0
+    with reporter.task(
+        "Prepare counterfactual requests",
+        total=total or None,
+        requests=0,
+        skipped_long=0,
+    ) as task:
+        with path.open("r", encoding="utf-8") as handle:
+            for number, line in enumerate(handle, start=1):
+                if parent_limit is not None and number > parent_limit:
+                    break
+                seen = number
+                try:
+                    row = json.loads(line)
+                    if "spec" in row:
+                        spec = InterventionSpec.from_dict(row["spec"])
+                        parent_text = row["parent_text"]
+                        meta = _parent_meta(
+                            case_id=spec.parent_case_id,
+                            case_group_id=_case_group_id(row, spec.parent_case_id),
+                            chars=len(parent_text),
+                            charges=(spec.target_charge,) if spec.target_charge else (),
+                            defendant_count=1 + len(spec.co_defendants),
+                            length_excluded=False,
+                        )
+                        parents.append(meta)
+                        remember(GenerationRequest(parent_text, spec), meta)
+                    else:
+                        # The generator only sees label-agnostic strict text, the same text the
+                        # predictor reads for the parent case.
+                        parent_text = row["fact_strict"]
+                        charges = tuple(row["charges"])
+                        defendant_count = 1 + len(tuple(row.get("co_defendants") or ()))
+                        if max_source_chars is not None and len(parent_text) > max_source_chars:
+                            skipped_long += 1
+                            parents.append(
+                                _parent_meta(
+                                    case_id=str(row["case_id"]),
+                                    case_group_id=_case_group_id(row, str(row["case_id"])),
+                                    chars=len(parent_text),
+                                    charges=charges,
+                                    defendant_count=defendant_count,
+                                    length_excluded=True,
+                                )
+                            )
+                            continue
+                        factors = LegalFactors.from_dict(row["factors"])
+                        rank_reason = sentence_rank_exclusion(
+                            charges=charges,
+                            penalty_type=row.get("penalty_type"),
+                            imprisonment_months=row.get("imprisonment_months"),
+                            restitution=factors.restitution,
+                        )
+                        if rank_reason is not None:
+                            rank_exclusions[rank_reason] = rank_exclusions.get(rank_reason, 0) + 1
+                        meta = _parent_meta(
                             case_id=str(row["case_id"]),
                             case_group_id=_case_group_id(row, str(row["case_id"])),
                             chars=len(parent_text),
                             charges=charges,
                             defendant_count=defendant_count,
-                            length_excluded=True,
+                            length_excluded=False,
                         )
-                    )
-                    continue
-                factors = LegalFactors.from_dict(row["factors"])
-                rank_reason = sentence_rank_exclusion(
-                    charges=charges,
-                    penalty_type=row.get("penalty_type"),
-                    imprisonment_months=row.get("imprisonment_months"),
-                    restitution=factors.restitution,
-                )
-                if rank_reason is not None:
-                    rank_exclusions[rank_reason] = rank_exclusions.get(rank_reason, 0) + 1
-                meta = _parent_meta(
-                    case_id=str(row["case_id"]),
-                    case_group_id=_case_group_id(row, str(row["case_id"])),
-                    chars=len(parent_text),
-                    charges=charges,
-                    defendant_count=defendant_count,
-                    length_excluded=False,
-                )
-                parents.append(meta)
-                for spec in propose_interventions(
-                    parent_case_id=row["case_id"],
-                    defendant=row["target_defendant"],
-                    charges=charges,
-                    factors=factors,
-                    charge_boundaries=boundaries,
-                    co_defendants=tuple(row.get("co_defendants") or ()),
-                    penalty_type=row.get("penalty_type"),
-                    imprisonment_months=row.get("imprisonment_months"),
-                ):
-                    remember(GenerationRequest(parent_text, spec), meta)
+                        parents.append(meta)
+                        for spec in propose_interventions(
+                            parent_case_id=row["case_id"],
+                            defendant=row["target_defendant"],
+                            charges=charges,
+                            factors=factors,
+                            charge_boundaries=boundaries,
+                            co_defendants=tuple(row.get("co_defendants") or ()),
+                            penalty_type=row.get("penalty_type"),
+                            imprisonment_months=row.get("imprisonment_months"),
+                        ):
+                            remember(GenerationRequest(parent_text, spec), meta)
+                            if len(requests) >= limit:
+                                break
                     if len(requests) >= limit:
                         break
-            if len(requests) >= limit:
-                break
+                finally:
+                    task.advance(requests=len(requests), skipped_long=skipped_long)
+        if seen != total:
+            task.update(total=seen or None, requests=len(requests), skipped_long=skipped_long)
     return requests, skipped_long, rank_exclusions, {
         "parents": parents,
         "request_meta": request_meta,
@@ -257,15 +286,16 @@ def main() -> int:
         )
     )
     max_source_chars = config.get("max_source_chars")
-    requests, skipped_long, rank_exclusions, coverage_plan = _requests(
-        args.input,
-        args.limit,
-        boundaries,
-        max_source_chars=int(max_source_chars) if max_source_chars is not None else None,
-        parent_limit=args.parent_limit,
-    )
     try:
         with create_progress_reporter() as progress:
+            requests, skipped_long, rank_exclusions, coverage_plan = _requests(
+                args.input,
+                args.limit,
+                boundaries,
+                max_source_chars=int(max_source_chars) if max_source_chars is not None else None,
+                parent_limit=args.parent_limit,
+                progress=progress,
+            )
             result = generate_records(
                 requests,
                 generator,

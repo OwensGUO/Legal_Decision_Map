@@ -311,6 +311,163 @@ def prune_checkpoints(destination: str | Path, *, keep: set[Path]) -> list[Path]
     return removed
 
 
+_QUANTIZATION_METADATA_MARKERS = (
+    ".absmax",
+    ".quant_map",
+    ".nested_absmax",
+    ".nested_quant_map",
+    ".quant_state.",
+)
+
+
+def _is_quantization_metadata(key: str) -> bool:
+    return any(marker in key for marker in _QUANTIZATION_METADATA_MARKERS)
+
+
+def checkpoint_has_model_weights(checkpoint: str | Path) -> bool:
+    path = Path(checkpoint)
+    return any(
+        (path / name).is_file()
+        for name in ("model.safetensors", "pytorch_model.bin", "model.safetensors.index.json")
+    )
+
+
+def _checkpoint_weight_files(checkpoint: Path) -> list[Path]:
+    index = checkpoint / "model.safetensors.index.json"
+    if index.is_file():
+        payload = json.loads(index.read_text(encoding="utf-8"))
+        return sorted({checkpoint / name for name in payload["weight_map"].values()})
+    safe = checkpoint / "model.safetensors"
+    if safe.is_file():
+        return [safe]
+    binary = checkpoint / "pytorch_model.bin"
+    if binary.is_file():
+        return [binary]
+    raise FileNotFoundError(f"checkpoint has no model weights: {checkpoint}")
+
+
+def _saved_weight_sources(files: list[Path]) -> dict[str, Path]:
+    """Map checkpoint keys to the file that holds them, without reading tensor bytes."""
+    sources: dict[str, Path] = {}
+    for file in files:
+        if file.name.endswith(".safetensors"):
+            from safetensors import safe_open
+
+            with safe_open(file, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if not _is_quantization_metadata(key):
+                        sources[key] = file
+            continue
+        import torch
+
+        blob = torch.load(file, map_location="cpu", weights_only=False)
+        for key, value in blob.items():
+            if not _is_quantization_metadata(key) and hasattr(value, "detach"):
+                sources[key] = file
+    return sources
+
+
+def _saved_key(name: str, sources: dict[str, Path]) -> str | None:
+    if name in sources:
+        return name
+    prefixed = f"module.{name}"
+    if prefixed in sources:
+        return prefixed
+    return None
+
+
+def load_trainable_weights(module: Any, checkpoint: str | Path) -> None:
+    """Copy saved parameters that require gradients into ``module``.
+
+    Accelerate writes the frozen NF4 backbone and bitsandbytes quantization
+    statistics into the same file. Loading that file onto the GPU allocates
+    those statistics again and then rejects them, because they are not
+    parameters. QLoRA does not change the backbone, so those entries stay on
+    disk and only adapter and head weights are copied.
+    """
+    files = _checkpoint_weight_files(Path(checkpoint))
+    sources = _saved_weight_sources(files)
+    trainable = [
+        (name, parameter)
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
+    ]
+    missing = [name for name, _parameter in trainable if _saved_key(name, sources) is None]
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise RuntimeError(f"checkpoint is missing trainable parameters: {preview}")
+    grouped: dict[Path, list[tuple[Any, str]]] = {}
+    for name, parameter in trainable:
+        key = _saved_key(name, sources)
+        if key is None:
+            continue
+        grouped.setdefault(sources[key], []).append((parameter, key))
+    import torch
+
+    for file, items in grouped.items():
+        if file.name.endswith(".safetensors"):
+            from safetensors import safe_open
+
+            with safe_open(file, framework="pt", device="cpu") as handle:
+                for parameter, key in items:
+                    _copy_checkpoint_tensor(parameter, handle.get_tensor(key))
+            continue
+        blob = torch.load(file, map_location="cpu", weights_only=False)
+        for parameter, key in items:
+            _copy_checkpoint_tensor(parameter, blob[key])
+
+
+def _copy_checkpoint_tensor(parameter: Any, value: Any) -> None:
+    import torch
+
+    with torch.no_grad():
+        parameter.copy_(value.detach().to(device=parameter.device, dtype=parameter.dtype))
+
+
+def _restore_rng_state(checkpoint: Path, process_index: int) -> None:
+    import torch
+
+    path = checkpoint / f"random_states_{process_index}.pkl"
+    if not path.is_file():
+        return
+    states = torch.load(path, map_location="cpu", weights_only=False)
+    random.setstate(states["random_state"])
+    numpy_state = states.get("numpy_random_seed")
+    if numpy_state is not None:
+        import numpy as np
+
+        np.random.set_state(numpy_state)
+    manual_seed = states["torch_manual_seed"]
+    torch.set_rng_state(manual_seed.cpu() if hasattr(manual_seed, "cpu") else manual_seed)
+    cuda_state = states.get("torch_cuda_manual_seed")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def restore_training_checkpoint(
+    module: Any,
+    checkpoint: str | Path,
+    *,
+    optimizer: Any | None = None,
+    process_index: int = 0,
+    restore_training_state: bool = False,
+) -> None:
+    """Restore trainable weights, and optionally the Adam and RNG state."""
+    destination = Path(checkpoint)
+    load_trainable_weights(module, destination)
+    if not restore_training_state:
+        return
+    if optimizer is None:
+        raise ValueError("optimizer is required when restoring training state")
+    import torch
+
+    optimizer_path = destination / "optimizer.bin"
+    if not optimizer_path.is_file():
+        raise FileNotFoundError(f"optimizer state not found: {optimizer_path}")
+    optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
+    _restore_rng_state(destination, process_index)
+
+
 def _file_identity(path: str | Path) -> dict[str, int | str]:
     source = Path(path)
     digest = hashlib.sha256()
@@ -2041,6 +2198,24 @@ def run_real_training(
         pair_loader = _untracked_counterfactual_loader(
             pairs, pair_sampler, collate_pairs, accelerator
         )
+
+    def restore_saved_state(path: str | Path, *, restore_training_state: bool) -> None:
+        checkpoint = Path(path)
+        # Test doubles and incomplete folders have no weight file. Real Accelerate
+        # checkpoints do, and their full safetensors load rejects NF4 statistics.
+        if not checkpoint_has_model_weights(checkpoint):
+            accelerator.load_state(str(checkpoint))
+            return
+        unwrap = getattr(accelerator, "unwrap_model", None)
+        module = unwrap(predictor) if callable(unwrap) else predictor
+        restore_training_checkpoint(
+            module,
+            checkpoint,
+            optimizer=optimizer,
+            process_index=int(getattr(accelerator, "process_index", 0)),
+            restore_training_state=restore_training_state,
+        )
+
     if resume_from_checkpoint is not None:
         if int(accelerator.num_processes) != int(compatibility["num_processes"]):
             raise ValueError(
@@ -2049,7 +2224,7 @@ def run_real_training(
                 f"current={accelerator.num_processes}. Sampler cursors are not valid "
                 "across a world-size change; start a new run."
             )
-        accelerator.load_state(str(resume_from_checkpoint))
+        restore_saved_state(resume_from_checkpoint, restore_training_state=True)
     destination.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(destination / "tensorboard") if accelerator.is_main_process else None
     log_path = destination / "train.jsonl"
@@ -2480,7 +2655,7 @@ def run_real_training(
             ]
             broadcast_object_list(choice)
             if Path(str(choice[0])) != final_checkpoint:
-                accelerator.load_state(str(choice[0]))
+                restore_saved_state(str(choice[0]), restore_training_state=False)
                 selected_checkpoint = Path(str(choice[0]))
         result: dict[str, Any] = {
             "steps": step,

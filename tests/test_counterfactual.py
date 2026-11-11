@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from io import StringIO
 
 import pytest
@@ -205,6 +207,58 @@ def test_validator_rejects_identity_label_sentence_leakage_and_unchanged_text() 
     assert "unchanged" in result.errors
 
 
+def test_generation_progress_keeps_moving_while_a_request_is_in_flight(tmp_path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingGenerator(MockGenerator):
+        def generate(self, parent_text, spec, *, seed, quote=None):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().generate(parent_text, spec, seed=seed, quote=quote)
+
+    output = tmp_path / "generated.jsonl"
+    request = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec("charge_flip"))
+    stream = StringIO()
+    holder: dict[str, object] = {}
+
+    def run() -> None:
+        with create_progress_reporter(
+            stream=stream,
+            environ={"PROGRESS": "never", "LC_ALL": "C"},
+            is_terminal=False,
+            plain_interval=0,
+        ) as progress:
+            holder["result"] = generate_records(
+                [request],
+                BlockingGenerator(),
+                output,
+                generator_identity=generator_identity({"selector": "mock"}, mock=True),
+                prompt_version="v1",
+                sampling={"temperature": 0.0},
+                seed=42,
+                retries=0,
+                progress=progress,
+            )
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert started.wait(5)
+    deadline = time.monotonic() + 3
+    running = ""
+    while time.monotonic() < deadline:
+        running = stream.getvalue()
+        if "progress" in running and "[----------------]" in running:
+            break
+        time.sleep(0.05)
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert "progress" in running
+    assert "[----------------]" in running
+    assert holder["result"].records  # type: ignore[attr-defined]
+
+
 def test_generate_records_persists_provenance_and_resumes(tmp_path) -> None:
     output = tmp_path / "generated.jsonl"
     request = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec())
@@ -269,7 +323,7 @@ def test_generate_records_retries_invalid_output(tmp_path) -> None:
     class BrokenGenerator:
         calls = 0
 
-        def generate(self, parent_text, spec, *, seed):
+        def generate(self, parent_text, spec, *, seed, quote=None):
             self.calls += 1
             return "not-json"
 
@@ -279,7 +333,7 @@ def test_generate_records_retries_invalid_output(tmp_path) -> None:
         stream=stream, environ={"PROGRESS": "never"}, is_terminal=False, plain_interval=0
     ) as progress:
         records = generate_records(
-            [GenerationRequest("某甲事实。", _spec())],
+            [GenerationRequest("某甲秘密取得财物。", _spec("charge_flip"))],
             generator,
             tmp_path / "failed.jsonl",
             generator_identity=generator_identity({"selector": "broken"}, mock=True),
@@ -566,15 +620,18 @@ def test_transport_failures_are_not_written_and_rejections_are(tmp_path) -> None
     )
 
     class FlakyGenerator:
-        def generate(self, parent_text, spec, *, seed):
+        def generate(self, parent_text, spec, *, seed, quote=None):
             if spec.parent_case_id == "down":
                 raise GenerationTransportError("connection refused")
             raise GenerationRejectedError("HTTP 400: prompt too long")
 
     down = GenerationRequest(
-        "某甲事实。", InterventionSpec.from_dict({**_spec().to_dict(), "parent_case_id": "down"})
+        "某甲秘密取得财物。",
+        InterventionSpec.from_dict(
+            {**_spec("charge_flip").to_dict(), "parent_case_id": "down"}
+        ),
     )
-    rejected = GenerationRequest("某甲事实。", _spec())
+    rejected = GenerationRequest("某甲秘密取得财物。", _spec("charge_flip"))
     output = tmp_path / "flaky.jsonl"
     stream = StringIO()
     with create_progress_reporter(
@@ -636,15 +693,17 @@ def test_generate_records_progress_counts_valid_and_transport_failure(tmp_path) 
     from legal_landscape.counterfactual.generate import GenerationTransportError
 
     class MixedGenerator:
-        def generate(self, parent_text, spec, *, seed):
+        def generate(self, parent_text, spec, *, seed, quote=None):
             if spec.parent_case_id == "down":
                 raise GenerationTransportError("connection refused")
-            return MockGenerator().generate(parent_text, spec, seed=seed)
+            return MockGenerator().generate(parent_text, spec, seed=seed, quote=quote)
 
-    valid = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec())
+    valid = GenerationRequest("某甲秘密取得财物，涉案1000元并认罪。", _spec("charge_flip"))
     down = GenerationRequest(
         "某甲秘密取得财物，涉案1000元并认罪。",
-        InterventionSpec.from_dict({**_spec().to_dict(), "parent_case_id": "down"}),
+        InterventionSpec.from_dict(
+            {**_spec("charge_flip").to_dict(), "parent_case_id": "down"}
+        ),
     )
     stream = StringIO()
     with create_progress_reporter(

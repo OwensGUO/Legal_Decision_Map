@@ -42,6 +42,8 @@ class ProgressTask(Protocol):
 
     def fail(self, **fields: Scalar) -> None: ...
 
+    def pulse(self) -> None: ...
+
 
 class ProgressReporter(AbstractContextManager["ProgressReporter"], Protocol):
     def task(
@@ -84,6 +86,9 @@ class _NullTask(AbstractContextManager["_NullTask"]):
         pass
 
     def fail(self, **fields: Scalar) -> None:
+        pass
+
+    def pulse(self) -> None:
         pass
 
 
@@ -158,6 +163,24 @@ def _details(fields: Mapping[str, Scalar], *, ascii_only: bool) -> str:
     )
 
 
+def _bar(
+    completed: float, total: float | None, *, ascii_only: bool, width: int = 16,
+) -> str:
+    """A fixed-width bar. Brackets stay visible when the fill glyphs do not."""
+    if total is None or total <= 0:
+        return ""
+    ratio = min(1.0, max(0.0, float(completed) / float(total)))
+    filled = int(ratio * width)
+    if completed > 0 and filled == 0:
+        filled = 1
+    if completed >= total:
+        filled = width
+    filled = min(width, max(0, filled))
+    if ascii_only:
+        return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+    return "[" + ("█" * filled) + ("░" * (width - filled)) + "]"
+
+
 def _timing(
     completed: float, initial: float, total: float | None, elapsed: float, status: str,
 ) -> str:
@@ -218,6 +241,9 @@ class _PlainTask(AbstractContextManager["_PlainTask"]):
         timing = _timing(self.completed, self.initial_completed, self.total, elapsed, status)
         if timing:
             line += f" {timing}"
+        bar = _bar(self.completed, self.total, ascii_only=self.reporter.ascii_only)
+        if bar:
+            line += f" {bar}"
         if details:
             line += f" {details}"
         self.reporter._write(line + "\n")
@@ -263,6 +289,9 @@ class _PlainTask(AbstractContextManager["_PlainTask"]):
 
     def fail(self, **fields: Scalar) -> None:
         self._finish("failed", **fields)
+
+    def pulse(self) -> None:
+        self._intermediate()
 
 
 class PlainProgressReporter(AbstractContextManager["PlainProgressReporter"]):
@@ -319,19 +348,9 @@ class _StableBarColumn(ProgressColumn):
         self.width = width
 
     def render(self, task: Task) -> Text:
-        total = task.total
-        if total is None or total <= 0:
-            return Text("")
-        ratio = min(1.0, max(0.0, float(task.completed) / float(total)))
-        filled = int(ratio * self.width)
-        if task.completed > 0 and filled == 0:
-            filled = 1
-        if task.completed >= total:
-            filled = self.width
-        filled = min(self.width, max(0, filled))
-        if self.ascii_only:
-            return Text("[" + ("#" * filled) + ("-" * (self.width - filled)) + "]")
-        return Text(("█" * filled) + ("░" * (self.width - filled)))
+        return Text(_bar(
+            task.completed or 0, task.total, ascii_only=self.ascii_only, width=self.width,
+        ))
 
 
 class _TimingColumn(ProgressColumn):
@@ -479,6 +498,7 @@ class _RichTask(AbstractContextManager["_RichTask"]):
         self.stopped: float | None = None
         self.task_id: int | None = None
         self.plain_task: _PlainTask | None = None
+        self.mirror_task: _PlainTask | None = None
         self.finished = False
         self.final_status: str | None = None
 
@@ -495,12 +515,24 @@ class _RichTask(AbstractContextManager["_RichTask"]):
             )
             self.plain_task.__enter__()
 
+    def _activate_mirror(self) -> None:
+        mirror = self.reporter.mirror
+        if mirror is None or self.mirror_task is not None or self.plain_task is not None:
+            return
+        self.mirror_task = _PlainTask(
+            mirror, self.description, self.total, self.completed, dict(self.fields),
+            started=self.started, initial_completed=self.initial_completed,
+            stopped=self.stopped,
+        )
+        self.mirror_task.__enter__()
+
     def __enter__(self) -> Self:
         self.reporter.active.append(self)
         if self.reporter.plain is not None:
             self._activate_plain()
         else:
             self.reporter._render(lambda progress: self._add_rich_task(progress))
+            self._activate_mirror()
         return self
 
     def _add_rich_task(self, progress: Progress) -> None:
@@ -540,6 +572,8 @@ class _RichTask(AbstractContextManager["_RichTask"]):
             self.plain_task.advance(amount, **fields)
         else:
             self._refresh()
+            if self.mirror_task is not None:
+                self.mirror_task.advance(amount, **fields)
 
     def update(
         self,
@@ -562,6 +596,10 @@ class _RichTask(AbstractContextManager["_RichTask"]):
             )
         else:
             self._refresh()
+            if self.mirror_task is not None:
+                self.mirror_task.update(
+                    completed=completed, total=total, description=description, **fields
+                )
 
     def _finish(self, status: str, **fields: Scalar) -> None:
         if self.finished:
@@ -577,12 +615,22 @@ class _RichTask(AbstractContextManager["_RichTask"]):
             self._refresh(status, force=True)
             if self.plain_task is not None:
                 self.plain_task._finish(status, **fields)
+            elif self.mirror_task is not None:
+                self.mirror_task._finish(status, **fields)
 
     def succeed(self, **fields: Scalar) -> None:
         self._finish("completed", **fields)
 
     def fail(self, **fields: Scalar) -> None:
         self._finish("failed", **fields)
+
+    def pulse(self) -> None:
+        if self.plain_task is not None:
+            self.plain_task.pulse()
+            return
+        self._refresh()
+        if self.mirror_task is not None:
+            self.mirror_task.pulse()
 
     def __exit__(self, *exc: object) -> bool:
         if not self.finished:
@@ -609,6 +657,9 @@ class RichProgressReporter(AbstractContextManager["RichProgressReporter"]):
         self.plain_interval = plain_interval
         self.ascii_only = ascii_only
         self.plain: PlainProgressReporter | None = None
+        # Set when Rich will not redraw until the reporter closes. TERM=dumb and
+        # TERM=unknown, common on servers, are in that group.
+        self.mirror: PlainProgressReporter | None = None
         self.active: list[_RichTask] = []
         self.finished: list[_RichTask] = []
         self.refresh_interval = 0.1
@@ -651,6 +702,13 @@ class RichProgressReporter(AbstractContextManager["RichProgressReporter"]):
             self._fallback()
             assert self.plain is not None
             return self.plain
+        console = getattr(self.progress, "console", None)
+        if console is not None and not getattr(console, "is_interactive", False):
+            # Rich leaves the display blank until close when the terminal is dumb.
+            self.mirror = PlainProgressReporter(
+                self.stream, clock=self.clock, interval=self.plain_interval,
+                ascii_only=self.ascii_only,
+            )
         return self
 
     def __exit__(self, *exc: object) -> bool:

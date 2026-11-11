@@ -210,6 +210,46 @@ def test_disabled_reporter_is_silent_even_when_progress_is_always():
     assert stream.getvalue() == ""
 
 
+def test_plain_progress_line_includes_a_bar_when_the_total_is_known():
+    stream = io.StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={"PROGRESS": "never", "LC_ALL": "C"},
+        is_terminal=False,
+        plain_interval=0,
+    ) as reporter:
+        with reporter.task("Generate counterfactuals", total=4) as task:
+            started = stream.getvalue()
+            task.update(completed=2)
+    rendered = stream.getvalue()
+    assert "Generate counterfactuals: 0/4 started" in started
+    assert "[----------------]" in started
+    assert "[########--------]" in rendered
+    assert "completed" in rendered.splitlines()[-1]
+
+
+def test_dumb_terminal_shows_a_bar_while_generation_is_still_running(monkeypatch):
+    monkeypatch.setenv("TERM", "dumb")
+    stream = io.StringIO()
+    with create_progress_reporter(
+        stream=stream,
+        environ={
+            "PROGRESS": "always",
+            "TERM": "dumb",
+            "NO_COLOR": "1",
+            "LC_ALL": "C",
+            "COLUMNS": "80",
+        },
+        is_terminal=True,
+    ) as reporter:
+        with reporter.task("Generate counterfactuals", total=4) as task:
+            running = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stream.getvalue())
+            task.update(completed=1)
+    assert "Generate counterfactuals" in running
+    assert "0/4" in running
+    assert "[----------------]" in running
+
+
 def test_plain_progress_rate_limits_only_intermediate_updates():
     stream = io.StringIO()
     time = [0.0]
@@ -266,8 +306,10 @@ def test_rich_progress_uses_a_stable_bar_instead_of_a_spinner():
         is_terminal=True,
     ) as reporter:
         with reporter.task("Generate counterfactuals", total=4) as task:
+            empty = _visible_progress(reporter)
             task.update(completed=2)
             running = _visible_progress(reporter)
+    assert "[░░░░░░░░░░░░░░░░]" in empty
     finished = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stream.getvalue())
     assert "████████░░░░░░░░" in running
     assert "████████░░░░░░░░" in finished

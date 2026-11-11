@@ -172,10 +172,11 @@ def test_generation_transport_failure_preserves_previous_request_view(tmp_path, 
     view = tmp_path / "current.jsonl"
     view.write_text("previous view\n")
     spec = InterventionSpec(
-        "c1", "某甲", "sentence_rank", LegalFactors(restitution=False),
-        LegalFactors(restitution=True), None, -1, ("restitution",), "refund",
+        "c1", "某甲", "charge_flip",
+        LegalFactors(conduct="秘密窃取"), LegalFactors(conduct="虚构事实使被害人自愿交付"),
+        "诈骗", None, ("conduct",), "boundary",
     )
-    source.write_text(json.dumps({"parent_text": "某甲未退赃。", "spec": spec.to_dict()}) + "\n")
+    source.write_text(json.dumps({"parent_text": "某甲盗走手机。", "spec": spec.to_dict()}) + "\n")
 
     def fail_generate(*args, **kwargs):
         raise GenerationTransportError("service unavailable")
@@ -315,8 +316,10 @@ def test_generate_counterfactuals_progress_stays_in_stderr(tmp_path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["generated"] == 1
+    assert "Prepare counterfactual requests" in result.stderr
     assert "Generate counterfactuals: 1/1 completed" in result.stderr
     assert "valid=1 invalid=0 failed=0 resumed=0 duplicate=0" in result.stderr
+    assert "[################]" in result.stderr or "[████████████████]" in result.stderr
 
 
 def test_build_dataset_progress_writes_traceable_processed_records(tmp_path) -> None:

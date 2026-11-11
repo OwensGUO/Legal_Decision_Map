@@ -1,4 +1,8 @@
-"""Versioned prompts for constrained counterfactual realization."""
+"""Versioned prompts for constrained counterfactual realization.
+
+A behaviour flip asks for one replacement sentence, not a rewritten case. Amount and
+restitution edits never reach the model; see ``spans.plan_realization``.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import json
 from legal_landscape.factors.extract import CONDUCT_CUES
 from legal_landscape.factors.schema import InterventionSpec
 
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v5"
 
 _CUES = dict(CONDUCT_CUES)
 
@@ -33,15 +37,39 @@ def _edit(field: str, value: object, defendant: str) -> str:
     return f"把{defendant}的{field}改写为{value}。"
 
 
-def build_messages(parent_text: str, spec: InterventionSpec) -> list[dict[str, str]]:
-    system = (
-        "你是法律事实改写器。只修改指定的事实要素，其余文字尽量逐字保留，"
-        "保持其他事实要素与被告人身份不变，不要改写其他被告人的事实。"
-        "原文中的“××”和“[已屏蔽]”是遮蔽标记，"
-        "必须原样保留，不得补全、替换或删除。不得写出任何罪名、法条、刑罚、量刑建议"
-        "或法律评价（例如“构成××罪”“从轻处罚”）。不要输出思维过程。"
-        "只返回JSON对象：{\"counterfactual_text\": 改写后的完整案件事实}。"
-    )
+_SYSTEM = (
+    "你是法律事实改写器。只修改指定的事实要素，其余文字保持不变，"
+    "保持其他事实要素与被告人身份不变，不要改写其他被告人的事实。"
+    "原文中的“××”和“[已屏蔽]”是遮蔽标记，"
+    "必须原样保留，不得补全、替换或删除。不得写出任何罪名、法条、刑罚、量刑建议"
+    "或法律评价（例如“构成××罪”“从轻处罚”）。不要输出思维过程。"
+)
+_SPAN_SYSTEM = (
+    _SYSTEM
+    + "只重写给定的那一句，保留句末标点，句子中必须出现目标被告人的姓名。"
+    "只返回JSON对象：{\"replacement_sentence\": 重写后的那一句}。"
+)
+
+
+def build_messages(
+    parent_text: str, spec: InterventionSpec, *, quote: str | None = None
+) -> list[dict[str, str]]:
+    """Prompt for one request. ``quote`` selects the sentence-level protocol."""
+    if quote is not None:
+        user = {
+            "source_sentence": quote,
+            "target_defendant": spec.target_defendant,
+            "other_defendants": list(spec.co_defendants),
+            "edits": [
+                _edit(field, getattr(spec.target_factors, field), spec.target_defendant)
+                for field in spec.changed_fields
+            ],
+            "response_schema": {"replacement_sentence": "string"},
+        }
+        return [
+            {"role": "system", "content": _SPAN_SYSTEM},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ]
     user = {
         "source_text": parent_text,
         "target_defendant": spec.target_defendant,
@@ -53,6 +81,6 @@ def build_messages(parent_text: str, spec: InterventionSpec) -> list[dict[str, s
         "response_schema": {"counterfactual_text": "string"},
     }
     return [
-        {"role": "system", "content": system},
+        {"role": "system", "content": _SYSTEM},
         {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
     ]

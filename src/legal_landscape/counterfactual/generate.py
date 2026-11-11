@@ -16,6 +16,11 @@ from typing import Any, Protocol
 
 from legal_landscape.counterfactual.prompts import PROMPT_VERSION, build_messages
 from legal_landscape.counterfactual.provenance import MANIFEST_NAME, ensure_manifest
+from legal_landscape.counterfactual.spans import (
+    plan_realization,
+    replacement_problem,
+    splice,
+)
 from legal_landscape.counterfactual.validators import (
     VALIDATOR_VERSION,
     ValidationResult,
@@ -28,10 +33,19 @@ from legal_landscape.factors.schema import InterventionSpec
 from legal_landscape.progress import NullProgressReporter, ProgressReporter
 
 _RESTITUTION_MENTION = re.compile(r"(?:未能|拒不|没有|未|已)?(?:退赃|退赔|返还赃款)")
+# Keep the progress display alive while a vLLM call is still running.
+_PROGRESS_POLL_SECONDS = 0.25
 
 
 class CounterfactualGenerator(Protocol):
-    def generate(self, parent_text: str, spec: InterventionSpec, *, seed: int) -> str: ...
+    def generate(
+        self,
+        parent_text: str,
+        spec: InterventionSpec,
+        *,
+        seed: int,
+        quote: str | None = None,
+    ) -> str: ...
 
 
 class GenerationTransportError(RuntimeError):
@@ -91,8 +105,36 @@ class MockGenerator:
 
     model_revision = "mock-v1"
 
-    def generate(self, parent_text: str, spec: InterventionSpec, *, seed: int) -> str:
+    def generate(
+        self,
+        parent_text: str,
+        spec: InterventionSpec,
+        *,
+        seed: int,
+        quote: str | None = None,
+    ) -> str:
         del seed
+        if quote is not None:
+            cues = dict(CONDUCT_CUES)
+            terminator = quote[-1] if quote and quote[-1] in "。；！？" else "。"
+            body = quote.rstrip("。；！？\n")
+            target = cues.get(spec.target_factors.conduct, (str(spec.target_factors.conduct),))[0]
+            swapped = False
+            for cue in sorted(
+                cues.get(spec.source_factors.conduct or "", ()), key=len, reverse=True
+            ):
+                if cue in body:
+                    body = body.replace(cue, target, 1)
+                    swapped = True
+                    break
+            if not swapped:
+                body = f"{body}，其行为表现为{target}"
+            payload = {"replacement_sentence": body + terminator}
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        plan = plan_realization(parent_text, spec)
+        if plan.kind == "deterministic" and plan.text is not None:
+            payload = {"counterfactual_text": plan.text}
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True)
         text = parent_text
         fragments = [spec.target_defendant]
         cues = dict(CONDUCT_CUES)
@@ -168,13 +210,20 @@ class VLLMHTTPGenerator:
             self._client.close()
             self._client = None
 
-    def generate(self, parent_text: str, spec: InterventionSpec, *, seed: int) -> str:
+    def generate(
+        self,
+        parent_text: str,
+        spec: InterventionSpec,
+        *,
+        seed: int,
+        quote: str | None = None,
+    ) -> str:
         import httpx
 
         client = self._http()
         payload = {
             "model": self.model,
-            "messages": build_messages(parent_text, spec),
+            "messages": build_messages(parent_text, spec, quote=quote),
             "seed": seed,
             "response_format": {"type": "json_object"},
             "chat_template_kwargs": {"enable_thinking": False},
@@ -213,6 +262,18 @@ def _completed(path: Path) -> set[str]:
     return result
 
 
+def _replacement_sentence(raw: str) -> str | None:
+    """The replacement sentence from a span-protocol response, or None."""
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get("replacement_sentence")
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _realize(
     request: GenerationRequest,
     generator: CounterfactualGenerator,
@@ -225,28 +286,56 @@ def _realize(
     min_similarity: float,
     charge_lexicon: tuple[str, ...],
 ) -> dict[str, Any]:
-    """Generate one request, retrying outputs that fail validation."""
+    """Realize one request: splice a deterministic edit or retry a quoted sentence."""
+    spec = request.spec
+    plan = plan_realization(request.parent_text, spec)
     raw = ""
     result = None
     retry_count = 0
-    for retry_count in range(retries + 1):
-        try:
-            raw = generator.generate(request.parent_text, request.spec, seed=seed + retry_count)
-        except GenerationRejectedError as exc:
-            raw = ""
-            result = ValidationResult(False, (f"request_rejected: {exc}",), None, None)
-            break
+    if plan.kind == "skip":
+        # Structural: the parent has no span that can carry the edit. Never retried.
+        result = ValidationResult(False, (f"unrealizable:{plan.reason}",), None, None)
+    elif plan.kind == "deterministic":
+        raw = json.dumps({"counterfactual_text": plan.text}, ensure_ascii=False)
         result = validate_generation(
-            request.parent_text,
-            request.spec,
-            raw,
-            min_similarity=min_similarity,
-            charge_lexicon=charge_lexicon,
+            request.parent_text, spec, raw,
+            min_similarity=min_similarity, charge_lexicon=charge_lexicon,
         )
-        if result.valid:
-            break
+    else:
+        assert plan.span is not None and plan.quote is not None
+        for retry_count in range(retries + 1):
+            try:
+                raw = generator.generate(
+                    request.parent_text, spec, seed=seed + retry_count, quote=plan.quote
+                )
+            except GenerationRejectedError as exc:
+                raw = ""
+                result = ValidationResult(False, (f"request_rejected: {exc}",), None, None)
+                break
+            replacement = _replacement_sentence(raw)
+            problem = (
+                "missing_replacement_sentence"
+                if replacement is None
+                else replacement_problem(spec, plan.span.text, replacement)
+            )
+            if problem is not None:
+                result = ValidationResult(False, (problem,), None, None)
+                continue
+            spliced, _ = splice(plan.base_text, plan.span, replacement or "")
+            result = validate_generation(
+                request.parent_text,
+                spec,
+                json.dumps({"counterfactual_text": spliced}, ensure_ascii=False),
+                min_similarity=min_similarity,
+                charge_lexicon=charge_lexicon,
+            )
+            if result.valid:
+                raw = json.dumps(
+                    {"replacement_sentence": replacement, "counterfactual_text": spliced},
+                    ensure_ascii=False,
+                )
+                break
     assert result is not None
-    spec = request.spec
     return {
         "generation_id": request.generation_id,
         "parent_case_id": spec.parent_case_id,
@@ -258,6 +347,9 @@ def _realize(
         "target_charge": spec.target_charge,
         "rank_direction": spec.rank_direction,
         "rule_id": spec.rule_id,
+        # deterministic: spliced without the model; span: one quoted rewrite; skip: no span.
+        "realization": plan.kind,
+        "realization_reason": plan.reason,
         "co_defendants": list(spec.co_defendants),
         "model_revision": generator_identity["checkpoint_fingerprint"],
         "generator_identity": dict(generator_identity),
@@ -364,7 +456,12 @@ def generate_records(
 
         refill()
         while in_flight:
-            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            done, _ = wait(
+                in_flight, timeout=_PROGRESS_POLL_SECONDS, return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                progress_task.pulse()
+                continue
             for future in done:
                 request = in_flight.pop(future)
                 try:

@@ -11,12 +11,12 @@ generator:
   max_context_length: 8192
   temperature: 0.2
   top_p: 0.9
-  # Outputs repeat the whole rewritten fact; 3000 source chars stay within 8192 tokens.
-  max_tokens: 4096
+  # A behaviour flip returns one sentence; the whole-case ceiling is gone.
+  max_tokens: 1024
   max_source_chars: 3000
   seed: 42
-  # Retries of outputs that fail validation.
-  retries: 2
+  # One retry for a sampling miss; structural skips are never retried.
+  retries: 1
   # Concurrent HTTP requests; vLLM batches them on the GPUs.
   concurrency: 32
   request_timeout: 600
