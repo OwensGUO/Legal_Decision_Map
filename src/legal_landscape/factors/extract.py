@@ -73,6 +73,60 @@ CONDUCT_CUES = (
 )
 
 
+# Verbs judgments use for the conduct itself. CONDUCT_CUES holds canonical wording, so
+# inflected forms such as 盗得 are absent there; these lists add them for consistency
+# checking and clause selection, never for factor extraction.
+TAKING_VERBS = (
+    "盗得", "窃得", "骗得", "抢得", "夺取", "夺走", "劫取", "劫走", "强行劫走",
+    "盗走", "偷走", "窃取", "盗取", "扒窃", "骗取", "秘密窃取",
+    "趁人不备", "乘人不备", "持刀威胁", "以暴力相威胁", "胁迫交付",
+)
+HARM_VERBS = (
+    "殴打", "打伤", "打倒在", "致其轻伤", "致人轻伤", "致其重伤", "致人重伤",
+    "轻伤一级", "轻伤二级", "重伤一级", "重伤二级", "持棍棒", "持械",
+)
+# Injury grades are medical facts about the victim and must survive a conduct flip, so
+# they identify the outcome, never the conduct being changed.
+INJURY_OUTCOMES = (
+    "轻伤一级", "轻伤二级", "重伤一级", "重伤二级", "致人轻伤", "致其轻伤",
+    "致人重伤", "致其重伤", "轻微伤",
+)
+
+# Discriminative cues separate two conducts that share the same act. 故意伤害 and 寻衅滋事
+# both involve 殴打, and an injury grade must survive a flip because it is a medical fact
+# about the victim, not the conduct being changed. Only these phrases identify the conduct.
+CONDUCT_DISCRIMINATORS = {
+    "因个人纠纷定向伤害": ("个人纠纷", "因琐事", "发生纠纷", "因琐事与"),
+    "无事生非随意殴打": ("无事生非", "借故生非", "随意殴打", "无故殴打"),
+}
+
+
+def conduct_verbs(conduct: str | None) -> tuple[str, ...]:
+    """Verb set that locates a description of this conduct in case text."""
+    discriminators = conduct_discriminators(conduct or "")
+    if discriminators is not None:
+        return discriminators
+    if conduct in ("秘密窃取", "趁人不备公开夺取", "暴力胁迫取财"):
+        return TAKING_VERBS
+    if conduct == "虚构事实使被害人自愿交付":
+        return (*TAKING_VERBS, "虚构事实", "隐瞒真相", "谎称", "冒充")
+    if conduct in ("无事生非随意殴打", "因个人纠纷定向伤害"):
+        return HARM_VERBS
+    return tuple(dict(CONDUCT_CUES).get(conduct or "", ()))
+
+
+def conduct_discriminators(conduct: str | None) -> tuple[str, ...] | None:
+    """Phrases that identify this conduct among conducts sharing the same act, or None."""
+    return CONDUCT_DISCRIMINATORS.get(conduct or "")
+
+
+def discriminative_present(text: str, conduct: str) -> bool:
+    cues = conduct_discriminators(conduct)
+    if cues is None:
+        return False
+    return any(cue in text for cue in cues)
+
+
 def _marker_absorbed(prefix: str, marker_index: int) -> bool:
     """True when the negation character belongs to a different word, such as 不但 or 无前科."""
     for phrase in _ABSORBED_NEGATION:

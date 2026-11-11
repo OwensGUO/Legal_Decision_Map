@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from legal_landscape.counterfactual.generate import (
     GenerationRequest,
     MockGenerator,
@@ -126,30 +124,11 @@ def test_structural_skip_needs_no_model_call() -> None:
     assert plan.reason == "no_amount_span"
 
 
-def test_flip_plan_quotes_the_source_behaviour_sentence() -> None:
+def test_flip_plan_quotes_the_whole_sentence() -> None:
+    """The rewrite unit is the sentence, so the quote carries its terminator."""
     plan = plan_realization("张三窃取他人财物，涉案金额5000元。无人报警。", _flip_spec())
     assert plan.kind == "span"
-    assert plan.quote == "张三窃取他人财物"
-
-
-@pytest.mark.parametrize(
-    ("replacement", "problem"),
-    [
-        ("李四虚构事实骗取财物。", "replacement_missing_target"),
-        ("张三李四虚构事实骗取财物。", "replacement_mentions_other_defendant"),
-        ("张三窃取他人财物。", "replacement_keeps_source_conduct"),
-        ("张三取走他人财物。", "replacement_missing_target_conduct"),
-        ("", "empty_replacement"),
-    ],
-)
-def test_replacement_problems_are_caught_before_splicing(replacement, problem) -> None:
-    spec = InterventionSpec(
-        "c1", "张三", "charge_flip",
-        LegalFactors(conduct="秘密窃取"),
-        LegalFactors(conduct="虚构事实使被害人自愿交付"),
-        "诈骗", None, ("conduct",), "boundary", ("李四",),
-    )
-    assert replacement_problem(spec, "张三窃取他人财物。", replacement) == problem
+    assert plan.quote == "张三窃取他人财物，涉案金额5000元。"
 
 
 def test_replacement_cannot_restore_a_masked_span() -> None:
@@ -228,15 +207,15 @@ def test_all_three_intervention_types_realize_end_to_end(tmp_path) -> None:
     assert [record["retry_count"] for record in result.records] == [0, 0, 0]
 
 
-def test_multi_defendant_clause_is_edited_without_disturbing_the_neighbour() -> None:
+def test_multi_defendant_sentence_is_quoted_whole_so_neighbours_survive() -> None:
     parent = "张三与李四共同盗窃，张三窃取现金3000元，李四负责望风。"
-    spec = _flip_spec()
+    spec = _flip_spec_named("张三", ("李四",))
     plan = plan_realization(parent, spec)
     assert plan.kind == "span"
-    assert plan.quote == "张三窃取现金3000元"
-    spliced, _ = splice(
-        plan.base_text, plan.span, "张三虚构事实骗取现金3000元"
-    )
+    assert plan.quote == parent
+    replacement = "张三与李四共同盗窃，张三虚构事实骗取现金3000元，李四负责望风"
+    assert replacement_problem(spec, parent, replacement) is None
+    spliced, _ = splice(plan.base_text, plan.span, replacement)
     assert spliced == "张三与李四共同盗窃，张三虚构事实骗取现金3000元，李四负责望风。"
 
 
@@ -261,20 +240,18 @@ def test_flip_without_any_source_clause_is_refused() -> None:
     assert plan.reason == "no_target_span"
 
 
-def test_flip_falls_back_to_the_clause_that_describes_behaviour() -> None:
-    """Canonical cues are rare in judgments, so a behaviour clause is the next choice."""
+def test_flip_selects_the_sentence_that_describes_the_behaviour() -> None:
     parent = "被告人张三驾车窜至某小区，张三趁人不备夺走被害人手机。"
     plan = plan_realization(parent, _flip_spec())
     assert plan.kind == "span"
-    # 夺走 describes a taking but is not one of the source conduct's canonical cues.
-    assert plan.quote == "张三趁人不备夺走被害人手机"
+    assert plan.quote == parent
 
 
-def test_flip_prefers_the_exact_source_cue_over_a_generic_behaviour_clause() -> None:
-    parent = "被告人张三驾车窜至某小区，张三趁无人之机窃取被害人现金3000元。"
+def test_flip_ignores_a_sentence_without_a_conduct_verb() -> None:
+    parent = "被告人张三到案后如实供述。张三趁无人之机窃取被害人现金3000元。"
     plan = plan_realization(parent, _flip_spec())
     assert plan.kind == "span"
-    assert plan.quote == "张三趁无人之机窃取被害人现金3000元"
+    assert plan.quote == "张三趁无人之机窃取被害人现金3000元。"
 
 
 def test_amount_splice_ignores_a_literal_that_is_not_the_source_amount() -> None:
@@ -330,8 +307,35 @@ def test_participation_only_clause_is_not_a_flip_target() -> None:
     assert plan.reason == "no_target_span"
 
 
-def test_single_taking_clause_is_still_selected() -> None:
+def test_single_taking_sentence_is_still_selected() -> None:
     parent = "被告人张三趁人不备夺走被害人手机一部。"
     plan = plan_realization(parent, _flip_spec())
     assert plan.kind == "span"
-    assert plan.quote == "被告人张三趁人不备夺走被害人手机一部"
+    assert plan.quote == parent
+
+
+def _harm_spec() -> InterventionSpec:
+    return InterventionSpec(
+        "c1", "张三", "charge_flip",
+        LegalFactors(conduct="因个人纠纷定向伤害"),
+        LegalFactors(conduct="无事生非随意殴打"),
+        "寻衅滋事", None, ("conduct",), "boundary",
+    )
+
+
+def test_injury_grade_is_not_treated_as_the_source_conduct() -> None:
+    """轻伤二级 is a medical fact about the victim and must survive a conduct flip."""
+    parent = "被告人张三因琐事与被害人发生纠纷，后殴打被害人致轻伤二级。"
+    plan = plan_realization(parent, _harm_spec())
+    assert plan.kind == "span"
+    assert plan.quote == parent
+    replacement = "被告人张三无事生非，随意殴打被害人致轻伤二级"
+    assert replacement_problem(_harm_spec(), parent, replacement) is None
+
+
+def test_harm_flip_that_keeps_the_source_grounds_is_still_refused() -> None:
+    parent = "被告人张三因琐事与被害人发生纠纷，后殴打被害人致轻伤二级。"
+    problem = replacement_problem(
+        _harm_spec(), parent, "被告人张三因琐事随意殴打被害人致轻伤二级"
+    )
+    assert problem == "replacement_keeps_source_conduct"

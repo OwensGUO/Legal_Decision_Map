@@ -15,7 +15,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 from legal_landscape.counterfactual.validators import amounts_match
-from legal_landscape.factors.extract import CONDUCT_CUES, RESTITUTION_CUES
+from legal_landscape.factors.extract import (
+    CONDUCT_CUES,
+    RESTITUTION_CUES,
+    conduct_discriminators,
+    conduct_verbs,
+)
 from legal_landscape.factors.schema import InterventionSpec
 
 TERMINATORS = "。；！？\n"
@@ -30,15 +35,6 @@ _ANY_AMOUNT = re.compile(r"([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万)?元")
 _MASKS = ("××", "[已屏蔽]")
 # Judgments write conduct with inflected verbs the canonical cue table does not carry
 # (盗得, 窃得, 骗得). These lists are for consistency checking, never for extraction.
-_TAKING_VERBS = (
-    "盗得", "窃得", "骗得", "抢得", "夺取", "夺走", "劫取", "劫走", "强行劫走",
-    "盗走", "偷走", "窃取", "盗取", "扒窃", "骗取", "秘密窃取",
-    "趁人不备", "乘人不备", "持刀威胁", "以暴力相威胁", "胁迫交付",
-)
-_HARM_VERBS = (
-    "殴打", "打伤", "打倒在", "致其轻伤", "致人轻伤", "致其重伤", "致人重伤",
-    "轻伤一级", "轻伤二级", "重伤一级", "重伤二级", "持棍棒", "持械",
-)
 # Verbs that describe only a role in a joint offence, never the taking itself.
 _PARTICIPATION_VERBS = ("放哨", "望风", "驾车", "开车接应", "接应", "负责开车")
 # Summary lines restate the count rather than describing one taking. Keep these phrases
@@ -218,17 +214,6 @@ def _amountalize(text: str, spec: InterventionSpec) -> str | None:
 _BARE_INITIAL_VERBS = "破进将趁因持驾开负把抓在到殴打盗窃夺抢骗敲望放接"
 
 
-def _behaviour_verbs(conduct: str | None) -> tuple[str, ...]:
-    """Verb set used to find a case's own description of the conduct being flipped."""
-    if conduct in ("秘密窃取", "趁人不备公开夺取", "暴力胁迫取财"):
-        return _TAKING_VERBS
-    if conduct == "虚构事实使被害人自愿交付":
-        return (*_TAKING_VERBS, "虚构事实", "隐瞒真相", "谎称", "冒充")
-    if conduct in ("无事生非随意殴打", "因个人纠纷定向伤害"):
-        return _HARM_VERBS
-    return tuple(dict(CONDUCT_CUES).get(conduct or "", ()))
-
-
 def _bare_initial_actors(text: str, spec: InterventionSpec) -> set[str]:
     """Actors a judgment refers to by a bare surname initial, as in 王破坏防护栏.
 
@@ -246,52 +231,55 @@ def _bare_initial_actors(text: str, spec: InterventionSpec) -> set[str]:
     return {match.group(0)[-1] for match in pattern.finditer(text)}
 
 
-def _behaviour_spans(text: str, spec: InterventionSpec, verbs: tuple[str, ...]) -> tuple[Span, ...]:
-    """Every clause describing the conduct, whichever defendant it names.
+def _behaviour_spans(
+    text: str, spec: InterventionSpec, verbs: tuple[str, ...]
+) -> tuple[Span, ...]:
+    """Sentences that describe the conduct, whichever defendant they name.
 
-    Deliberately wider than scope_spans: a case that describes taking property in its
-    factual counts must be rewritten in all of them, and a count usually names only the
-    victim, not the defendant.
+    Returns whole sentences rather than clauses: a judgment states one incident across
+    several comma clauses (因琐事与被害人发生口角 then 殴打其致轻伤二级), and rewriting
+    one of them leaves the incident half-changed. Clauses naming only a co-defendant and
+    summary lines (共参与作案8次) are excluded.
     """
     others = other_defendants(spec)
     kept: list[Span] = []
     for sentence in sentence_spans(text):
-        for clause in clause_spans(sentence.text):
-            body = clause.text
-            if any(marker in body for marker in _SUMMARY_MARKERS):
-                continue
-            names_other = any(name in body for name in others)
-            names_target = mentions(body, spec.target_defendant, others)
-            if names_other and not names_target:
-                continue
-            if any(verb in body for verb in verbs):
-                kept.append(
-                    Span(sentence.start + clause.start, sentence.start + clause.end, body)
-                )
+        body = sentence.text
+        if any(marker in body for marker in _SUMMARY_MARKERS):
+            continue
+        names_other = any(name in body for name in others)
+        names_target = mentions(body, spec.target_defendant, others)
+        if names_other and not names_target:
+            continue
+        if any(verb in body for verb in verbs):
+            kept.append(sentence)
     return tuple(kept)
 
 
 def _flip_span(text: str, spec: InterventionSpec) -> tuple[Span | None, str | None]:
-    """Pick the clause a behaviour flip rewrites, or the structural reason it cannot.
+    """Pick the sentence a behaviour flip rewrites, or the structural reason it cannot.
 
-    A flip is only sound when the case describes the conduct exactly once and names the
-    actor unambiguously. Anything else would either leave contradicting counts behind or
-    edit a defendant the program cannot identify.
+    A flip is only sound when the case describes the conduct in one place and names the
+    actor unambiguously. Several incidents, a bare surname initial, or an act that is
+    only 放哨/驾车/接应 cannot be rewritten without inventing facts.
     """
     if _bare_initial_actors(text, spec):
         return None, "abbreviated_ambiguous"
-    verbs = _behaviour_verbs(spec.source_factors.conduct)
+    verbs = conduct_verbs(spec.source_factors.conduct)
     if not verbs:
         return None, "no_target_span"
     spans = _behaviour_spans(text, spec, verbs)
     if not spans:
         return None, "no_target_span"
     if len(spans) > 1:
-        # Several counts describe the same conduct; one quoted rewrite cannot reconcile them.
+        # Separate incidents describe the same conduct; one rewrite cannot cover them.
         return None, "incomplete_flip"
     span = spans[0]
-    if any(verb in span.text for verb in _PARTICIPATION_VERBS) and not any(
-        verb in span.text for verb in verbs
+    discriminators = conduct_discriminators(spec.source_factors.conduct)
+    if (
+        not discriminators
+        and any(verb in span.text for verb in _PARTICIPATION_VERBS)
+        and not any(verb in span.text for verb in verbs)
     ):
         return None, "no_target_span"
     return span, None
@@ -357,14 +345,25 @@ def replacement_problem(
         return "replacement_not_single_sentence"
     if not mentions(body, spec.target_defendant, others):
         return "replacement_missing_target"
-    if any(name in body for name in others):
+    # A sentence-level rewrite spans the whole sentence, so a co-defendant named in the
+    # original stays named. Only a newly introduced co-defendant name is an error.
+    introduced = sum(body.count(name) for name in others) - sum(
+        original.count(name) for name in others
+    )
+    if introduced > 0:
         return "replacement_mentions_other_defendant"
     source = spec.source_factors.conduct
     target = spec.target_factors.conduct
-    source_cues = dict(CONDUCT_CUES).get(source or "", ())
+    # Injury grades and similar shared facts must survive a flip, so the check uses the
+    # discriminative cues when both conducts share the same act.
+    if conduct_discriminators(source) and conduct_discriminators(target):
+        source_cues = conduct_discriminators(source) or ()
+        target_cues = conduct_discriminators(target) or ()
+    else:
+        source_cues = dict(CONDUCT_CUES).get(source or "", ())
+        target_cues = dict(CONDUCT_CUES).get(target or "", ())
     if source and source != target and any(cue in body for cue in source_cues):
         return "replacement_keeps_source_conduct"
-    target_cues = dict(CONDUCT_CUES).get(target or "", ())
     if target_cues and not any(cue in body for cue in target_cues):
         return "replacement_missing_target_conduct"
     before, after = mask_counts(original), mask_counts(body)

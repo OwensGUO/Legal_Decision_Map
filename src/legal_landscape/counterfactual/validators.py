@@ -17,6 +17,7 @@ from legal_landscape.factors.extract import (
     RESTITUTION_CUES,
     SURRENDER_CUES,
     conduct_cues,
+    conduct_discriminators,
     cue_polarity,
     extract_factors,
 )
@@ -178,7 +179,11 @@ def _sentence_supports_change(sentence: str, spec: InterventionSpec) -> bool:
             if cue_polarity(sentence, _BOOLEAN_CUES[name]) != value:
                 return False
         elif name == "conduct" and isinstance(value, str):
-            if value not in conduct_cues(sentence):
+            discriminators = conduct_discriminators(value)
+            if discriminators is not None:
+                if not any(cue in sentence for cue in discriminators):
+                    return False
+            elif value not in conduct_cues(sentence):
                 return False
         elif name == "amount" and value is not None and not _amount_appears(
             sentence,
@@ -256,10 +261,21 @@ def _target_change_appears(text: str, spec: InterventionSpec) -> bool:
             if cue_polarity(text, _BOOLEAN_CUES[name]) is not value:
                 return False
         if name == "conduct" and isinstance(value, str):
-            cues = conduct_cues(text)
             source = spec.source_factors.conduct
-            if value not in cues or (source is not None and source != value and source in cues):
-                return False
+            discriminators = conduct_discriminators(value)
+            if discriminators is not None:
+                # Shared-act flips: the discriminator must appear and the source's must not.
+                if not any(cue in text for cue in discriminators):
+                    return False
+                source_cues = conduct_discriminators(source or "")
+                if source != value and source_cues and any(cue in text for cue in source_cues):
+                    return False
+            else:
+                cues = conduct_cues(text)
+                if value not in cues or (
+                    source is not None and source != value and source in cues
+                ):
+                    return False
         if name == "amount" and value is not None and not _amount_change_realized(
             text, spec, float(value)
         ):
@@ -277,8 +293,12 @@ def _factor_drift(parent_text: str, text: str, spec: InterventionSpec) -> list[s
     errors: list[str] = []
     for name in before.to_dict():
         if name in spec.changed_fields:
-            if name in _BOOLEAN_CUES and getattr(after, name) != getattr(spec.target_factors, name):
+            expected = getattr(spec.target_factors, name)
+            if name in _BOOLEAN_CUES and getattr(after, name) != expected:
                 errors.append(f"factor_mismatch:{name}")
+            elif name == "conduct" and expected is not None and after.conduct != expected:
+                # Training re-extracts this field; a record that fails here is dropped later.
+                errors.append("factor_mismatch:conduct")
         elif getattr(after, name) != getattr(before, name):
             errors.append(f"non_target_changed:{name}")
     for other in others:
