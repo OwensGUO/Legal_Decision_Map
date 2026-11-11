@@ -240,9 +240,32 @@ def test_multiple_source_clauses_are_refused_before_the_model_is_called() -> Non
 
 
 def test_flip_without_any_source_clause_is_refused() -> None:
-    plan = plan_realization("张三与李四共同实施行为。", _flip_spec())
+    spec = InterventionSpec(
+        "c1", "张三", "charge_flip",
+        LegalFactors(conduct="秘密窃取"),
+        LegalFactors(conduct="虚构事实使被害人自愿交付"),
+        "诈骗", None, ("conduct",), "boundary", ("李四",),
+    )
+    # The only clause names both actors, so no clause belongs to the target alone.
+    plan = plan_realization("张三与李四共同实施行为。", spec)
     assert plan.kind == "skip"
-    assert plan.reason == "no_source_conduct_span"
+    assert plan.reason == "no_target_span"
+
+
+def test_flip_falls_back_to_the_clause_that_describes_behaviour() -> None:
+    """Canonical cues are rare in judgments, so a behaviour clause is the next choice."""
+    parent = "被告人张三驾车窜至某小区，张三趁人不备夺走被害人手机。"
+    plan = plan_realization(parent, _flip_spec())
+    assert plan.kind == "span"
+    # 夺走 describes a taking but is not one of the source conduct's canonical cues.
+    assert plan.quote == "张三趁人不备夺走被害人手机"
+
+
+def test_flip_prefers_the_exact_source_cue_over_a_generic_behaviour_clause() -> None:
+    parent = "被告人张三驾车窜至某小区，张三趁无人之机窃取被害人现金3000元。"
+    plan = plan_realization(parent, _flip_spec())
+    assert plan.kind == "span"
+    assert plan.quote == "张三趁无人之机窃取被害人现金3000元"
 
 
 def test_amount_splice_ignores_a_literal_that_is_not_the_source_amount() -> None:

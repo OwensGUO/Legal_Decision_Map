@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from legal_landscape.counterfactual.validators import amounts_match
-from legal_landscape.factors.extract import CONDUCT_CUES, RESTITUTION_CUES
+from legal_landscape.factors.extract import CONDUCT_CUES, RESTITUTION_CUES, conduct_cues
 from legal_landscape.factors.schema import InterventionSpec
 
 TERMINATORS = "。；！？\n"
@@ -199,19 +199,31 @@ def _amountalize(text: str, spec: InterventionSpec) -> str | None:
     return None
 
 
-def _source_clauses(text: str, spec: InterventionSpec) -> tuple[Span, ...]:
-    """Target clauses that still describe the source behaviour.
+def _flip_span(text: str, spec: InterventionSpec) -> tuple[Span | None, str | None]:
+    """Pick the clause a behaviour flip rewrites, or the structural reason it cannot.
 
-    A flip must rewrite every one of them: one case can describe the same defendant
-    taking property in several counts, and rewriting a single clause leaves the others
-    contradicting the new conduct.
+    Canonical conduct cues (秘密窃取, 抽头渔利, ...) rarely appear verbatim in a judgment,
+    so an exact-cue match is tried first and a behaviour-describing clause is accepted
+    next. Two exact-cue clauses mean the same conduct is described in several counts;
+    one quoted rewrite cannot make the whole case consistent, so that request is refused.
     """
+    spans = scope_spans(text, spec)
+    if not spans:
+        return None, "no_target_span"
     source_cues = dict(CONDUCT_CUES).get(spec.source_factors.conduct or "", ())
-    return tuple(
-        span
-        for span in scope_spans(text, spec)
-        if any(cue in span.text for cue in source_cues)
-    )
+    exact = [span for span in spans if any(cue in span.text for cue in source_cues)]
+    if len(exact) > 1:
+        return None, "incomplete_flip"
+    if exact:
+        return exact[0], None
+    others = other_defendants(spec)
+    named = [
+        span for span in spans if mentions(span.text, spec.target_defendant, others)
+    ] or list(spans)
+    describing = [span for span in named if conduct_cues(span.text)]
+    if describing:
+        return describing[0], None
+    return named[0], None
 
 
 def plan_realization(parent_text: str, spec: InterventionSpec) -> Realization:
@@ -232,13 +244,10 @@ def plan_realization(parent_text: str, spec: InterventionSpec) -> Realization:
             return Realization("skip", parent_text, reason="no_amount_span")
         text = edited
     if "conduct" in spec.changed_fields:
-        clauses = _source_clauses(text, spec)
-        if not clauses:
-            return Realization("skip", parent_text, reason="no_source_conduct_span")
-        if len(clauses) > 1:
-            # A single quoted rewrite cannot make a multi-count description consistent.
-            return Realization("skip", parent_text, reason="incomplete_flip")
-        return Realization("span", text, span=clauses[0], quote=clauses[0].text)
+        span, reason = _flip_span(text, spec)
+        if span is None:
+            return Realization("skip", parent_text, reason=reason)
+        return Realization("span", text, span=span, quote=span.text)
     if text == parent_text:
         return Realization("skip", parent_text, reason="no_supported_field")
     return Realization("deterministic", parent_text, text=text)
