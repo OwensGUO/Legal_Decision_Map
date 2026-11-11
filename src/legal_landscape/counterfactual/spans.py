@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from legal_landscape.counterfactual.validators import amounts_match
-from legal_landscape.factors.extract import CONDUCT_CUES, RESTITUTION_CUES, conduct_cues
+from legal_landscape.factors.extract import CONDUCT_CUES, RESTITUTION_CUES
 from legal_landscape.factors.schema import InterventionSpec
 
 TERMINATORS = "。；！？\n"
@@ -28,6 +28,22 @@ _CUED_AMOUNT = re.compile(
 )
 _ANY_AMOUNT = re.compile(r"([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万)?元")
 _MASKS = ("××", "[已屏蔽]")
+# Judgments write conduct with inflected verbs the canonical cue table does not carry
+# (盗得, 窃得, 骗得). These lists are for consistency checking, never for extraction.
+_TAKING_VERBS = (
+    "盗得", "窃得", "骗得", "抢得", "夺取", "夺走", "劫取", "劫走", "强行劫走",
+    "盗走", "偷走", "窃取", "盗取", "扒窃", "骗取", "秘密窃取",
+    "趁人不备", "乘人不备", "持刀威胁", "以暴力相威胁", "胁迫交付",
+)
+_HARM_VERBS = (
+    "殴打", "打伤", "打倒在", "致其轻伤", "致人轻伤", "致其重伤", "致人重伤",
+    "轻伤一级", "轻伤二级", "重伤一级", "重伤二级", "持棍棒", "持械",
+)
+# Verbs that describe only a role in a joint offence, never the taking itself.
+_PARTICIPATION_VERBS = ("放哨", "望风", "驾车", "开车接应", "接应", "负责开车")
+# Summary lines restate the count rather than describing one taking. Keep these phrases
+# specific: 共计 appears in ordinary counts (价值共计2304元) and 起 in 一起/起诉.
+_SUMMARY_MARKERS = ("共参与", "共实施", "共同作案", "作案", "总计", "总价值", "共计作案")
 
 
 @dataclass(frozen=True)
@@ -199,31 +215,86 @@ def _amountalize(text: str, spec: InterventionSpec) -> str | None:
     return None
 
 
+_BARE_INITIAL_VERBS = "破进将趁因持驾开负把抓在到殴打盗窃夺抢骗敲望放接"
+
+
+def _behaviour_verbs(conduct: str | None) -> tuple[str, ...]:
+    """Verb set used to find a case's own description of the conduct being flipped."""
+    if conduct in ("秘密窃取", "趁人不备公开夺取", "暴力胁迫取财"):
+        return _TAKING_VERBS
+    if conduct == "虚构事实使被害人自愿交付":
+        return (*_TAKING_VERBS, "虚构事实", "隐瞒真相", "谎称", "冒充")
+    if conduct in ("无事生非随意殴打", "因个人纠纷定向伤害"):
+        return _HARM_VERBS
+    return tuple(dict(CONDUCT_CUES).get(conduct or "", ()))
+
+
+def _bare_initial_actors(text: str, spec: InterventionSpec) -> set[str]:
+    """Actors a judgment refers to by a bare surname initial, as in 王破坏防护栏.
+
+    Such a reference cannot be attributed to one defendant: 王 is a prefix of both 王某A
+    and an unrelated 王某, so any conduct in that clause belongs to an unknown actor.
+    """
+    actors = (spec.target_defendant, *other_defendants(spec))
+    initials = {actor[:1] for actor in actors if actor}
+    if not initials:
+        return set()
+    pattern = re.compile(
+        rf"(?:由|被告人|，|。|；|、|和|与|及|^)(?:{'|'.join(map(re.escape, sorted(initials)))})"
+        rf"(?=[{_BARE_INITIAL_VERBS}])"
+    )
+    return {match.group(0)[-1] for match in pattern.finditer(text)}
+
+
+def _behaviour_spans(text: str, spec: InterventionSpec, verbs: tuple[str, ...]) -> tuple[Span, ...]:
+    """Every clause describing the conduct, whichever defendant it names.
+
+    Deliberately wider than scope_spans: a case that describes taking property in its
+    factual counts must be rewritten in all of them, and a count usually names only the
+    victim, not the defendant.
+    """
+    others = other_defendants(spec)
+    kept: list[Span] = []
+    for sentence in sentence_spans(text):
+        for clause in clause_spans(sentence.text):
+            body = clause.text
+            if any(marker in body for marker in _SUMMARY_MARKERS):
+                continue
+            names_other = any(name in body for name in others)
+            names_target = mentions(body, spec.target_defendant, others)
+            if names_other and not names_target:
+                continue
+            if any(verb in body for verb in verbs):
+                kept.append(
+                    Span(sentence.start + clause.start, sentence.start + clause.end, body)
+                )
+    return tuple(kept)
+
+
 def _flip_span(text: str, spec: InterventionSpec) -> tuple[Span | None, str | None]:
     """Pick the clause a behaviour flip rewrites, or the structural reason it cannot.
 
-    Canonical conduct cues (秘密窃取, 抽头渔利, ...) rarely appear verbatim in a judgment,
-    so an exact-cue match is tried first and a behaviour-describing clause is accepted
-    next. Two exact-cue clauses mean the same conduct is described in several counts;
-    one quoted rewrite cannot make the whole case consistent, so that request is refused.
+    A flip is only sound when the case describes the conduct exactly once and names the
+    actor unambiguously. Anything else would either leave contradicting counts behind or
+    edit a defendant the program cannot identify.
     """
-    spans = scope_spans(text, spec)
+    if _bare_initial_actors(text, spec):
+        return None, "abbreviated_ambiguous"
+    verbs = _behaviour_verbs(spec.source_factors.conduct)
+    if not verbs:
+        return None, "no_target_span"
+    spans = _behaviour_spans(text, spec, verbs)
     if not spans:
         return None, "no_target_span"
-    source_cues = dict(CONDUCT_CUES).get(spec.source_factors.conduct or "", ())
-    exact = [span for span in spans if any(cue in span.text for cue in source_cues)]
-    if len(exact) > 1:
+    if len(spans) > 1:
+        # Several counts describe the same conduct; one quoted rewrite cannot reconcile them.
         return None, "incomplete_flip"
-    if exact:
-        return exact[0], None
-    others = other_defendants(spec)
-    named = [
-        span for span in spans if mentions(span.text, spec.target_defendant, others)
-    ] or list(spans)
-    describing = [span for span in named if conduct_cues(span.text)]
-    if describing:
-        return describing[0], None
-    return named[0], None
+    span = spans[0]
+    if any(verb in span.text for verb in _PARTICIPATION_VERBS) and not any(
+        verb in span.text for verb in verbs
+    ):
+        return None, "no_target_span"
+    return span, None
 
 
 def plan_realization(parent_text: str, spec: InterventionSpec) -> Realization:

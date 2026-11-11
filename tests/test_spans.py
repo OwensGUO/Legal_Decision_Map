@@ -43,6 +43,15 @@ def _amount_spec(source: float, target: float, *, defendant: str = "张三") -> 
     )
 
 
+def _flip_spec_named(defendant: str, co: tuple[str, ...]) -> InterventionSpec:
+    return InterventionSpec(
+        "c1", defendant, "charge_flip",
+        LegalFactors(conduct="秘密窃取"),
+        LegalFactors(conduct="虚构事实使被害人自愿交付"),
+        "诈骗", None, ("conduct",), "boundary", co,
+    )
+
+
 def _flip_spec(*, defendant: str = "张三") -> InterventionSpec:
     return InterventionSpec(
         "c1", defendant, "charge_flip",
@@ -285,3 +294,44 @@ def test_amount_skip_when_only_a_different_figure_is_present() -> None:
     plan = plan_realization(parent, _amount_spec(7062.0, 7132.62))
     assert plan.kind == "skip"
     assert plan.reason == "no_amount_span"
+
+
+def test_bare_surname_leaves_the_actor_unattributable() -> None:
+    """王破坏防护栏 cannot be pinned to 王某A: 王 also prefixes an unrelated 王某."""
+    parent = (
+        "被告人王某A与徐某A到小区，由徐敲门望风，"
+        "王破坏防护栏进入被害人家中，将现金1400元窃取。"
+    )
+    plan = plan_realization(parent, _flip_spec_named("王某A", ("徐某A",)))
+    assert plan.kind == "skip"
+    assert plan.reason == "abbreviated_ambiguous"
+
+
+def test_multi_count_taking_with_inflected_verbs_is_refused() -> None:
+    """盗得 is the common judgment form and was invisible to the canonical cue table."""
+    parent = "一、张三在刘某家中盗得戒指两枚，价值2304元；二、张三在张某家中盗得现金500元。"
+    plan = plan_realization(parent, _flip_spec())
+    assert plan.kind == "skip"
+    assert plan.reason == "incomplete_flip"
+
+
+def test_multi_count_refusal_ignores_a_summary_line() -> None:
+    """共参与作案8次 states the count; it must not be treated as a rewriteable clause."""
+    parent = "以上被告人张三共参与盗窃作案8次。"
+    plan = plan_realization(parent, _flip_spec())
+    assert plan.kind == "skip"
+    assert plan.reason == "no_target_span"
+
+
+def test_participation_only_clause_is_not_a_flip_target() -> None:
+    parent = "被告人张三负责驾车接应，李四入室取财。以上事实清楚。"
+    plan = plan_realization(parent, _flip_spec_named("张三", ("李四",)))
+    assert plan.kind == "skip"
+    assert plan.reason == "no_target_span"
+
+
+def test_single_taking_clause_is_still_selected() -> None:
+    parent = "被告人张三趁人不备夺走被害人手机一部。"
+    plan = plan_realization(parent, _flip_spec())
+    assert plan.kind == "span"
+    assert plan.quote == "被告人张三趁人不备夺走被害人手机一部"
