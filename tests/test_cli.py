@@ -470,6 +470,7 @@ def test_build_dataset_progress_counts_dropped_and_short_splits(tmp_path) -> Non
         "near_duplicate_pairs": 0,
         "cross_split_groups": 1,
         "dropped_units": {"train": 1, "valid": 0, "test": 0},
+        "duplicate_case_ids_dropped": {"train": 0, "valid": 0, "test": 0},
     }
     lines = stream.getvalue().splitlines()
     assert sum("Assign groups" in line and "progress" in line for line in lines) == 3

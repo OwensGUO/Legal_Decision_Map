@@ -303,3 +303,51 @@ def test_counterfactual_primary_endpoints_exclude_redundant_monotonicity() -> No
         "flip_accuracy", "invariant_violation_rate", "sentence_pairwise_accuracy",
         "invariant_charge_drift",
     )
+
+
+def test_paired_test_treats_verbatim_duplicate_samples_as_one() -> None:
+    """A test split that repeats a judgment verbatim yields two rows with one case_id.
+
+    Both systems predict both rows, so the duplicate appears on each side. The paired
+    test must collapse it rather than refuse the comparison, while a repeated key whose
+    truth disagrees stays an error.
+    """
+    from legal_landscape.evaluation.bootstrap import dedupe_paired_rows
+
+    reference = _static_rows(3)
+    for index, row in enumerate(reference):
+        row["case_id"] = f"c{index}"
+        row["charge_vocabulary"] = ["a", "b", "c"]
+        row["article_vocabulary"] = ["a", "b", "c"]
+        row["unseen_true_charge_labels"] = []
+        row["unseen_true_article_labels"] = []
+        row["articles_available"] = True
+    # Row 0 is duplicated verbatim on both sides, as a repeated source judgment would be.
+    reference_dup = [*reference, dict(reference[0])]
+    candidate_dup = [
+        {**row, "predicted_months": float(row["predicted_months"]) + 1.0} for row in reference_dup
+    ]
+
+    kept, dropped = dedupe_paired_rows(reference_dup)
+    assert dropped == 1
+    assert len(kept) == len(reference)
+    assert [row["case_id"] for row in kept] == [row["case_id"] for row in reference]
+
+    # Before this change the duplicate made the comparison refuse outright. The paired
+    # difference must now match the same comparison run on the de-duplicated rows.
+    with_dup = fast_paired_test(
+        prepare_static(candidate_dup), prepare_static(reference_dup),
+        ("sentence_mae",), iterations=20, seed=5,
+    )
+    without_dup = fast_paired_test(
+        prepare_static(candidate_dup[: len(reference)]), prepare_static(reference),
+        ("sentence_mae",), iterations=20, seed=5,
+    )
+    for key in ("difference", "lower", "upper", "p_value"):
+        assert math.isclose(
+            with_dup["sentence_mae"][key], without_dup["sentence_mae"][key], abs_tol=1e-9
+        )
+
+    conflicting = [*reference, {**reference[0], "true_charges": [0, 0, 1]}]
+    with pytest.raises(ValueError, match="different truth"):
+        dedupe_paired_rows(conflicting)

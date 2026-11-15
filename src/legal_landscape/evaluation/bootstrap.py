@@ -154,6 +154,32 @@ def _truth_signature(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def dedupe_paired_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Keep the first row per sample key; return the rows and how many were dropped.
+
+    CAIL derives case_id from the fact text, so a source corpus that repeats a judgment
+    verbatim yields two identical test records. They are one sample, not two, and would
+    otherwise make the paired bootstrap refuse the comparison. A repeated key whose truth
+    fields disagree is a real error and is still raised.
+    """
+    kept: list[dict[str, Any]] = []
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    dropped = 0
+    for row in rows:
+        key = _sample_key(row)
+        first = seen.get(key)
+        if first is None:
+            seen[key] = row
+            kept.append(row)
+            continue
+        if _truth_signature(first) != _truth_signature(row) or str(
+            first.get("group_id")
+        ) != str(row.get("group_id")):
+            raise ValueError(f"paired comparison has a repeated sample {key} with different truth")
+        dropped += 1
+    return kept, dropped
+
+
 def assert_paired_rows(
     candidate: list[dict[str, Any]], reference: list[dict[str, Any]]
 ) -> None:
@@ -300,6 +326,14 @@ def fast_paired_test(
     if not isinstance(candidate_rows, list) or not isinstance(reference_rows, list):
         raise ValueError(
             "paired comparison requires source row identity on both prepared inputs"
+        )
+    # Verbatim-duplicate samples are one sample; both sides must drop the same ones.
+    candidate_rows, dropped_candidate = dedupe_paired_rows(candidate_rows)
+    reference_rows, dropped_reference = dedupe_paired_rows(reference_rows)
+    if dropped_candidate != dropped_reference:
+        raise ValueError(
+            "paired comparison dropped a different number of duplicate samples on each side: "
+            f"{dropped_candidate} vs {dropped_reference}"
         )
     assert_paired_rows(candidate_rows, reference_rows)
     if set(candidate.group_keys) != set(reference.group_keys):

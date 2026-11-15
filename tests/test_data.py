@@ -673,3 +673,24 @@ def test_cmdl_multi_charge_without_final_penalty_does_not_absorb_detention(tmp_p
         None,
         False,
     )
+
+
+def test_build_keeps_one_record_per_verbatim_duplicate_within_a_split(tmp_path) -> None:
+    """CAIL2018 repeats judgments verbatim; the fact-derived case_id collides.
+
+    Two identical records are one sample. Keeping both breaks paired evaluation, which
+    keys on case_id, and double-weights that case in every group bootstrap.
+    """
+    metadata, records = _build(
+        tmp_path,
+        "cail",
+        {
+            "train": [_cail_row(_LONG_FACT, "盗窃"), _cail_row(_LONG_FACT, "盗窃")],
+            "test": [_cail_row(_LONG_FACT.replace("4450", "9999") + "另一案。", "诈骗")],
+        },
+    )
+    train_ids = [row["case_id"] for row in records["train"]]
+    assert len(train_ids) == 1
+    assert len(set(train_ids)) == 1
+    assert metadata["split_integrity"]["duplicate_case_ids_dropped"]["train"] == 1
+    assert metadata["split_integrity"]["duplicate_case_ids_dropped"]["test"] == 0

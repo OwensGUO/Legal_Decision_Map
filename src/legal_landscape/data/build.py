@@ -178,6 +178,9 @@ def build_dataset(
         split: {"units_with_unseen_charge": 0, "units_with_unseen_article": 0} for split in paths
     }
     dropped_units = dict.fromkeys(paths, 0)
+    # CAIL2018 repeats some judgments verbatim; their fact-derived case_id collides. One
+    # sample per id keeps paired evaluation and group bootstraps well defined.
+    duplicate_ids = dict.fromkeys(paths, 0)
     penalty_exclusions = {
         "missing_final_penalty": 0,
         "missing_penalty_fields": 0,
@@ -196,11 +199,15 @@ def build_dataset(
             accepted=0,
             dropped=0,
         ) as task:
+            seen_ids: set[str] = set()
             with output_path.open("w", encoding="utf-8") as handle:
                 for case in iterator:
                     if plan.assigned_split(case.fact_raw) != split:
                         dropped_units[split] += 1
+                    elif case.case_id in seen_ids:
+                        duplicate_ids[split] += 1
                     else:
+                        seen_ids.add(case.case_id)
                         sanitized = sanitize_text(case.fact_raw, charge_lexicon=lexicon)
                         factors = extract_factors(
                             sanitized.strict,
@@ -249,6 +256,7 @@ def build_dataset(
             "near_duplicate_pairs": plan.near_duplicate_pairs,
             "cross_split_groups": plan.cross_split_clusters,
             "dropped_units": dropped_units,
+            "duplicate_case_ids_dropped": duplicate_ids,
         },
         "label_vocabulary_source": "train",
         "label_coverage": coverage,
