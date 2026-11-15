@@ -14,6 +14,7 @@ from legal_landscape.evaluation.bootstrap import (
     fast_bootstrap_metric_set,
     fast_paired_test,
     holm_adjust,
+    paired_sample_summary,
 )
 from legal_landscape.evaluation.prepared import (
     METRIC_VERSION,
@@ -282,6 +283,9 @@ def main() -> int:
             )
             payload["comparison"] = {
                 "reference_input": str(args.reference_input),
+                "paired_samples": paired_sample_summary(
+                    prepared.source_rows, reference.source_rows
+                ),
                 "endpoints": comparisons,
                 "raw_p_values": raw_p_values,
                 "holm_adjusted_p_values": adjusted,

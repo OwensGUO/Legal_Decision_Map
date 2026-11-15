@@ -305,49 +305,68 @@ def test_counterfactual_primary_endpoints_exclude_redundant_monotonicity() -> No
     )
 
 
-def test_paired_test_treats_verbatim_duplicate_samples_as_one() -> None:
-    """A test split that repeats a judgment verbatim yields two rows with one case_id.
-
-    Both systems predict both rows, so the duplicate appears on each side. The paired
-    test must collapse it rather than refuse the comparison, while a repeated key whose
-    truth disagrees stays an error.
-    """
-    from legal_landscape.evaluation.bootstrap import dedupe_paired_rows
-
-    reference = _static_rows(3)
-    for index, row in enumerate(reference):
+def _keyed_static_rows(count: int = 6) -> list[dict]:
+    rows = _static_rows(3, count)
+    for index, row in enumerate(rows):
         row["case_id"] = f"c{index}"
+        row["group_id"] = f"c{index}"
         row["charge_vocabulary"] = ["a", "b", "c"]
         row["article_vocabulary"] = ["a", "b", "c"]
         row["unseen_true_charge_labels"] = []
         row["unseen_true_article_labels"] = []
         row["articles_available"] = True
-    # Row 0 is duplicated verbatim on both sides, as a repeated source judgment would be.
-    reference_dup = [*reference, dict(reference[0])]
-    candidate_dup = [
-        {**row, "predicted_months": float(row["predicted_months"]) + 1.0} for row in reference_dup
+    return rows
+
+
+def test_paired_test_keeps_repeated_samples_including_conflicting_truth() -> None:
+    """CAIL derives case_id from the fact text, so a repeated judgment shares one id.
+
+    Both systems predict every repeated row. A verbatim repeat and a repeat whose source
+    label disagrees (same fact, 3 versus 9 months) are both kept: the paired test pairs the
+    two sides by sample key plus truth, and its point difference is the difference of the
+    full-row metrics that the headline results report.
+    """
+    from legal_landscape.evaluation.bootstrap import paired_sample_summary
+
+    reference = _keyed_static_rows()
+    reference.append(dict(reference[0]))
+    reference.append({**reference[1], "true_months": float(reference[1]["true_months"]) + 6.0})
+    candidate = [
+        {**row, "predicted_months": float(row["predicted_months"]) + 0.5} for row in reference
     ]
+    # Row order within a file is not part of the pairing.
+    candidate = [*candidate[-1:], *candidate[:-1]]
 
-    kept, dropped = dedupe_paired_rows(reference_dup)
-    assert dropped == 1
-    assert len(kept) == len(reference)
-    assert [row["case_id"] for row in kept] == [row["case_id"] for row in reference]
+    summary = paired_sample_summary(candidate, reference)
+    assert summary == {
+        "rows": 8,
+        "unique_samples": 6,
+        "repeated_samples": 2,
+        "repeated_rows": 4,
+        "conflicting_truth_samples": 1,
+    }
 
-    # Before this change the duplicate made the comparison refuse outright. The paired
-    # difference must now match the same comparison run on the de-duplicated rows.
-    with_dup = fast_paired_test(
-        prepare_static(candidate_dup), prepare_static(reference_dup),
-        ("sentence_mae",), iterations=20, seed=5,
+    prepared_candidate, prepared_reference = prepare_static(candidate), prepare_static(reference)
+    result = fast_paired_test(
+        prepared_candidate, prepared_reference, ("sentence_mae",), iterations=20, seed=5
     )
-    without_dup = fast_paired_test(
-        prepare_static(candidate_dup[: len(reference)]), prepare_static(reference),
-        ("sentence_mae",), iterations=20, seed=5,
+    expected = (
+        prepared_candidate.metrics(None)["sentence_mae"]
+        - prepared_reference.metrics(None)["sentence_mae"]
     )
-    for key in ("difference", "lower", "upper", "p_value"):
-        assert math.isclose(
-            with_dup["sentence_mae"][key], without_dup["sentence_mae"][key], abs_tol=1e-9
-        )
+    assert math.isclose(result["sentence_mae"]["difference"], expected, abs_tol=1e-12)
+    assert result["sentence_mae"]["groups"] == 6
 
-    conflicting = [*reference, {**reference[0], "true_charges": [0, 0, 1]}]
-    with pytest.raises(ValueError, match="different truth"):
-        dedupe_paired_rows(conflicting)
+
+def test_paired_test_refuses_repeats_that_differ_between_sides() -> None:
+    from legal_landscape.evaluation.bootstrap import paired_sample_summary
+
+    base = _keyed_static_rows()
+    conflicting = [*base, {**base[1], "true_months": float(base[1]["true_months"]) + 6.0}]
+    verbatim = [*base, dict(base[1])]
+    with pytest.raises(ValueError, match="differs between the two sides"):
+        paired_sample_summary(conflicting, verbatim)
+    with pytest.raises(ValueError, match="differs between the two sides"):
+        paired_sample_summary(verbatim, base)
+    with pytest.raises(ValueError, match="sample sets differ"):
+        paired_sample_summary(base, base[:-1])

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import Any
 
@@ -154,30 +154,43 @@ def _truth_signature(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def dedupe_paired_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Keep the first row per sample key; return the rows and how many were dropped.
+def paired_sample_summary(
+    candidate: list[dict[str, Any]], reference: list[dict[str, Any]]
+) -> dict[str, int]:
+    """Require both sides to carry the same rows per sample key; count the repeats.
 
-    CAIL derives case_id from the fact text, so a source corpus that repeats a judgment
-    verbatim yields two identical test records. They are one sample, not two, and would
-    otherwise make the paired bootstrap refuse the comparison. A repeated key whose truth
-    fields disagree is a real error and is still raised.
+    CAIL derives case_id from the fact text, so a corpus that repeats a judgment yields
+    several rows under one key, usually verbatim and occasionally with a disagreeing
+    source label (the same fact recorded with 3 and with 9 months). Every such row was
+    predicted by both systems and is part of the headline metrics, so none is dropped
+    here. The two sides must agree, per key, on how often each (group, truth) occurs;
+    that is what makes the paired comparison well defined. Row order does not matter.
     """
-    kept: list[dict[str, Any]] = []
-    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
-    dropped = 0
-    for row in rows:
-        key = _sample_key(row)
-        first = seen.get(key)
-        if first is None:
-            seen[key] = row
-            kept.append(row)
-            continue
-        if _truth_signature(first) != _truth_signature(row) or str(
-            first.get("group_id")
-        ) != str(row.get("group_id")):
-            raise ValueError(f"paired comparison has a repeated sample {key} with different truth")
-        dropped += 1
-    return kept, dropped
+
+    def index(rows: list[dict[str, Any]]) -> dict[tuple[Any, ...], Counter]:
+        found: dict[tuple[Any, ...], Counter] = defaultdict(Counter)
+        for row in rows:
+            found[_sample_key(row)][(str(row.get("group_id")), _truth_signature(row))] += 1
+        return found
+
+    left, right = index(candidate), index(reference)
+    if set(left) != set(right):
+        missing = sorted(set(left) ^ set(right))[:3]
+        raise ValueError(f"paired comparison sample sets differ, for example {missing}")
+    for key, rows in left.items():
+        if rows != right[key]:
+            raise ValueError(
+                f"sample {key} differs between the two sides in group, truth, "
+                "intervention fields, or repeat count"
+            )
+    repeated = [rows for rows in left.values() if sum(rows.values()) > 1]
+    return {
+        "rows": len(candidate),
+        "unique_samples": len(left),
+        "repeated_samples": len(repeated),
+        "repeated_rows": sum(sum(rows.values()) for rows in repeated),
+        "conflicting_truth_samples": sum(1 for rows in repeated if len(rows) > 1),
+    }
 
 
 def assert_paired_rows(
@@ -327,15 +340,8 @@ def fast_paired_test(
         raise ValueError(
             "paired comparison requires source row identity on both prepared inputs"
         )
-    # Verbatim-duplicate samples are one sample; both sides must drop the same ones.
-    candidate_rows, dropped_candidate = dedupe_paired_rows(candidate_rows)
-    reference_rows, dropped_reference = dedupe_paired_rows(reference_rows)
-    if dropped_candidate != dropped_reference:
-        raise ValueError(
-            "paired comparison dropped a different number of duplicate samples on each side: "
-            f"{dropped_candidate} vs {dropped_reference}"
-        )
-    assert_paired_rows(candidate_rows, reference_rows)
+    # Repeated keys (CAIL repeats judgments) are kept on both sides and must match.
+    paired_sample_summary(candidate_rows, reference_rows)
     if set(candidate.group_keys) != set(reference.group_keys):
         raise ValueError("paired comparison requires identical group IDs")
     keys = tuple(sorted(candidate.group_keys))

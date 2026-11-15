@@ -712,3 +712,6 @@ def test_evaluation_cli_bootstrap_progress_and_five_holm_results(tmp_path) -> No
     assert required <= payload.keys()
     assert payload["confidence_intervals"]["charge_macro_f1"]["iterations"] == 20
     assert len(payload["comparison"]["holm_adjusted_p_values"]) == 5
+    paired = payload["comparison"]["paired_samples"]
+    assert paired["rows"] == len(candidate)
+    assert paired["repeated_samples"] == 0 and paired["conflicting_truth_samples"] == 0
