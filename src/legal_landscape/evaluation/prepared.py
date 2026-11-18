@@ -14,7 +14,7 @@ import numpy as np
 
 from legal_landscape.evaluation.static_metrics import SENTENCE_CLASS_VOCABULARY, sentence_class
 
-METRIC_VERSION = "v2"
+METRIC_VERSION = "v3"
 _SENTENCE_INDEX = {label: index for index, label in enumerate(SENTENCE_CLASS_VOCABULARY)}
 
 
@@ -51,7 +51,11 @@ class _Grouped:
 
 
 class _MultiLabel:
-    """Multi-label metrics; macro averages use the classes present in the full truth."""
+    """Multi-label metrics; macro averages use the classes present in the weighted truth.
+
+    Under bootstrap weights that is the classes present in the resample, so a replicate
+    equals the metric recomputed on the resampled rows.
+    """
 
     def __init__(self, rows: list[dict[str, Any]], prefix: str) -> None:
         truth = np.asarray([row[f"true_{prefix}"] for row in rows], dtype=bool)
@@ -74,7 +78,6 @@ class _MultiLabel:
         self.fn = (truth & ~prediction).astype(float)
         self.exact = (truth == prediction).all(axis=1).astype(float)
         self.hamming = (truth == prediction).mean(axis=1)
-        self.supported = truth.any(axis=0)
         self.all_columns = np.ones(truth.shape[1], dtype=bool)
 
     def metrics(self, weights: np.ndarray) -> dict[str, float]:
@@ -91,7 +94,8 @@ class _MultiLabel:
                 _ratio(np.array(2 * total_tp), np.array(2 * total_tp + total_fp + total_fn))
             ),
         }
-        for suffix, columns in (("", self.supported), ("_all_labels", self.all_columns)):
+        supported = (tp + fn) > 0
+        for suffix, columns in (("", supported), ("_all_labels", self.all_columns)):
             result[f"macro_precision{suffix}"] = _macro(precision, columns)
             result[f"macro_recall{suffix}"] = _macro(recall, columns)
             result[f"macro_f1{suffix}"] = _macro(f1, columns)
@@ -121,7 +125,6 @@ class StaticPrepared(_Grouped):
         self.class_truth = np.eye(width)[true_class]
         self.class_prediction = np.eye(width)[predicted_class]
         self.class_equal = (true_class == predicted_class).astype(float)
-        self.class_supported = self.class_truth.any(axis=0)
         predicted = np.asarray([row["predicted_months"] for row in rows], dtype=float)
         truth = np.asarray(
             [math.nan if row.get("true_months") is None else row["true_months"] for row in rows],
@@ -150,11 +153,12 @@ class StaticPrepared(_Grouped):
         tp = weights @ (self.class_truth * self.class_equal[:, None])
         predicted, actual = weights @ self.class_prediction, weights @ self.class_truth
         accuracy = _mean(self.class_equal, weights)
+        supported = actual > 0
         sentence_class_metrics = {
             "accuracy": accuracy,
-            "macro_precision": _macro(_ratio(tp, predicted), self.class_supported),
-            "macro_recall": _macro(_ratio(tp, actual), self.class_supported),
-            "macro_f1": _macro(_ratio(2 * tp, predicted + actual), self.class_supported),
+            "macro_precision": _macro(_ratio(tp, predicted), supported),
+            "macro_recall": _macro(_ratio(tp, actual), supported),
+            "macro_f1": _macro(_ratio(2 * tp, predicted + actual), supported),
             "micro_precision": accuracy,
             "micro_recall": accuracy,
             "micro_f1": accuracy,

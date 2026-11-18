@@ -59,6 +59,61 @@ def test_fast_bootstrap_reproduces_row_resampling_for_label_set_free_metrics() -
             assert math.isclose(fast[name][key], slow[name][key], abs_tol=1e-12)
 
 
+def test_fast_bootstrap_macro_averages_over_classes_present_in_each_resample() -> None:
+    """A rare class missing from a resample is not averaged in as zero.
+
+    Recomputing a macro metric on a resampled dataset averages over the classes that
+    dataset's truth contains; the vectorized replicate must do the same, or the interval
+    sits below the point estimate.
+    """
+    rows = _static_rows(4)
+    for row in rows:
+        row["true_charges"] = [*row["true_charges"], 0]
+        row["predicted_charges"] = [*row["predicted_charges"], 0]
+    rows[0]["true_charges"][3] = 1
+    rows[0]["predicted_charges"][3] = 1
+    rows[0]["true_months"], rows[0]["predicted_months"] = 100.0, 100.0
+    names = (
+        "charge_macro_precision", "charge_macro_recall", "charge_macro_f1",
+        "article_macro_f1", "sentence_macro_precision", "sentence_macro_recall",
+        "sentence_macro_f1",
+    )
+    fast = fast_bootstrap_metric_set(prepare_static(rows), names, iterations=60, seed=7)
+    slow = bootstrap_metric_set(
+        rows, lambda sample: prepare_static(sample).metrics(None), names, iterations=60, seed=7
+    )
+    for name in names:
+        for key in ("estimate", "lower", "upper"):
+            assert math.isclose(fast[name][key], slow[name][key], abs_tol=1e-12), (name, key)
+
+
+def test_paired_macro_difference_reproduces_row_resampling() -> None:
+    reference = _static_rows(5)
+    rng = np.random.default_rng(6)
+    candidate = []
+    for index, row in enumerate(reference):
+        row["true_charges"] = [*row["true_charges"], int(index == 0)]
+        row["predicted_charges"] = [*row["predicted_charges"], int(index == 0)]
+        row["case_id"] = f"c{index}"
+        row["charge_vocabulary"] = ["a", "b", "c", "d"]
+        row["article_vocabulary"] = ["a", "b", "c"]
+        row["articles_available"] = True
+        predicted = [int(value) for value in rng.random(4) < 0.4]
+        candidate.append({**row, "predicted_charges": predicted})
+    names = ("charge_macro_f1", "sentence_macro_f1")
+    fast = fast_paired_test(
+        prepare_static(candidate), prepare_static(reference), names, iterations=60, seed=11
+    )
+    for name in names:
+        slow = paired_cluster_test(
+            candidate, reference,
+            lambda sample, metric=name: prepare_static(sample).metrics(None)[metric],
+            iterations=60, seed=11,
+        )
+        for key in ("difference", "lower", "upper", "p_value"):
+            assert math.isclose(fast[name][key], slow[key], abs_tol=1e-12), (name, key)
+
+
 def test_fast_paired_test_reproduces_row_resampling() -> None:
     reference = _static_rows(2)
     rng = np.random.default_rng(3)
@@ -168,27 +223,31 @@ def test_distinct_unseen_labels_are_separate_macro_classes() -> None:
     assert one_metrics["charge_micro_f1"] == 0.5
     assert one_metrics["charge_macro_f1"] == pytest.approx(1 / 3)
     # Shared unseen label X is one column. Resampling cannot add a class.
-    assert prepared.charge.supported.sum() == 3
     assert prepared.charge.tp.shape[1] == 3
+    assert prepared.metrics(None)["charge_macro_f1"] == pytest.approx(1 / 3)
     assert prepared.metrics(np.array([2.0, 0.0]))["charge_macro_f1"] != 0.0
 
 
-def test_macro_average_uses_classes_present_in_the_full_test_truth() -> None:
+def test_macro_average_uses_classes_present_in_the_weighted_truth() -> None:
     prepared = prepare_static([_row([1, 0, 0], [1, 0, 0]), _row([0, 1, 0], [0, 1, 0], "g2")])
     metrics = prepared.metrics(None)
     assert metrics["charge_macro_f1"] == 1.0
     assert metrics["charge_macro_f1_all_labels"] == 2 / 3
     assert metrics["metric_version"] == METRIC_VERSION
+    # A resample without the second group has no class-1 truth, so class 1 leaves the average.
     without_second_group = prepared.metrics(np.array([1.0, 0.0]))
-    assert without_second_group["charge_macro_f1"] == 0.5
+    assert without_second_group["charge_macro_f1"] == 1.0
+    assert without_second_group["charge_macro_f1_all_labels"] == 1 / 3
 
 
-def test_sentence_macro_average_uses_a_fixed_class_set() -> None:
-    first = {**_row([1], [1]), "true_months": 3.0, "predicted_months": 3.0}
+def test_sentence_macro_average_uses_classes_present_in_the_weighted_truth() -> None:
+    first = {**_row([1], [1]), "true_months": 3.0, "predicted_months": 30.0}
     second = {**_row([1], [1], "g2"), "true_months": 30.0, "predicted_months": 30.0}
     prepared = prepare_static([first, second])
-    assert prepared.metrics(None)["sentence_macro_f1"] == 1.0
-    assert prepared.metrics(np.array([1.0, 0.0]))["sentence_macro_f1"] == 0.5
+    # Classes 0-6 (recall 0) and 25-36 (precision 1/2) are both in the full truth.
+    assert prepared.metrics(None)["sentence_macro_f1"] == pytest.approx((0 + 2 / 3) / 2)
+    # Without the first group only 25-36 is true; the 0-6 class leaves the average.
+    assert prepared.metrics(np.array([0.0, 1.0]))["sentence_macro_f1"] == 1.0
 
 
 def _pair(kind, parent, counterfactual, **extra):
